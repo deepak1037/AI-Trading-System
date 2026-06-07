@@ -39,6 +39,31 @@ A new capability inspired by the user's reference tool `CharlesSchwabVS`.
 
 ---
 
+## Per-stock composite scoring (replaced hardcoded constants)
+
+`update_from_stage4` previously scored every stock with constants (fund=70,
+inst=70, tech=80, squeeze=50, tf=60 → flat 68 for all). Now each name is scored
+from its own data, threaded through the stages:
+- The three `screen()` methods return `list[dict]` (fundamental flags /
+  accumulation data / technical data) instead of `list[str]`. Bool wrappers
+  (`_passes_accumulation`) kept where other code depends on them.
+- `scanner/pipeline.run_funnel()` merges Stage 3+4 data by ticker;
+  `update_from_stage4(stage4_data: dict)` runs Stage 5 and computes the real
+  composite via the scorer's `*_from_*` methods. `scripts/run_scanner.py`
+  (make scanner) + `build_watchlist.py` use it.
+- Fixed a staleness bug: a name still in Stage 5 but now scoring below threshold
+  was neither re-scored nor removed (kept the old flat 68). Watchlist is now set
+  to exactly the qualifying Stage-5 survivors with fresh scores.
+
+Live (paced, 502-name universe): 82 names, scores **65–80**, 15 distinct values.
+
+**Known calibration limits** (not bugs):
+- Range tops out ~80, not 95: `squeeze` (15%) + `tf_alignment` (10%) are ~0 for
+  quality momentum names (low short interest), capping the top.
+- Without `FMP_API_KEY`, Stage 3 uses yfinance `.info` GAAP earnings growth,
+  which misranks growth names (e.g. CRWD marked `eps_accelerating=False`). FMP
+  is the biggest lever for fundamental accuracy.
+
 ## New settings (config/settings.py + .env.example)
 
 Not in `CLAUDE_SETTINGS.md`:
