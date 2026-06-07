@@ -324,19 +324,25 @@ class SchwabBroker(BaseBroker):
             resp       = self._client.preview_order(self._account_hash, order_spec)
             resp.raise_for_status()
             data       = resp.json()
-            alerts     = data.get("orderValidationResult", {}).get("alerts", [])
-            is_valid   = len(alerts) == 0
-            rejection  = " | ".join(a.get("message", "") for a in alerts) if alerts else None
-            impact     = data.get("orderValidationResult", {}).get("buyingPowerEffect", {})
+            # Schwab preview response shape (from API reference):
+            #   orderStrategy.orderBalance.{orderValue, projectedCommission, projectedBuyingPower}
+            #   orderValidationResult.rejects[].message  (non-empty = invalid)
+            ostrat   = data.get("orderStrategy", {})
+            balance  = ostrat.get("orderBalance", {})
+            rejects  = data.get("orderValidationResult", {}).get("rejects", [])
+            alerts   = data.get("orderValidationResult", {}).get("alerts", [])
+            errors   = rejects or alerts
+            is_valid = len(errors) == 0
+            rejection = " | ".join(e.get("message", "") for e in errors) if errors else None
             logger.info(
                 "Order preview | ticker=%s valid=%s rejection=%s",
                 order.ticker, is_valid, rejection,
             )
             return OrderPreview(
-                estimated_cost      = abs(float(impact.get("cost", 0.0))),
-                buying_power_effect = float(impact.get("availableFundsDelta", 0.0)),
-                margin_impact       = float(impact.get("marginRequirementDelta", 0.0)),
-                fees                = float(data.get("estimatedCommission", 0.0)),
+                estimated_cost      = abs(float(balance.get("orderValue", 0.0))),
+                buying_power_effect = float(balance.get("projectedBuyingPower", 0.0)),
+                margin_impact       = 0.0,
+                fees                = float(balance.get("projectedCommission", 0.0)),
                 is_valid            = is_valid,
                 rejection_reason    = rejection,
                 raw_response        = data,
@@ -470,20 +476,23 @@ class SchwabBroker(BaseBroker):
             order_spec = self._build_options_order(order)
             resp       = self._client.preview_order(self._account_hash, order_spec)
             resp.raise_for_status()
-            data       = resp.json()
-            alerts     = data.get("orderValidationResult", {}).get("alerts", [])
-            is_valid   = len(alerts) == 0
-            rejection  = " | ".join(a.get("message", "") for a in alerts) if alerts else None
-            impact     = data.get("orderValidationResult", {}).get("buyingPowerEffect", {})
+            data     = resp.json()
+            ostrat   = data.get("orderStrategy", {})
+            balance  = ostrat.get("orderBalance", {})
+            rejects  = data.get("orderValidationResult", {}).get("rejects", [])
+            alerts   = data.get("orderValidationResult", {}).get("alerts", [])
+            errors   = rejects or alerts
+            is_valid = len(errors) == 0
+            rejection = " | ".join(e.get("message", "") for e in errors) if errors else None
             logger.info(
                 "Options preview | contract=%s valid=%s rejection=%s",
                 order.contract, is_valid, rejection,
             )
             return OrderPreview(
-                estimated_cost      = abs(float(impact.get("cost", 0.0))),
-                buying_power_effect = float(impact.get("availableFundsDelta", 0.0)),
-                margin_impact       = float(impact.get("marginRequirementDelta", 0.0)),
-                fees                = settings.PAPER_OPTIONS_COMMISSION * order.qty,
+                estimated_cost      = abs(float(balance.get("orderValue", 0.0))),
+                buying_power_effect = float(balance.get("projectedBuyingPower", 0.0)),
+                margin_impact       = 0.0,
+                fees                = float(balance.get("projectedCommission", settings.PAPER_OPTIONS_COMMISSION * order.qty)),
                 is_valid            = is_valid,
                 rejection_reason    = rejection,
                 raw_response        = data,

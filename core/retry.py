@@ -133,11 +133,25 @@ def circuit_breaker(
     if failure_threshold < 1:
         raise ValueError("failure_threshold must be >= 1")
 
-    state = _CircuitState()
+    # Fallback state for module-level (non-method) functions.
+    _global_state = _CircuitState()
 
     def decorator(func: F) -> F:
+        # Per-instance state attr name — stored on the instance __dict__ so
+        # each object (e.g. each SchwabBroker) has its own independent circuit.
+        _attr = f"_cb_{func.__qualname__.replace('.', '_').replace('<', '').replace('>', '')}"
+
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Resolve state: per-instance for methods, global for plain functions.
+            instance = args[0] if args and hasattr(args[0], "__dict__") else None
+            if instance is not None:
+                if _attr not in instance.__dict__:
+                    instance.__dict__[_attr] = _CircuitState()
+                state = instance.__dict__[_attr]
+            else:
+                state = _global_state
+
             if state.state == "OPEN":
                 assert state.opened_at is not None
                 if time_func() - state.opened_at >= recovery_timeout:
@@ -172,7 +186,7 @@ def circuit_breaker(
                 state.state = "CLOSED"
                 return result
 
-        wrapper._circuit_state = state  # type: ignore[attr-defined]
+        wrapper._circuit_state = _global_state  # type: ignore[attr-defined]
         return wrapper  # type: ignore[return-value]
 
     return decorator
