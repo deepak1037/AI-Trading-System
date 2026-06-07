@@ -16,22 +16,57 @@ st.set_page_config(page_title="Positions", layout="wide")
 st.title("Open Positions")
 
 
-def _load_account_state(account_id: str) -> "dict | None":
-    import json
+# ── Source selector ───────────────────────────────────────────────────────────
 
+sources = list(settings.PAPER_ACCOUNTS)
+if settings.BROKER == "schwab":
+    sources = ["schwab_live"] + sources
+
+source = st.selectbox("Account", sources)
+
+
+# ── Data loaders ──────────────────────────────────────────────────────────────
+
+def _load_paper_positions(account_id: str) -> list[dict]:
+    import json
     path = Path(settings.PAPER_ACCOUNTS_DIR) / f"{account_id}.json"
     if not path.exists():
-        return None
+        st.warning(f"Account file not found: {path}")
+        return []
     with open(path) as f:
-        return json.load(f)  # type: ignore[no-any-return]
+        state = json.load(f)
+    return state.get("open_positions", [])  # type: ignore[no-any-return]
+
+
+def _load_schwab_positions() -> list[dict]:
+    try:
+        from broker_core.schwab_broker import SchwabBroker
+        broker = SchwabBroker()
+        raw = broker.get_positions()
+        return [
+            {
+                "ticker": p.ticker,
+                "strategy": p.strategy_name,
+                "position_type": p.position_type,
+                "qty": p.qty,
+                "entry_price": p.avg_cost,
+                "current_price": p.current_price,
+                "unrealized_pnl": p.unrealized_pnl,
+                "stop_loss": None,
+                "take_profit": None,
+                "entry_date": str(p.opened_at.date()) if p.opened_at else "",
+            }
+            for p in raw
+        ]
+    except Exception as exc:
+        st.error(f"Failed to load Schwab positions: {exc}")
+        return []
 
 
 def _get_live_price(ticker: str) -> float | None:
     try:
         import yfinance as yf
-
-        t = yf.Ticker(ticker)
-        hist = t.history(period="1d", interval="1m")
+        hist = yf.Ticker(ticker).history(period="1d", interval="1m")
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
     except Exception:
@@ -39,42 +74,56 @@ def _get_live_price(ticker: str) -> float | None:
     return None
 
 
-account_id = st.selectbox("Account", settings.PAPER_ACCOUNTS)
-state = _load_account_state(account_id)
+# ── Load positions ────────────────────────────────────────────────────────────
 
-if not state:
-    st.warning(f"Account {account_id} not initialized.")
-    st.stop()
+if source == "schwab_live":
+    with st.spinner("Fetching positions from Schwab..."):
+        positions = _load_schwab_positions()
+else:
+    positions = _load_paper_positions(source)
 
-positions = state.get("open_positions", [])
 if not positions:
     st.info("No open positions.")
     st.stop()
 
+
+# ── Build display table ───────────────────────────────────────────────────────
+
 rows = []
 for pos in positions:
     ticker = pos.get("ticker", "")
-    live_price = _get_live_price(ticker) or pos.get("current_price", pos.get("entry_price", 0))
+
+    if source == "schwab_live":
+        live_price = pos.get("current_price") or _get_live_price(ticker) or 0.0
+    else:
+        live_price = _get_live_price(ticker) or pos.get("current_price", pos.get("entry_price", 0))
+
     qty = pos.get("qty", 0)
     entry = pos.get("entry_price", 0)
-    unrealized_pnl = (live_price - entry) * qty
-    pnl_pct = (live_price - entry) / entry * 100 if entry else 0
+
+    if source == "schwab_live" and pos.get("unrealized_pnl") is not None:
+        unrealized_pnl = pos["unrealized_pnl"]
+        pnl_pct = unrealized_pnl / (entry * qty) * 100 if entry and qty else 0.0
+    else:
+        unrealized_pnl = (live_price - entry) * qty
+        pnl_pct = (live_price - entry) / entry * 100 if entry else 0.0
 
     rows.append({
         "Ticker": ticker,
-        "Strategy": pos.get("strategy", ""),
-        "Type": pos.get("position_type", ""),
+        "Strategy": pos.get("strategy", "—"),
+        "Type": pos.get("position_type", "—"),
         "Qty": qty,
         "Entry": f"${entry:.2f}",
         "Live Price": f"${live_price:.2f}",
         "Unrealized P&L": f"${unrealized_pnl:+,.2f}",
         "P&L %": f"{pnl_pct:+.2f}%",
-        "Stop Loss": f"${pos.get('stop_loss', 0):.2f}" if pos.get("stop_loss") else "—",
-        "Take Profit": f"${pos.get('take_profit', 0):.2f}" if pos.get("take_profit") else "—",
+        "Stop Loss": f"${pos['stop_loss']:.2f}" if pos.get("stop_loss") else "—",
+        "Take Profit": f"${pos['take_profit']:.2f}" if pos.get("take_profit") else "—",
         "Entry Date": pos.get("entry_date", ""),
     })
 
 df = pd.DataFrame(rows)
+
 
 def _color_pnl(val: str) -> str:
     if "+" in str(val):
@@ -83,14 +132,19 @@ def _color_pnl(val: str) -> str:
         return "color: red"
     return ""
 
+
 styled = df.style.applymap(_color_pnl, subset=["Unrealized P&L", "P&L %"])
 st.dataframe(styled, use_container_width=True)
 
-# Summary metrics
 total_pnl = sum(
-    ((_get_live_price(p["ticker"]) or p.get("current_price", p["entry_price"])) - p["entry_price"])
-    * p["qty"]
-    for p in positions
+    float(r["Unrealized P&L"].replace("$", "").replace(",", ""))
+    for r in rows
 )
-st.metric("Total Unrealized P&L", f"${total_pnl:+,.2f}")
-st.caption(f"Auto-refresh: every {settings.DASHBOARD_REFRESH_SECONDS}s | {len(positions)} open positions")
+col1, col2 = st.columns(2)
+col1.metric("Total Unrealized P&L", f"${total_pnl:+,.2f}")
+col2.metric("Open Positions", len(positions))
+
+st.caption(
+    f"Source: {'Schwab Live API' if source == 'schwab_live' else source} | "
+    f"Auto-refresh: every {settings.DASHBOARD_REFRESH_SECONDS}s"
+)
