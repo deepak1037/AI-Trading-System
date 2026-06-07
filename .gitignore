@@ -40,3 +40,8 @@ paper_trading/backups/*.json
 .idea/
 .vscode/
 *.swp
+
+# Secret backups — never commit
+.env.bak*
+.env.*.bak
+*.bak
