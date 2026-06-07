@@ -178,6 +178,11 @@ lint: _check_venv
 		--disable-error-code=no-untyped-def \
 		|| true
 
+# ── healthcheck: test every system component ─────────────────────────────────
+.PHONY: healthcheck
+healthcheck: _check_venv _mklogs
+	@$(PYTHON) scripts/healthcheck.py
+
 # ── paper-balance: paper account summary ─────────────────────────────────────
 .PHONY: paper-balance
 paper-balance: _check_venv
