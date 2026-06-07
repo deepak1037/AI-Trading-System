@@ -59,7 +59,8 @@ class OrderPreview(BaseModel):
     """Dry-run preview of an order (no real submission)."""
 
     estimated_cost: float = 0.0
-    buying_power_effect: float = 0.0
+    buying_power_effect: float = 0.0     # projected buying power (leveraged figure)
+    projected_available_fund: float = 0.0  # projected available funds (real cash basis)
     margin_impact: float = 0.0
     fees: float = 0.0
     is_valid: bool = True
@@ -87,7 +88,8 @@ class Account(BaseModel):
     account_id: str
     cash: float = 0.0
     equity: float = 0.0
-    buying_power: float = 0.0
+    buying_power: float = 0.0       # leveraged purchasing power (margin-inflated)
+    available_funds: float = 0.0    # cash available before leverage (margin basis)
     margin_used: float = 0.0
 
 

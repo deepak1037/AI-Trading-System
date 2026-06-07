@@ -216,11 +216,11 @@ class LLMROIAnalyzer:
         if underlying_price is None:
             underlying_price = self._current_price(ticker)
 
-        # Fetch account buying power once so per-row previews don't each re-fetch.
-        current_bp: Optional[float] = None
+        # Fetch account available funds once so per-row previews don't re-fetch.
+        current_af: Optional[float] = None
         if use_broker_margin:
             try:
-                current_bp = float(self._broker.get_account().buying_power or 0.0)
+                current_af = float(self._broker.get_account().available_funds or 0.0)
             except Exception as exc:  # noqa: BLE001 — rows fall back to formula
                 logger.debug("Account fetch failed for %s: %s", ticker, exc)
 
@@ -247,7 +247,7 @@ class LLMROIAnalyzer:
                         contract=contract,
                         underlying_price=underlying_price,
                         use_broker_margin=use_broker_margin,
-                        current_buying_power=current_bp,
+                        current_available_funds=current_af,
                     )
                 )
             except DataError:
@@ -262,21 +262,21 @@ class LLMROIAnalyzer:
         contract: Optional[OptionsContract] = None,
         underlying_price: Optional[float] = None,
         use_broker_margin: bool = False,
-        current_buying_power: Optional[float] = None,
+        current_available_funds: Optional[float] = None,
     ) -> PutROIResult:
         """Locate the put contract and compute its quantitative ROI.
 
         Args:
             use_broker_margin: When True and a broker is configured, query the
-                broker's preview API for the *real* buying-power reduction and
-                use it as the primary margin. Falls back to the Reg-T /
+                broker's preview API for the *real* available-funds reduction
+                and use it as the primary margin. Falls back to the Reg-T /
                 cash-secured formula when unavailable (paper/dev, no broker, or
                 an invalid preview). Off by default because it adds an API
                 round-trip per contract — callers scanning many expiries should
                 leave it off; the single deep analysis turns it on.
-            current_buying_power: Optional pre-fetched account buying power, so
-                a caller computing many contracts (build_roi_table) avoids one
-                get_account() call per contract. Ignored unless
+            current_available_funds: Optional pre-fetched account available
+                funds, so a caller computing many contracts (build_roi_table)
+                avoids one get_account() call per contract. Ignored unless
                 use_broker_margin is True.
         """
         ticker = ticker.upper().strip()
@@ -305,7 +305,8 @@ class LLMROIAnalyzer:
         margin = None
         if use_broker_margin:
             margin = self._broker_margin_per_contract(
-                ticker, contract, mid, current_bp=current_buying_power
+                ticker, contract, mid,
+                current_available_funds=current_available_funds,
             )
             if margin is not None:
                 margin_basis = "schwab_preview"
@@ -372,28 +373,30 @@ class LLMROIAnalyzer:
         ticker: str,
         contract: OptionsContract,
         mid: float,
-        current_bp: Optional[float] = None,
+        current_available_funds: Optional[float] = None,
     ) -> Optional[float]:
         """Real per-contract margin via the broker preview API.
 
-        Mirrors the reference tool's approach: the true capital requirement is
-        the drop in account buying power Schwab projects for the order, i.e.
-        ``current_buying_power − projectedBuyingPower``. Returns None on any
-        failure (no broker, invalid preview, non-positive reduction) so the
-        caller falls back to the formula.
+        The true capital tied up is the drop in **available funds** Schwab
+        projects for the order: ``availableFunds − projectedAvailableFund``.
+        This is the reference tool's approach. We deliberately use available
+        funds, NOT buying power: buying power is leveraged (~4× funds on a
+        margin account), so its delta overstates the real margin several-fold
+        (e.g. HIMS $23 put: $336 funds-delta vs $1,345 buying-power-delta).
 
-        ``current_bp`` may be passed pre-fetched to avoid one get_account() call
-        per contract when computing a whole table.
+        Returns None on any failure (no broker, missing funds data, non-positive
+        reduction) so the caller falls back to the formula. ``current_available_funds``
+        may be passed pre-fetched to avoid one get_account() call per contract.
         """
         if self._broker is None:
             return None
         try:
             from broker_core.base_broker import OptionsOrder
 
-            if current_bp is None:
+            if current_available_funds is None:
                 account = self._broker.get_account()
-                current_bp = float(account.buying_power or 0.0)
-            if current_bp <= 0:
+                current_available_funds = float(account.available_funds or 0.0)
+            if current_available_funds <= 0:
                 return None
             order = OptionsOrder(
                 ticker=ticker,
@@ -415,15 +418,15 @@ class LLMROIAnalyzer:
                     "Preview note for %s margin: %s",
                     contract.symbol, preview.rejection_reason,
                 )
-            projected_bp = float(preview.buying_power_effect or 0.0)
-            if projected_bp <= 0:
+            projected_af = float(preview.projected_available_fund or 0.0)
+            if projected_af <= 0:
                 return None
-            reduction = current_bp - projected_bp
-            # Sanity: a single contract can't tie up more than the whole account.
-            if 0 < reduction < current_bp:
+            reduction = current_available_funds - projected_af
+            # Sanity: a single contract can't tie up more than all available funds.
+            if 0 < reduction < current_available_funds:
                 return reduction
             logger.debug(
-                "Implausible BP reduction (%.2f) for %s — using formula",
+                "Implausible funds reduction (%.2f) for %s — using formula",
                 reduction, contract.symbol,
             )
             return None

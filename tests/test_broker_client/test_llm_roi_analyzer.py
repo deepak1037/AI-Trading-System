@@ -41,14 +41,14 @@ class FakeBroker:
         self,
         chain: OptionsChain,
         last: float = 12.90,
-        buying_power: float = 10_000.0,
-        projected_bp: float = 9_000.0,
+        available_funds: float = 10_000.0,
+        projected_af: float = 9_000.0,
         preview_valid: bool = True,
     ) -> None:
         self._chain = chain
         self._last = last
-        self._buying_power = buying_power
-        self._projected_bp = projected_bp
+        self._available_funds = available_funds
+        self._projected_af = projected_af
         self._preview_valid = preview_valid
 
     def get_options_chain(self, ticker: str, expiry=None) -> OptionsChain:
@@ -58,12 +58,19 @@ class FakeBroker:
         return Quote(ticker=ticker, bid=self._last - 0.01, ask=self._last + 0.01, last=self._last)
 
     def get_account(self) -> Account:
-        return Account(account_id="X", buying_power=self._buying_power)
+        # buying_power is intentionally larger (leveraged) to ensure the
+        # analyzer uses available_funds, not buying_power, for margin.
+        return Account(
+            account_id="X",
+            buying_power=self._available_funds * 4,
+            available_funds=self._available_funds,
+        )
 
     def preview_options_order(self, order) -> OrderPreview:
         return OrderPreview(
             estimated_cost=0.0,
-            buying_power_effect=self._projected_bp,
+            buying_power_effect=self._projected_af * 4,  # leveraged — must be ignored
+            projected_available_fund=self._projected_af,
             is_valid=self._preview_valid,
             rejection_reason=None if self._preview_valid else "rejected",
         )
@@ -263,17 +270,28 @@ class TestBuildPutROI:
 
     def test_real_margin_via_preview(self, analyzer, monkeypatch):
         a, expiry = analyzer
-        # FakeBroker: BP 10000 → projected 9000 → reduction 1000 = margin.
+        # FakeBroker: available funds 10000 → projected 9000 → reduction 1000.
+        # (buying_power is 4× larger and must be ignored.)
         roi = a.build_put_roi("HOOD", 8.0, expiry, use_broker_margin=True)
         assert roi.margin_basis == "schwab_preview"
         assert roi.margin_per_contract == pytest.approx(1000.0)
+
+    def test_uses_available_funds_not_buying_power(self):
+        # available funds 10000 → projected 9000 → margin 1000, NOT the
+        # leveraged buying-power delta (40000 → 36000 = 4000).
+        expiry = _future_expiry(40)
+        broker = FakeBroker(_make_chain(expiry), available_funds=10_000.0, projected_af=9_000.0)
+        a = LLMROIAnalyzer(broker=broker)
+        roi = a.build_put_roi("HOOD", 8.0, expiry, use_broker_margin=True)
+        assert roi.margin_per_contract == pytest.approx(1000.0)
+        assert roi.margin_per_contract != pytest.approx(4000.0)
 
     def test_benign_alert_still_uses_real_margin(self, monkeypatch):
         # Schwab flags naked-put previews with a benign alert (is_valid=False)
         # but the projected balance is still usable — we must NOT discard it.
         expiry = _future_expiry(40)
         broker = FakeBroker(_make_chain(expiry), preview_valid=False,
-                            buying_power=10_000.0, projected_bp=9_000.0)
+                            available_funds=10_000.0, projected_af=9_000.0)
         a = LLMROIAnalyzer(broker=broker)
         roi = a.build_put_roi("HOOD", 8.0, expiry, use_broker_margin=True)
         assert roi.margin_basis == "schwab_preview"
@@ -282,8 +300,8 @@ class TestBuildPutROI:
     def test_nonpositive_reduction_falls_back_to_formula(self, monkeypatch):
         monkeypatch.setattr("broker_client.llm_roi_analyzer.settings.OPTIONS_MARGIN_BASIS", "reg_t")
         expiry = _future_expiry(40)
-        # projected == buying_power → reduction 0 → formula fallback.
-        broker = FakeBroker(_make_chain(expiry), buying_power=10_000.0, projected_bp=10_000.0)
+        # projected == available funds → reduction 0 → formula fallback.
+        broker = FakeBroker(_make_chain(expiry), available_funds=10_000.0, projected_af=10_000.0)
         a = LLMROIAnalyzer(broker=broker)
         roi = a.build_put_roi("HOOD", 8.0, expiry, use_broker_margin=True)
         assert roi.margin_basis == "reg_t"
@@ -372,15 +390,15 @@ class TestBuildRoiTable:
                 return super().get_account()
 
         broker = CountingBroker(
-            _make_multi_expiry_chain(exps), buying_power=10_000.0, projected_bp=9_000.0
+            _make_multi_expiry_chain(exps), available_funds=10_000.0, projected_af=9_000.0
         )
         a = LLMROIAnalyzer(broker=broker)
         table = a.build_roi_table("HOOD", 8.0, underlying_price=12.9, use_broker_margin=True)
         assert len(table) == 3
-        # Every row uses the real (preview) margin: 10000 − 9000 = 1000.
+        # Every row uses the real available-funds reduction: 10000 − 9000 = 1000.
         assert all(r.margin_basis == "schwab_preview" for r in table)
         assert all(r.margin_per_contract == pytest.approx(1000.0) for r in table)
-        # Account buying power fetched ONCE for the whole table, not per row.
+        # Account available funds fetched ONCE for the whole table, not per row.
         assert broker.account_calls == 1
 
 

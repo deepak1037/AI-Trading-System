@@ -201,11 +201,12 @@ class SchwabBroker(BaseBroker):
             resp.raise_for_status()
             bal = resp.json().get("securitiesAccount", {}).get("currentBalances", {})
             return Account(
-                account_id   = str(settings.SCHWAB_ACCOUNT_NUMBER),
-                cash         = float(bal.get("cashBalance", 0.0)),
-                equity       = float(bal.get("liquidationValue", 0.0)),
-                buying_power = float(bal.get("buyingPower", 0.0)),
-                margin_used  = float(bal.get("maintenanceRequirement", 0.0)),
+                account_id      = str(settings.SCHWAB_ACCOUNT_NUMBER),
+                cash            = float(bal.get("cashBalance", 0.0)),
+                equity          = float(bal.get("liquidationValue", 0.0)),
+                buying_power    = float(bal.get("buyingPower", 0.0)),
+                available_funds = float(bal.get("availableFunds", 0.0)),
+                margin_used     = float(bal.get("maintenanceRequirement", 0.0)),
             )
         except BrokerError:
             raise
@@ -359,6 +360,7 @@ class SchwabBroker(BaseBroker):
             return OrderPreview(
                 estimated_cost      = abs(float(balance.get("orderValue", 0.0))),
                 buying_power_effect = float(balance.get("projectedBuyingPower", 0.0)),
+                projected_available_fund = float(balance.get("projectedAvailableFund", 0.0)),
                 margin_impact       = 0.0,
                 fees                = float(balance.get("projectedCommission", 0.0)),
                 is_valid            = is_valid,
@@ -509,6 +511,7 @@ class SchwabBroker(BaseBroker):
             return OrderPreview(
                 estimated_cost      = abs(float(balance.get("orderValue", 0.0))),
                 buying_power_effect = float(balance.get("projectedBuyingPower", 0.0)),
+                projected_available_fund = float(balance.get("projectedAvailableFund", 0.0)),
                 margin_impact       = 0.0,
                 fees                = float(balance.get("projectedCommission", settings.PAPER_OPTIONS_COMMISSION * order.qty)),
                 is_valid            = is_valid,
