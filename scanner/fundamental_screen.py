@@ -114,10 +114,19 @@ class FundamentalScreen:
             import moomoo as ft  # type: ignore[import-untyped]
 
             ctx = self._ensure_moomoo_ctx()
-            ret, data = ctx.get_financials_statements(
-                f"US.{ticker}", statement_type=1, financial_type=10, num=12
-            )
-            if ret != ft.RET_OK or not isinstance(data, dict):
+            data = None
+            for attempt in range(2):
+                ret, data = ctx.get_financials_statements(
+                    f"US.{ticker}", statement_type=1, financial_type=10, num=12
+                )
+                if ret == ft.RET_OK and isinstance(data, dict):
+                    break
+                # Back off once on the 30/30s frequency cap, then give up.
+                if attempt == 0 and "high frequency" in str(data).lower():
+                    time.sleep(2.0)
+                    continue
+                return None
+            if not isinstance(data, dict):
                 return None
             quarters = []
             for rep in data.get("report_list", []):
@@ -289,8 +298,13 @@ class FundamentalScreen:
         so downstream scoring uses real fundamental flags, not a flat value.
         """
         source = self._resolve_source()
-        # Only the yfinance .info path is rate-limited; Moomoo is local, FMP paid.
-        pace = settings.SCANNER_YF_PACE_SECONDS if source == "yfinance" else 0.0
+        # Pace per source: yfinance .info has its own limit; Moomoo OpenD caps
+        # financial-statement calls at 30/30s (~1/s); FMP (paid) is unmetered here.
+        pace = {
+            "yfinance": settings.SCANNER_YF_PACE_SECONDS,
+            "moomoo": settings.MOOMOO_PACE_SECONDS,
+            "fmp": 0.0,
+        }[source]
         flag_fn = {
             "moomoo": self._moomoo_flags,
             "fmp": self._fmp_flags,

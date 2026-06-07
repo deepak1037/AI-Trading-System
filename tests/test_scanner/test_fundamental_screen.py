@@ -136,6 +136,7 @@ class TestFundamentalScreenIntegration:
         assert calls["fallback"] == 2 and calls["fmp"] == 0 and calls["moomoo"] == 0
 
     def test_screen_routes_to_moomoo(self, monkeypatch):
+        monkeypatch.setattr("scanner.fundamental_screen.settings.MOOMOO_PACE_SECONDS", 0.0)
         s = FundamentalScreen()
         s._source = "moomoo"
         calls = {"fallback": 0, "fmp": 0, "moomoo": 0}

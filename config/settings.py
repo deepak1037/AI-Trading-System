@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     # Moomoo OpenD (local gateway) — primary Stage 3 fundamentals source.
     MOOMOO_HOST: str = "127.0.0.1"
     MOOMOO_PORT: int = 11111
+    # OpenD financial-statement quota is 30 requests / 30s (~1/s). Pace at 1.1s
+    # to stay safely under it across a large universe.
+    MOOMOO_PACE_SECONDS: float = 1.1
 
     # ── LLM (Claude) — options ROI analysis ───────────────────
     ANTHROPIC_API_KEY: str = ""
