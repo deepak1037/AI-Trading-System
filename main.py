@@ -1,12 +1,9 @@
-"""Entry point (CLAUDE.md Section 4): starts watcher + position watcher.
-
-Day 1: database init + settings validation only.
-Day 5 adds scheduler.start(); Day 9 adds position_watcher.start().
-"""
+"""Entry point (CLAUDE.md Section 4): starts watcher + position watcher."""
 
 from __future__ import annotations
 
 import sys
+import time
 
 from config.settings import settings
 from core.logger import get_logger
@@ -24,9 +21,37 @@ def main() -> None:
     )
     init_db()
     logger.info("Database ready at %s", settings.DB_PATH)
-    # TODO Day 5: from watcher.scheduler import Scheduler; Scheduler().start()
-    # TODO Day 9: from broker_client.position_watcher import PositionWatcher; PositionWatcher().start()
-    logger.info("Startup complete. Sleeping until market phase activation.")
+
+    # Start watcher scheduler
+    from watcher.scheduler import WatcherScheduler
+    from watcher.calendar_guard import CalendarGuard
+    guard = CalendarGuard()
+
+    # Start position watcher if broker is configured
+    from broker_core.factory import get_broker
+    from broker_client.order_router import OrderRouter
+    from broker_client.position_watcher import PositionWatcher
+
+    broker = get_broker()
+    router = OrderRouter(broker=broker)
+    watcher = PositionWatcher(broker=broker, router=router)
+    watcher.start()
+    logger.info("PositionWatcher started")
+
+    scheduler = WatcherScheduler(calendar_guard=guard)
+    scheduler.start()
+    logger.info("WatcherScheduler started — running phases per market calendar")
+
+    logger.info("Startup complete. System is live.")
+
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested — stopping scheduler and watcher.")
+        scheduler.stop()
+        watcher.stop()
+        logger.info("Clean shutdown complete.")
 
 
 if __name__ == "__main__":
