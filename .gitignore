@@ -1,0 +1,39 @@
+# ── Secrets ───────────────────────────────────────────────
+.env
+schwab_token.json
+*.pem
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ── Tooling caches ────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ── Runtime data (gitignored per CLAUDE.md Section 4) ──────
+logs/*.log
+db/*.db
+paper_trading/accounts/*.json
+paper_trading/trades/*.csv
+paper_trading/backups/*.json
+
+# Keep the data directories themselves tracked.
+!**/.gitkeep
+
+# ── OS / editor ───────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp

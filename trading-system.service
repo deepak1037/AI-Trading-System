@@ -1,0 +1,45 @@
+[Unit]
+Description=AI-Trading-System — automated stock trading engine
+Documentation=https://github.com/yourname/ai-trading-system
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/ai-trading-system
+
+# Load secrets from .env (file must be chmod 600, owned by trading user)
+EnvironmentFile=/opt/ai-trading-system/.env
+
+ExecStart=/opt/ai-trading-system/.venv/bin/python main.py
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy — come back up automatically but don't thrash
+Restart=on-failure
+RestartSec=30s
+StartLimitBurst=3
+StartLimitIntervalSec=120s
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/ai-trading-system /var/log/ai-trading-system
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Give the process time to flush logs on stop
+TimeoutStopSec=30s
+
+# Journal settings — also writes to LOG_FILE in .env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-system
+
+[Install]
+WantedBy=multi-user.target
