@@ -196,7 +196,7 @@ class SchwabBroker(BaseBroker):
         try:
             resp = self._client.get_account(
                 account_hash = self._account_hash,
-                fields       = ["positions"],
+                fields       = [self._client.Account.Fields.POSITIONS],
             )
             resp.raise_for_status()
             bal = resp.json().get("securitiesAccount", {}).get("currentBalances", {})
@@ -219,7 +219,7 @@ class SchwabBroker(BaseBroker):
         try:
             resp = self._client.get_account(
                 account_hash = self._account_hash,
-                fields       = ["positions"],
+                fields       = [self._client.Account.Fields.POSITIONS],
             )
             resp.raise_for_status()
             raw = resp.json().get("securitiesAccount", {}).get("positions", [])
