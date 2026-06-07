@@ -30,15 +30,17 @@ def main() -> None:
     # Start position watcher if broker is configured
     from broker_core.factory import get_broker
     from broker_client.order_router import OrderRouter
+    from broker_client.position_manager import PositionManager
     from broker_client.position_watcher import PositionWatcher
 
     broker = get_broker()
     router = OrderRouter(broker=broker)
-    watcher = PositionWatcher(broker=broker, router=router)
+    position_manager = PositionManager()
+    watcher = PositionWatcher(broker=broker, router=router, position_manager=position_manager)
     watcher.start()
     logger.info("PositionWatcher started")
 
-    scheduler = WatcherScheduler(calendar_guard=guard)
+    scheduler = WatcherScheduler(calendar=guard)
     scheduler.start()
     logger.info("WatcherScheduler started — running phases per market calendar")
 
