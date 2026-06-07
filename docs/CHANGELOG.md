@@ -62,6 +62,17 @@ tf 5, from 30/25/20/15/10) via new `SCANNER_WEIGHT_*` settings — squeeze/tf cu
 because quality momentum leaders rarely have short-squeeze setups. Result: range
 65–83, 96 names; NVDA=74, ASML=71, AMD=74 now rank above F=67, CVS=67, INTC(<65).
 
+**Moomoo OpenD is now the primary Stage 3 source** (free, local, accurate
+quarterly EPS). Priority: Moomoo → FMP(paid) → yfinance. `_moomoo_flags` uses
+`get_financials_statements` (income statement; diluted EPS 8048 / revenue 8001),
+filters `report_list` to quarters, derives eps_accelerating (QoQ|YoY) +
+rev_reaccelerating (YoY>5%). OpenD caps financials at 30 req/30s → paced at
+`MOOMOO_PACE_SECONDS=1.1`. Because Moomoo is local, Stage 3 no longer consumes
+the yfinance budget. Live result: Stage 3 431/516, watchlist **89 names, range
+65–83**, and **CRWD now appears (score 68)** — its real quarterly EPS (0.11/0.15
+recovering from losses) flips `eps_accelerating` True, which the GAAP yfinance
+fallback missed. settings: MOOMOO_HOST/PORT/PACE_SECONDS.
+
 **FMP free tier is unusable for fundamentals.** FMP deprecated `/api/v3`
 (Aug 2025) and made per-symbol income statements paid — a free key returns HTTP
 402 for non-demo symbols. `fundamental_screen` now uses the `/stable` API and
