@@ -53,25 +53,104 @@ class UniverseDownloader:
 
     def _get_tickers_from_sources(self) -> list[str]:
         """Fetch ticker list from multiple reliable sources."""
+        import requests
+
         tickers: set[str] = set()
+        session = requests.Session()
+        session.headers["User-Agent"] = (
+            "AI-Trading-System/1.0 (research; contact: trading@example.com)"
+        )
 
-        # Method 1: SP500 from Wikipedia via pandas
+        # ── Method 1: NASDAQ Trader FTP — official exchange listings ────────
+        # nasdaqlisted.txt  → all NASDAQ-listed stocks
+        # otherlisted.txt   → NYSE / AMEX / other exchange stocks
+        for url, label in [
+            ("http://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",  "NASDAQ"),
+            ("http://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",   "Other exchanges"),
+        ]:
+            try:
+                resp = session.get(url, timeout=15)
+                resp.raise_for_status()
+                df = pd.read_csv(
+                    pd.io.common.StringIO(resp.text),
+                    sep="|",
+                    dtype=str,
+                )
+                # nasdaqlisted: Symbol column; otherlisted: ACT Symbol column
+                col = "Symbol" if "Symbol" in df.columns else "ACT Symbol"
+                syms = (
+                    df[col]
+                    .dropna()
+                    .str.strip()
+                    .replace(".", "-", regex=False)
+                )
+                # Drop test symbols, warrants, units, preferred (contain $ ^ /)
+                valid = [s for s in syms if s and not any(c in s for c in "$^/~")]
+                # Last row is a file-creation-date trailer — filter non-alpha starts
+                valid = [s for s in valid if s[0].isalpha()]
+                tickers.update(valid)
+                logger.debug("NASDAQ Trader FTP (%s): %d tickers", label, len(valid))
+            except Exception as exc:
+                logger.warning("NASDAQ FTP %s fetch failed: %s", label, exc)
+
+        # ── Method 2: SEC EDGAR company_tickers — all SEC-registered US equities
         try:
-            sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-            tickers.update(sp500["Symbol"].str.replace(".", "-", regex=False).tolist())
-            logger.debug("Fetched %d S&P500 tickers", len(tickers))
+            resp = session.get(
+                "https://www.sec.gov/files/company_tickers.json",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            syms = [
+                v["ticker"].replace(".", "-")
+                for v in data.values()
+                if v.get("ticker") and v["ticker"][0].isalpha()
+                and not any(c in v["ticker"] for c in "$^/~")
+            ]
+            tickers.update(syms)
+            logger.debug("SEC EDGAR company_tickers: %d tickers", len(syms))
         except Exception as exc:
-            logger.warning("S&P500 fetch failed: %s", exc)
+            logger.warning("SEC EDGAR fetch failed: %s", exc)
 
-        # Method 2: Nasdaq-100 from Wikipedia
+        # ── Method 3: S&P 500 from GitHub datasets CSV (always up-to-date) ──
         try:
-            ndx = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")[4]
-            tickers.update(ndx["Ticker"].tolist())
+            resp = session.get(
+                "https://raw.githubusercontent.com/datasets/s-and-p-500-companies"
+                "/main/data/constituents.csv",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            sp500 = pd.read_csv(pd.io.common.StringIO(resp.text))
+            syms = sp500["Symbol"].str.replace(".", "-", regex=False).tolist()
+            tickers.update(syms)
+            logger.debug("GitHub S&P500 CSV: %d tickers", len(syms))
         except Exception as exc:
-            logger.warning("NDX100 fetch failed: %s", exc)
+            logger.warning("GitHub S&P500 CSV fetch failed: %s", exc)
 
-        # Method 3: Russell 2000 approximation — use iShares IWM holdings CSV
-        # TODO: add Polygon.io ticker endpoint when API key is available
+        # ── Method 4: GitHub S&P 500 from GitHub datasets CSV ────────────────
+        # (already fetched above as Method 3, this keeps the old name consistent)
+
+        # ── Method 5: Wikipedia S&P500 (fallback with proper User-Agent) ────
+        if len(tickers) < 100:
+            for url, tbl_idx, col, label in [
+                (
+                    "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                    0, "Symbol", "Wikipedia S&P500",
+                ),
+                (
+                    "https://en.wikipedia.org/wiki/Nasdaq-100",
+                    4, "Ticker", "Wikipedia NDX100",
+                ),
+            ]:
+                try:
+                    resp = session.get(url, timeout=10)
+                    resp.raise_for_status()
+                    df = pd.read_html(pd.io.common.StringIO(resp.text))[tbl_idx]
+                    syms = df[col].str.replace(".", "-", regex=False).tolist()
+                    tickers.update(syms)
+                    logger.debug("%s: %d tickers", label, len(syms))
+                except Exception as exc:
+                    logger.warning("%s fetch failed: %s", label, exc)
 
         logger.info("UniverseDownloader: %d raw tickers from sources", len(tickers))
         return sorted(tickers)
