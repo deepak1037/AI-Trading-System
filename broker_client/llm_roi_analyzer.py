@@ -813,6 +813,8 @@ Recent price action: {ctx.get('price_narrative') or 'n/a'}
     def _call_llm(
         self, roi: PutROIResult, ticker: str, ctx: dict
     ) -> LLMAssessment:
+        import anthropic
+
         client = self._ensure_client()
         user_prompt = self._build_user_prompt(roi, ticker, ctx)
         logger.debug("LLM ROI prompt for %s:\n%s", ticker, user_prompt)
@@ -831,7 +833,30 @@ Recent price action: {ctx.get('price_narrative') or 'n/a'}
                     if getattr(block, "type", None) == "text"
                 )
                 return self._parse_assessment(text)
-            except Exception as exc:  # noqa: BLE001 — retry transient API errors
+            except anthropic.APIStatusError as exc:
+                status = getattr(exc, "status_code", None)
+                # Retry only transient server-side conditions (429 / 5xx).
+                if status == 429 or (status is not None and status >= 500):
+                    last_exc = exc
+                    logger.warning(
+                        "LLM transient error %s (attempt %d/%d)",
+                        status, attempt, settings.API_MAX_RETRIES,
+                    )
+                    continue
+                # Non-transient (4xx) — surface immediately with a clear message.
+                msg = str(getattr(exc, "message", "") or exc)
+                if "credit balance" in msg.lower():
+                    raise DataError(
+                        "Anthropic API credit balance is too low — add credits at "
+                        "console.anthropic.com (Plans & Billing) to enable the Claude "
+                        "assessment. The ROI table above does not need it.",
+                        ticker=ticker,
+                    ) from exc
+                raise DataError(
+                    f"Anthropic API rejected the request ({status}): {msg}",
+                    ticker=ticker,
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 — retry transient (conn/timeout/parse)
                 last_exc = exc
                 logger.warning(
                     "LLM call attempt %d/%d failed: %s",

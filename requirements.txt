@@ -30,7 +30,8 @@ transformers==4.46.3
 torch==2.5.1
 
 # ── LLM (Claude) — options ROI analysis ───────────────────
-anthropic==0.39.0
+# >=0.40 required: 0.39 passes the removed `proxies` kwarg to httpx>=0.28.
+anthropic==0.107.0
 
 # ── Backtesting / volatility ──────────────────────────────
 lumibot==3.8.6

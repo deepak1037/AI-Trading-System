@@ -489,3 +489,69 @@ class TestAnalyzePutOpportunity:
         with pytest.raises(DataError, match="failed after 2 attempts"):
             a.analyze_put_opportunity(roi, "HOOD")
         assert a._client.messages.n == 2
+
+    def _status_error(self, status: int, message: str):
+        """Build an anthropic.APIStatusError instance without a real response."""
+        import anthropic
+
+        exc = anthropic.APIStatusError.__new__(anthropic.APIStatusError)
+        exc.status_code = status
+        exc.message = message
+        return exc
+
+    def test_billing_error_no_retry_clear_message(self, analyzer, monkeypatch):
+        a, expiry = analyzer
+        monkeypatch.setattr(
+            "broker_client.llm_roi_analyzer.settings.ANTHROPIC_API_KEY", "sk-test"
+        )
+        monkeypatch.setattr("broker_client.llm_roi_analyzer.settings.API_MAX_RETRIES", 3)
+        monkeypatch.setattr(a, "_gather_context", lambda t, r: {})
+        err = self._status_error(400, "Your credit balance is too low to access the API.")
+
+        class _Msgs:
+            def __init__(self, e):
+                self.n = 0
+                self._e = e
+
+            def create(self, **kw):
+                self.n += 1
+                raise self._e
+
+        class _Client:
+            def __init__(self, e):
+                self.messages = _Msgs(e)
+
+        a._client = _Client(err)
+        roi = a.build_put_roi("HOOD", 8.0, expiry)
+        with pytest.raises(DataError, match="credit balance"):
+            a.analyze_put_opportunity(roi, "HOOD")
+        # 4xx is non-transient: called exactly once, NOT retried.
+        assert a._client.messages.n == 1
+
+    def test_server_error_is_retried(self, analyzer, monkeypatch):
+        a, expiry = analyzer
+        monkeypatch.setattr(
+            "broker_client.llm_roi_analyzer.settings.ANTHROPIC_API_KEY", "sk-test"
+        )
+        monkeypatch.setattr("broker_client.llm_roi_analyzer.settings.API_MAX_RETRIES", 3)
+        monkeypatch.setattr(a, "_gather_context", lambda t, r: {})
+        err = self._status_error(503, "service unavailable")
+
+        class _Msgs:
+            def __init__(self, e):
+                self.n = 0
+                self._e = e
+
+            def create(self, **kw):
+                self.n += 1
+                raise self._e
+
+        class _Client:
+            def __init__(self, e):
+                self.messages = _Msgs(e)
+
+        a._client = _Client(err)
+        roi = a.build_put_roi("HOOD", 8.0, expiry)
+        with pytest.raises(DataError, match="failed after 3 attempts"):
+            a.analyze_put_opportunity(roi, "HOOD")
+        assert a._client.messages.n == 3  # 5xx IS transient — retried
