@@ -155,49 +155,73 @@ class UniverseDownloader:
         logger.info("UniverseDownloader: %d raw tickers from sources", len(tickers))
         return sorted(tickers)
 
-    @retry(max_attempts=3, backoff_seconds=2.0)
-    def liquidity_filter(self, tickers: list[str], batch_size: int = 100) -> list[str]:
-        """Stage 2: apply price/volume/mktcap filters. Returns passing tickers."""
+    def liquidity_filter(self, tickers: list[str], batch_size: int = 25) -> list[str]:
+        """Stage 2: apply price/volume/mktcap filters. Returns passing tickers.
+
+        Uses small batches with inter-batch sleep to respect yfinance rate limits.
+        Batch size 25 + 1.5s sleep keeps requests well under Yahoo's ~2 req/s limit.
+        """
+        import time
+
         import yfinance as yf
 
         passing: list[str] = []
         total = len(tickers)
+        i = 0
+        consecutive_rate_limits = 0
 
-        for i in range(0, total, batch_size):
+        while i < total:
             batch = tickers[i : i + batch_size]
-            logger.debug("Liquidity filter: batch %d-%d of %d", i, i + batch_size, total)
+            pct = (i / total * 100) if total else 0
+            logger.info(
+                "Liquidity filter: batch %d-%d of %d (%.0f%%)",
+                i + 1, min(i + batch_size, total), total, pct,
+            )
             try:
                 data = yf.download(
                     " ".join(batch),
                     period="30d",
                     interval="1d",
                     progress=False,
-                    threads=True,
+                    threads=False,  # serial downloads respect rate limits better
                 )
-                info_batch = yf.Tickers(" ".join(batch))
+                consecutive_rate_limits = 0
+
+                # yfinance returns MultiIndex columns when >1 ticker
+                close_df = None
+                vol_df = None
+                if isinstance(data.columns, pd.MultiIndex):
+                    if "Close" in data.columns.get_level_values(0):
+                        close_df = data["Close"]
+                    if "Volume" in data.columns.get_level_values(0):
+                        vol_df = data["Volume"]
+                else:
+                    # Single ticker — wrap as DataFrame
+                    if "Close" in data.columns:
+                        close_df = data[["Close"]].rename(columns={"Close": batch[0]})
+                    if "Volume" in data.columns:
+                        vol_df = data[["Volume"]].rename(columns={"Volume": batch[0]})
 
                 for ticker in batch:
                     try:
-                        if "Close" in data.columns:
-                            close_col = data["Close"][ticker] if ticker in data["Close"] else None
-                        else:
-                            close_col = None
+                        price = 0.0
+                        avg_vol = 0.0
+                        if close_df is not None and ticker in close_df.columns:
+                            col = close_df[ticker].dropna()
+                            if not col.empty:
+                                price = float(col.iloc[-1])
+                        if vol_df is not None and ticker in vol_df.columns:
+                            col = vol_df[ticker].dropna()
+                            if not col.empty:
+                                avg_vol = float(col.mean())
 
-                        price = float(close_col.dropna().iloc[-1]) if close_col is not None and not close_col.dropna().empty else 0.0
-
-                        if "Volume" in data.columns:
-                            vol_col = data["Volume"][ticker] if ticker in data["Volume"] else None
-                        else:
-                            vol_col = None
-                        avg_vol = float(vol_col.dropna().mean()) if vol_col is not None and not vol_col.dropna().empty else 0.0
-
-                        info = info_batch.tickers.get(ticker)
+                        # Market cap from fast_info (cached; no extra HTTP request)
                         mktcap = 0.0
-                        if info:
-                            try:
-                                mktcap = float(info.fast_info.get("marketCap", 0) or 0)
-                            except Exception:
-                                mktcap = 0.0
+                        try:
+                            fi = yf.Ticker(ticker).fast_info
+                            mktcap = float(getattr(fi, "market_cap", None) or 0)
+                        except Exception:
+                            mktcap = 0.0
 
                         if (
                             price >= settings.SCANNER_UNIVERSE_MIN_PRICE
@@ -207,8 +231,26 @@ class UniverseDownloader:
                             passing.append(ticker)
                     except Exception as ticker_exc:
                         logger.debug("Liquidity filter skip %s: %s", ticker, ticker_exc)
+
+                i += batch_size
+                # Respect rate limit: sleep between every batch
+                if i < total:
+                    time.sleep(1.5)
+
             except Exception as batch_exc:
-                logger.warning("Liquidity filter batch error: %s", batch_exc)
+                err = str(batch_exc)
+                if "RateLimit" in err or "Too Many Requests" in err or "rate limit" in err.lower():
+                    consecutive_rate_limits += 1
+                    wait = min(30 * consecutive_rate_limits, 120)
+                    logger.warning(
+                        "yfinance rate limited. Waiting %ds before retrying batch %d...",
+                        wait, i,
+                    )
+                    time.sleep(wait)
+                    # Do NOT advance i — retry same batch
+                else:
+                    logger.warning("Liquidity filter batch error: %s", batch_exc)
+                    i += batch_size  # skip broken batch, continue
 
         logger.info("UniverseDownloader: %d/%d tickers pass liquidity filter", len(passing), total)
         return passing
