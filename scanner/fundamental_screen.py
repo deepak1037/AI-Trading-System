@@ -29,7 +29,8 @@ from core.logger import get_logger
 
 logger = get_logger(__name__)
 
-_FMP_BASE = "https://financialmodelingprep.com/api/v3"
+# FMP migrated off the legacy /api/v3 endpoints (Aug 2025) to /stable.
+_FMP_BASE = "https://financialmodelingprep.com/stable"
 
 
 class FundamentalScreen:
@@ -40,29 +41,59 @@ class FundamentalScreen:
         self._fmp_key = settings.FMP_API_KEY
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "AI-Trading-System/1.0"
-        if not self._fmp_key:
+        # Resolved lazily on first screen() so construction stays network-free.
+        self._use_fmp: Optional[bool] = None
+
+    def _resolve_source(self) -> bool:
+        """Decide FMP vs yfinance once, log it, and cache the decision.
+
+        Only uses FMP if the key can actually pull fundamentals — the FMP FREE
+        tier returns HTTP 402 for income statements on non-demo symbols, so a
+        set-but-unprivileged key must still fall back to yfinance.
+        """
+        if self._use_fmp is not None:
+            return self._use_fmp
+        self._use_fmp = bool(self._fmp_key) and self._fmp_fundamentals_available()
+        if self._use_fmp:
+            logger.info("Scanner data source: FMP")
+        elif self._fmp_key:
             logger.warning(
-                "FMP_API_KEY not set — Stage 3 using simplified yfinance .info "
-                "filter with lenient thresholds. Set FMP_API_KEY in .env for the "
-                "full EPS/revenue/estimate-revision screen."
+                "Scanner data source: yfinance fallback — FMP_API_KEY is set but "
+                "fundamentals are not accessible on this plan (free tier returns "
+                "402 for income statements). A paid FMP plan is required."
             )
+        else:
+            logger.warning(
+                "Scanner data source: yfinance fallback — FMP_API_KEY not set."
+            )
+        return self._use_fmp
 
     # ── FMP path ─────────────────────────────────────────────────────────────
-    def _fmp_get(self, path: str, **params) -> Any:
+    def _fmp_get(self, endpoint: str, **params) -> Any:
         params["apikey"] = self._fmp_key
         try:
             resp = self._session.get(
-                f"{_FMP_BASE}/{path}", params=params, timeout=15
+                f"{_FMP_BASE}/{endpoint}", params=params, timeout=15
             )
             if resp.status_code == 429:
-                logger.warning("FMP rate limited on %s — backing off", path)
+                logger.warning("FMP rate limited on %s — backing off", endpoint)
                 time.sleep(2.0)
                 return None
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("FMP %s failed: %s", path, exc)
+            logger.debug("FMP %s failed: %s", endpoint, exc)
             return None
+
+    def _fmp_fundamentals_available(self) -> bool:
+        """Probe whether the key can pull income statements for the whole universe.
+
+        The FMP free tier allows only a small demo set of megacaps (AAPL, MSFT,
+        …) and returns 402 for everything else. Probe with a non-megacap symbol
+        (CRWD) so a free key is correctly detected as unusable for the scan.
+        """
+        data = self._fmp_get("income-statement", symbol="CRWD", period="quarter", limit=1)
+        return isinstance(data, list) and bool(data) and "revenue" in data[0]
 
     def _fmp_flags(self, ticker: str) -> Optional[dict]:
         """Return fundamental flags from FMP quarterly data, or None if failing.
@@ -71,12 +102,12 @@ class FundamentalScreen:
         A ticker passes if any flag is True.
         """
         income = self._fmp_get(
-            f"income-statement/{ticker}", period="quarter", limit=8
+            "income-statement", symbol=ticker, period="quarter", limit=8
         )
         if not isinstance(income, list) or len(income) < 2:
             return None
 
-        eps = [self._num(q.get("epsdiluted", q.get("eps"))) for q in income]
+        eps = [self._num(q.get("epsDiluted", q.get("eps"))) for q in income]
         rev = [self._num(q.get("revenue")) for q in income]
 
         eps_qoq = eps[0] is not None and eps[1] is not None and eps[0] > eps[1]
@@ -97,15 +128,16 @@ class FundamentalScreen:
         return flags if any(flags.values()) else None
 
     def _fmp_estimates_positive(self, ticker: str) -> bool:
-        """Best-effort: analyst estimating rising EPS next quarter vs current."""
+        """Best-effort: analysts estimating rising EPS next period vs current."""
         data = self._fmp_get(
-            f"analyst-estimates/{ticker}", period="quarter", limit=2
+            "analyst-estimates", symbol=ticker, period="quarter", limit=2
         )
         if not isinstance(data, list) or len(data) < 2:
             return False
-        # FMP returns most-recent first; compare next-period estimate to current.
-        nxt = self._num(data[0].get("estimatedEpsAvg"))
-        cur = self._num(data[1].get("estimatedEpsAvg"))
+        # FMP returns most-recent first; field name varies by API version.
+        def _eps_avg(row: dict) -> Optional[float]:
+            return self._num(row.get("epsAvg", row.get("estimatedEpsAvg")))
+        nxt, cur = _eps_avg(data[0]), _eps_avg(data[1])
         return nxt is not None and cur is not None and cur != 0 and nxt > cur
 
     # ── Fallback path (yfinance .info, no earnings calendar) ─────────────────
@@ -172,7 +204,7 @@ class FundamentalScreen:
 
         so downstream scoring uses real fundamental flags, not a flat value.
         """
-        use_fmp = bool(self._fmp_key)
+        use_fmp = self._resolve_source()
         pace = settings.SCANNER_YF_PACE_SECONDS
         passing: list[dict] = []
         for ticker in tickers:

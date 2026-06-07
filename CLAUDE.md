@@ -667,7 +667,8 @@ All values from config. Alert deduplication: no repeat of same type within `ALER
 | 5 — Technical base | ~25–40 stocks | Daily 6 AM | Stage 2 breakout, cup & handle, RS rank > 85th pct |
 
 **Watchlist entry threshold:** composite score ≥ 65 / 100
-**Scoring weights:** fundamental(30%) + institutional(25%) + technical(20%) + squeeze(15%) + tf_alignment(10%)
+**Scoring weights** (in `settings.SCANNER_WEIGHT_*`, must sum to 100): fundamental(35%) + institutional(25%) + technical(30%) + squeeze(5%) + tf_alignment(5%)
+  *(re-weighted from the original 30/25/20/15/10 — squeeze/tf reduced because quality momentum leaders rarely have short-squeeze setups; technical+fundamental raised. See docs/CHANGELOG.md.)*
 
 **Self-update logic:**
 - Weekly: full 5-stage funnel rerun

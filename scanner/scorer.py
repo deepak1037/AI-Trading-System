@@ -19,15 +19,21 @@ logger = get_logger(__name__)
 
 
 class CompositeScorer:
-    """Compute 0-100 composite score from individual signal components."""
+    """Compute 0-100 composite score from individual signal components.
 
-    WEIGHTS = {
-        "fundamental": 30,
-        "institutional": 25,
-        "technical": 20,
-        "squeeze": 15,
-        "tf_alignment": 10,
-    }
+    Weights come from ``settings.SCANNER_WEIGHT_*`` (validated to sum to 100) so
+    they can be re-tuned without code changes.
+    """
+
+    @property
+    def WEIGHTS(self) -> dict[str, int]:
+        return {
+            "fundamental": settings.SCANNER_WEIGHT_FUNDAMENTAL,
+            "institutional": settings.SCANNER_WEIGHT_INSTITUTIONAL,
+            "technical": settings.SCANNER_WEIGHT_TECHNICAL,
+            "squeeze": settings.SCANNER_WEIGHT_SQUEEZE,
+            "tf_alignment": settings.SCANNER_WEIGHT_TF_ALIGNMENT,
+        }
 
     def score(
         self,

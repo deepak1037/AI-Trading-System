@@ -157,6 +157,13 @@ class Settings(BaseSettings):
     SCANNER_WATCHLIST_THRESHOLD: int = 65  # min composite score to enter watchlist
     SCANNER_FULL_RUN_DAY: str = "sunday"
     SCANNER_DAILY_RUN_HOUR: int = 6  # 6 AM ET
+    # Composite scoring weights for the multi-bagger scanner (must sum to 100).
+    # Distinct from the signal-fusion WEIGHT_* fields above (live trader).
+    SCANNER_WEIGHT_FUNDAMENTAL: int = 35
+    SCANNER_WEIGHT_INSTITUTIONAL: int = 25
+    SCANNER_WEIGHT_TECHNICAL: int = 30
+    SCANNER_WEIGHT_SQUEEZE: int = 5
+    SCANNER_WEIGHT_TF_ALIGNMENT: int = 5
     # Sleep between per-ticker yfinance calls in Stages 3-5 (seconds). 0 = no
     # pacing. Set >0 (e.g. 0.6) to stay under yfinance's burst rate limit on
     # large universes, so the later stages aren't starved of data.
@@ -219,6 +226,18 @@ class Settings(BaseSettings):
         if weight_sum != 100:
             raise ConfigError(
                 "Signal fusion weights must sum to 100", actual_sum=weight_sum
+            )
+
+        scanner_weight_sum = (
+            self.SCANNER_WEIGHT_FUNDAMENTAL
+            + self.SCANNER_WEIGHT_INSTITUTIONAL
+            + self.SCANNER_WEIGHT_TECHNICAL
+            + self.SCANNER_WEIGHT_SQUEEZE
+            + self.SCANNER_WEIGHT_TF_ALIGNMENT
+        )
+        if scanner_weight_sum != 100:
+            raise ConfigError(
+                "Scanner scoring weights must sum to 100", actual_sum=scanner_weight_sum
             )
 
         # The live triple-gate must be internally consistent (Section 2).

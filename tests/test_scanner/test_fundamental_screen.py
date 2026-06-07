@@ -25,7 +25,8 @@ class TestNum:
 
 # ── FMP path ──────────────────────────────────────────────────────────────────
 def _income(eps_rev: list[tuple[float, float]]) -> list[dict]:
-    return [{"epsdiluted": e, "revenue": r} for e, r in eps_rev]
+    # Stable-API field name is camelCase epsDiluted.
+    return [{"epsDiluted": e, "revenue": r} for e, r in eps_rev]
 
 
 class TestFmpFlags:
@@ -117,11 +118,14 @@ class TestFallbackFlags:
 # ── Integration: screen() returns list[dict] ──────────────────────────────────
 class TestFundamentalScreenIntegration:
     def test_screen_empty_tickers(self):
-        assert FundamentalScreen().screen([]) == []
+        s = FundamentalScreen()
+        s._use_fmp = False  # avoid the capability network probe
+        assert s.screen([]) == []
 
     def test_screen_routes_to_fallback_when_no_key(self, monkeypatch):
         s = FundamentalScreen()
         s._fmp_key = ""
+        s._use_fmp = False  # resolved (no key)
         calls = {"fallback": 0, "fmp": 0}
         flags = {"eps_accelerating": True, "rev_reaccelerating": False, "est_revisions_up": False}
         monkeypatch.setattr(s, "_fallback_flags", lambda t: calls.__setitem__("fallback", calls["fallback"] + 1) or flags)
@@ -134,6 +138,7 @@ class TestFundamentalScreenIntegration:
     def test_screen_routes_to_fmp_when_key_set(self, monkeypatch):
         s = FundamentalScreen()
         s._fmp_key = "test-key"
+        s._use_fmp = True  # resolved (key has fundamentals access)
         calls = {"fallback": 0, "fmp": 0}
         flags = {"eps_accelerating": True, "rev_reaccelerating": False, "est_revisions_up": False}
         monkeypatch.setattr(s, "_fallback_flags", lambda t: calls.__setitem__("fallback", calls["fallback"] + 1) or flags)

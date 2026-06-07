@@ -18,12 +18,12 @@ class TestCompositeScorer:
         assert score == 100
 
     def test_score_partial(self):
-        # Only fundamental at 100 → 30% of 100 = 30
+        # Only fundamental at 100 → fundamental weight (35) % of 100 = 35
         score = self.scorer.score(fundamental_score=100.0)
-        assert score == 30
+        assert score == self.scorer.WEIGHTS["fundamental"]
 
     def test_score_weights_sum_to_100(self):
-        total = sum(CompositeScorer.WEIGHTS.values())
+        total = sum(self.scorer.WEIGHTS.values())
         assert total == 100
 
     def test_score_clamped_to_100(self):
