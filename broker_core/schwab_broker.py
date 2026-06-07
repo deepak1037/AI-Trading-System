@@ -229,13 +229,31 @@ class SchwabBroker(BaseBroker):
                 long_qty  = float(p.get("longQuantity", 0))
                 short_qty = float(p.get("shortQuantity", 0))
                 qty       = int(long_qty - short_qty)
+                asset_type = inst.get("assetType", "EQUITY")
+                # Options are priced per share; 1 contract = 100 shares.
+                # averagePrice and the derived current_price must both be per-share
+                # so that P&L math in the dashboard is consistent.
+                multiplier = 100 if asset_type == "OPTION" else 1
+                market_value = float(p.get("marketValue", 0.0))
+                if qty != 0:
+                    current_price = market_value / (qty * multiplier)
+                else:
+                    current_price = float(p.get("averagePrice", 0.0))
+                # Schwab returns total open P&L under several possible keys.
+                unrealized_pnl = next(
+                    (float(p[k]) for k in (
+                        "unrealizedPL", "longOpenProfitLoss",
+                        "shortOpenProfitLoss", "currentDayProfitLoss",
+                    ) if p.get(k) is not None),
+                    0.0,
+                )
                 positions.append(Position(
                     ticker         = inst.get("symbol", "UNKNOWN"),
                     qty            = qty,
                     avg_cost       = float(p.get("averagePrice", 0.0)),
-                    current_price  = float(p.get("marketValue", 0.0)) / max(1, abs(qty)),
-                    unrealized_pnl = float(p.get("unrealizedPL", p.get("currentDayProfitLoss", 0.0))),
-                    strategy_name  = "unknown",       # enriched by PositionWatcher from SQLite
+                    current_price  = current_price,
+                    unrealized_pnl = unrealized_pnl,
+                    strategy_name  = "unknown",
                     position_type  = _parse_position_type(inst, long_qty, short_qty),
                     opened_at      = datetime.now(tz=timezone.utc),
                 ))

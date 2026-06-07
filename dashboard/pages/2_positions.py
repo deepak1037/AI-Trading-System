@@ -99,13 +99,17 @@ for pos in positions:
 
     qty = pos.get("qty", 0)
     entry = pos.get("entry_price", 0)
+    pos_type = pos.get("position_type", "")
+    multiplier = 100 if "option" in pos_type else 1
 
-    if source == live_label and pos.get("unrealized_pnl") is not None:
-        unrealized_pnl = pos["unrealized_pnl"]
-        pnl_pct = unrealized_pnl / (entry * qty) * 100 if entry and qty else 0.0
+    broker_pnl = pos.get("unrealized_pnl")
+    if source == live_label and broker_pnl is not None and broker_pnl != 0.0:
+        unrealized_pnl = broker_pnl
     else:
-        unrealized_pnl = (live_price - entry) * qty
-        pnl_pct = (live_price - entry) / entry * 100 if entry else 0.0
+        unrealized_pnl = (live_price - entry) * qty * multiplier
+
+    cost_basis = abs(entry * qty * multiplier)
+    pnl_pct = unrealized_pnl / cost_basis * 100 if cost_basis else 0.0
 
     rows.append({
         "Ticker": ticker,
