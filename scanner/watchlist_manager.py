@@ -131,24 +131,28 @@ class WatchlistManager:
         stage5 = self._tech_screen.screen(list(stage4_data.keys()))
         stage5_by_ticker = {d["ticker"]: d for d in stage5}
 
-        added = 0
+        # Score every Stage 5 survivor; keep only those clearing the threshold.
+        qualifying: dict[str, int] = {}
         for ticker, tdata in stage5_by_ticker.items():
             score = self._composite_for(ticker, stage4_data.get(ticker, {}), tdata)
             if self._scorer.passes_watchlist_threshold(score):
-                self.add(ticker, composite_score=score)
-                added += 1
+                qualifying[ticker] = score
             else:
-                logger.debug("Stage5 %s scored %d (< threshold) — skipped", ticker, score)
+                logger.debug("Stage5 %s scored %d (< threshold)", ticker, score)
 
-        # Auto-remove tickers that no longer pass Stage 5
-        active = self.get_active()
-        for entry in active:
-            if entry["ticker"] not in stage5_by_ticker:
-                self.remove(entry["ticker"], reason="failed_stage5_rescan")
+        for ticker, score in qualifying.items():
+            self.add(ticker, composite_score=score)  # add or refresh score
+
+        # Remove any active name that no longer qualifies — whether it dropped
+        # out of Stage 5 OR is still in Stage 5 but now scores below threshold.
+        # (Without this, a name keeps a stale score forever.)
+        for entry in self.get_active():
+            if entry["ticker"] not in qualifying:
+                self.remove(entry["ticker"], reason="below_threshold_or_failed_stage5")
 
         logger.info(
-            "WatchlistManager.update_from_stage4: stage5=%d added=%d active=%d",
-            len(stage5_by_ticker), added, len(self.get_active()),
+            "WatchlistManager.update_from_stage4: stage5=%d qualifying=%d active=%d",
+            len(stage5_by_ticker), len(qualifying), len(self.get_active()),
         )
 
     def daily_rescan(self, stage4_data: dict[str, dict]) -> None:
