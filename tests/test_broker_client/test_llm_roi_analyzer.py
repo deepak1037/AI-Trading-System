@@ -17,8 +17,16 @@ from broker_client.llm_roi_analyzer import (
     LLMROIAnalyzer,
     PutROIResult,
 )
-from broker_core.base_broker import OptionsChain, OptionsContract, Quote
+from broker_core.base_broker import (
+    Account,
+    OptionsChain,
+    OptionsContract,
+    OrderPreview,
+    Quote,
+)
 from core.exceptions import DataError
+
+COMMISSION = 0.65  # settings.PAPER_OPTIONS_COMMISSION default
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
@@ -27,11 +35,21 @@ def _future_expiry(days: int = 40) -> str:
 
 
 class FakeBroker:
-    """Duck-typed broker: only the two methods the analyzer touches."""
+    """Duck-typed broker covering the methods the analyzer touches."""
 
-    def __init__(self, chain: OptionsChain, last: float = 12.90) -> None:
+    def __init__(
+        self,
+        chain: OptionsChain,
+        last: float = 12.90,
+        buying_power: float = 10_000.0,
+        projected_bp: float = 9_000.0,
+        preview_valid: bool = True,
+    ) -> None:
         self._chain = chain
         self._last = last
+        self._buying_power = buying_power
+        self._projected_bp = projected_bp
+        self._preview_valid = preview_valid
 
     def get_options_chain(self, ticker: str, expiry=None) -> OptionsChain:
         return self._chain
@@ -39,14 +57,27 @@ class FakeBroker:
     def get_quote(self, ticker: str) -> Quote:
         return Quote(ticker=ticker, bid=self._last - 0.01, ask=self._last + 0.01, last=self._last)
 
+    def get_account(self) -> Account:
+        return Account(account_id="X", buying_power=self._buying_power)
+
+    def preview_options_order(self, order) -> OrderPreview:
+        return OrderPreview(
+            estimated_cost=0.0,
+            buying_power_effect=self._projected_bp,
+            is_valid=self._preview_valid,
+            rejection_reason=None if self._preview_valid else "rejected",
+        )
+
 
 def _make_chain(expiry: str, ticker: str = "HOOD") -> OptionsChain:
-    # strike-8 put: bid 0.78 / ask 0.82 → mid 0.80
+    # strike-8 put: bid 0.78 / ask 0.82 → mid 0.80; delta on the 8 strike,
+    # a ±999 sentinel on the 7 strike to exercise the Greeks guard.
     puts = [
         OptionsContract(symbol=f"{ticker}P7", expiry=expiry, strike=7.0,
-                        option_type="put", bid=0.40, ask=0.46),
+                        option_type="put", bid=0.40, ask=0.46, delta=-999.0),
         OptionsContract(symbol=f"{ticker}P8", expiry=expiry, strike=8.0,
-                        option_type="put", bid=0.78, ask=0.82),
+                        option_type="put", bid=0.78, ask=0.82,
+                        delta=-0.25, implied_vol=0.62),
         OptionsContract(symbol=f"{ticker}P9", expiry=expiry, strike=9.0,
                         option_type="put", bid=1.20, ask=1.28),
     ]
@@ -128,6 +159,19 @@ class TestMargin:
         assert m == pytest.approx(720.0)
 
 
+class TestCleanGreek:
+    def test_passes_normal_values(self):
+        assert LLMROIAnalyzer._clean_greek(-0.25) == pytest.approx(-0.25)
+        assert LLMROIAnalyzer._clean_greek(0.0) == 0.0
+
+    def test_rejects_sentinels_and_none(self):
+        assert LLMROIAnalyzer._clean_greek(-999.0) is None
+        assert LLMROIAnalyzer._clean_greek(999.0) is None
+        assert LLMROIAnalyzer._clean_greek(900.0) is None
+        assert LLMROIAnalyzer._clean_greek(None) is None
+        assert LLMROIAnalyzer._clean_greek("bad") is None
+
+
 class TestDaysToExpiry:
     def test_future(self):
         a = LLMROIAnalyzer()
@@ -160,21 +204,77 @@ class TestFindPut:
 
 # ── build_put_roi ─────────────────────────────────────────────────────────────
 class TestBuildPutROI:
-    def test_basic_roi(self, analyzer, monkeypatch):
+    def test_basic_roi_net_premium_and_dual(self, analyzer, monkeypatch):
         monkeypatch.setattr("broker_client.llm_roi_analyzer.settings.OPTIONS_MARGIN_BASIS", "reg_t")
         a, expiry = analyzer
-        roi = a.build_put_roi("HOOD", 8.0, expiry)
+        roi = a.build_put_roi("HOOD", 8.0, expiry)  # formula margin (no broker preview)
         assert isinstance(roi, PutROIResult)
         assert roi.ticker == "HOOD"
         assert roi.mid == pytest.approx(0.80, abs=0.001)
-        assert roi.premium_per_contract == pytest.approx(80.0, abs=0.5)
+        # Net premium = gross 80 − commission 0.65 = 79.35
+        assert roi.gross_premium_per_contract == pytest.approx(80.0, abs=0.01)
+        assert roi.commission_per_contract == pytest.approx(COMMISSION, abs=0.01)
+        assert roi.premium_per_contract == pytest.approx(79.35, abs=0.01)
+        assert roi.margin_basis == "reg_t"
         assert roi.margin_per_contract == pytest.approx(160.0, abs=0.5)
-        assert roi.breakeven == pytest.approx(7.20, abs=0.01)
-        # OTM: (12.9 - 8) / 12.9 ≈ 38%
+        # breakeven = strike − net premium/share = 8 − 0.7935
+        assert roi.breakeven == pytest.approx(7.21, abs=0.01)
         assert roi.otm_pct == pytest.approx(37.98, abs=0.1)
-        # static = 80/160 = 50%; monthly scales by 30/DTE
-        assert roi.static_roi_pct == pytest.approx(50.0, abs=0.5)
-        assert roi.monthly_roi_pct == pytest.approx(50.0 * 30.0 / roi.days_to_expiry, abs=0.5)
+        # static (margin) = 79.35/160; monthly scales by 30/DTE
+        assert roi.static_roi_pct == pytest.approx(79.35 / 160 * 100, abs=0.2)
+        assert roi.monthly_roi_pct == pytest.approx(
+            roi.static_roi_pct * 30.0 / roi.days_to_expiry, abs=0.2
+        )
+        # Cash-secured companion: capital = strike × 100 = 800
+        assert roi.cash_secured_margin_per_contract == pytest.approx(800.0)
+        assert roi.cash_secured_roi_pct == pytest.approx(79.35 / 800 * 100, abs=0.2)
+
+    def test_delta_and_iv_from_contract(self, analyzer):
+        a, expiry = analyzer
+        roi = a.build_put_roi("HOOD", 8.0, expiry)
+        assert roi.delta == pytest.approx(-0.25, abs=0.001)
+        assert roi.iv == pytest.approx(62.0, abs=0.1)  # 0.62 fraction → 62%
+
+    def test_iv_normalizer(self):
+        # yfinance fraction → percent; Schwab percent kept as-is; sentinels dropped.
+        assert LLMROIAnalyzer._normalize_iv(0.62) == pytest.approx(62.0)
+        assert LLMROIAnalyzer._normalize_iv(70.82) == pytest.approx(70.8, abs=0.1)
+        assert LLMROIAnalyzer._normalize_iv(-999.0) is None
+        assert LLMROIAnalyzer._normalize_iv(0.0) is None
+        assert LLMROIAnalyzer._normalize_iv(None) is None
+
+    def test_greek_sentinel_rejected(self, analyzer):
+        a, expiry = analyzer
+        roi = a.build_put_roi("HOOD", 7.0, expiry)  # P7 has delta=-999 sentinel
+        assert roi.delta is None
+
+    def test_real_margin_via_preview(self, analyzer, monkeypatch):
+        a, expiry = analyzer
+        # FakeBroker: BP 10000 → projected 9000 → reduction 1000 = margin.
+        roi = a.build_put_roi("HOOD", 8.0, expiry, use_broker_margin=True)
+        assert roi.margin_basis == "schwab_preview"
+        assert roi.margin_per_contract == pytest.approx(1000.0)
+
+    def test_benign_alert_still_uses_real_margin(self, monkeypatch):
+        # Schwab flags naked-put previews with a benign alert (is_valid=False)
+        # but the projected balance is still usable — we must NOT discard it.
+        expiry = _future_expiry(40)
+        broker = FakeBroker(_make_chain(expiry), preview_valid=False,
+                            buying_power=10_000.0, projected_bp=9_000.0)
+        a = LLMROIAnalyzer(broker=broker)
+        roi = a.build_put_roi("HOOD", 8.0, expiry, use_broker_margin=True)
+        assert roi.margin_basis == "schwab_preview"
+        assert roi.margin_per_contract == pytest.approx(1000.0)
+
+    def test_nonpositive_reduction_falls_back_to_formula(self, monkeypatch):
+        monkeypatch.setattr("broker_client.llm_roi_analyzer.settings.OPTIONS_MARGIN_BASIS", "reg_t")
+        expiry = _future_expiry(40)
+        # projected == buying_power → reduction 0 → formula fallback.
+        broker = FakeBroker(_make_chain(expiry), buying_power=10_000.0, projected_bp=10_000.0)
+        a = LLMROIAnalyzer(broker=broker)
+        roi = a.build_put_roi("HOOD", 8.0, expiry, use_broker_margin=True)
+        assert roi.margin_basis == "reg_t"
+        assert roi.margin_per_contract == pytest.approx(160.0, abs=0.5)
 
     def test_explicit_price_overrides_broker(self, analyzer):
         a, expiry = analyzer

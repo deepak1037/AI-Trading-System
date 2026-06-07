@@ -51,9 +51,18 @@ def render(analysis: LLMROIAnalysis) -> str:
     lines.append(f"PUT OPPORTUNITY ANALYSIS — {roi.ticker} ${roi.strike:g} PUT {exp_label}")
     lines.append(_BAR)
     lines.append("QUANTITATIVE")
-    lines.append(f"  Premium/contract:    ${roi.premium_per_contract:,.0f}")
+    lines.append(
+        f"  Net premium/contract: ${roi.premium_per_contract:,.0f}  "
+        f"(gross ${roi.gross_premium_per_contract:,.0f} − ${roi.commission_per_contract:.2f} comm)"
+    )
     lines.append(f"  Margin/contract:     ${roi.margin_per_contract:,.0f}  ({roi.margin_basis})")
-    lines.append(f"  Static monthly ROI:  {roi.monthly_roi_pct:.1f}%")
+    lines.append(f"  Static monthly ROI:  {roi.monthly_roi_pct:.1f}%  (margin basis)")
+    lines.append(
+        f"  Cash-secured monthly: {roi.cash_secured_monthly_roi_pct:.1f}%  "
+        f"(${roi.cash_secured_margin_per_contract:,.0f} capital)"
+    )
+    if roi.delta is not None:
+        lines.append(f"  Delta:               {roi.delta:.2f}  (≈ assignment prob)")
     lines.append("")
     lines.append(f"LLM ASSESSMENT                    Confidence: {a.confidence}%")
     lines.append(f"  Recommendation:      {badge}")

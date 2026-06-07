@@ -209,6 +209,7 @@ AI-Trading-System/
 │   ├── position_watcher.py            ← unified watcher for ALL positions, regime-aware
 │   ├── risk_manager.py                ← Kelly sizing, daily loss limit, drawdown guard
 │   ├── options_engine.py              ← chain fetch, strike selection, spread construction
+│   ├── llm_roi_analyzer.py            ← put-selling ROI (real Schwab margin via preview) + Claude assessment
 │   └── strategies/
 │       ├── __init__.py                ← STRATEGY_REGISTRY dict, load_enabled_strategies()
 │       ├── base_strategy.py           ← BaseStrategy ABC (all strategies inherit this)

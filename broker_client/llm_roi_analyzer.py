@@ -49,7 +49,10 @@ class PutROIResult(BaseModel):
     """Quantitative ROI for selling one put contract.
 
     All ``*_per_contract`` figures are per single contract (multiplier shares).
-    ROI percentages are ``premium / margin`` scaled to the stated horizon.
+    ROI percentages use *net* premium (gross − commission) over the capital
+    requirement, scaled to the stated horizon. Two capital bases are reported:
+    the *primary* margin (Schwab's real buying-power reduction when available,
+    else a Reg-T estimate) and the *cash-secured* basis (strike × multiplier).
     """
 
     ticker: str
@@ -61,16 +64,28 @@ class PutROIResult(BaseModel):
     bid: float
     ask: float
     mid: float                        # per share
-    premium_per_contract: float       # mid * multiplier
-    margin_per_contract: float        # capital tied up per contract
-    margin_basis: str                 # reg_t | cash_secured
+    delta: Optional[float] = None     # contract delta (≈ assignment prob), guarded
+    iv: Optional[float] = None        # contract implied vol, %, guarded
 
-    breakeven: float                  # strike - mid
+    gross_premium_per_contract: float     # mid * multiplier
+    commission_per_contract: float        # per-contract commission/fees
+    premium_per_contract: float           # net = gross − commission
+
+    margin_per_contract: float            # primary capital tied up per contract
+    margin_basis: str                     # schwab_preview | reg_t | cash_secured
+
+    breakeven: float                  # strike − net premium/share
     otm_pct: float                    # % the strike sits below spot (negative = ITM)
 
-    static_roi_pct: float             # premium / margin over the holding period
+    static_roi_pct: float             # net premium / margin over the holding period
     monthly_roi_pct: float            # static scaled to 30 days
     annualized_roi_pct: float         # static scaled to 365 days
+
+    # Cash-secured companion (capital = strike × multiplier).
+    cash_secured_margin_per_contract: float
+    cash_secured_roi_pct: float
+    cash_secured_monthly_roi_pct: float
+    cash_secured_annualized_roi_pct: float
 
 
 class LLMAssessment(BaseModel):
@@ -135,8 +150,12 @@ class LLMROIAnalyzer:
     def analyze(
         self, ticker: str, strike: float, expiry: str
     ) -> LLMROIAnalysis:
-        """End-to-end: build the ROI result then run the LLM assessment."""
-        roi = self.build_put_roi(ticker, strike, expiry)
+        """End-to-end: build the ROI result then run the LLM assessment.
+
+        Uses the broker's real buying-power reduction for margin (via the
+        preview API) when a broker is available.
+        """
+        roi = self.build_put_roi(ticker, strike, expiry, use_broker_margin=True)
         return self.analyze_put_opportunity(roi, ticker)
 
     def build_put_roi(
@@ -146,8 +165,19 @@ class LLMROIAnalyzer:
         expiry: str,
         contract: Optional[OptionsContract] = None,
         underlying_price: Optional[float] = None,
+        use_broker_margin: bool = False,
     ) -> PutROIResult:
-        """Locate the put contract and compute its quantitative ROI."""
+        """Locate the put contract and compute its quantitative ROI.
+
+        Args:
+            use_broker_margin: When True and a broker is configured, query the
+                broker's preview API for the *real* buying-power reduction and
+                use it as the primary margin. Falls back to the Reg-T /
+                cash-secured formula when unavailable (paper/dev, no broker, or
+                an invalid preview). Off by default because it adds an API
+                round-trip per contract — callers scanning many expiries should
+                leave it off; the single deep analysis turns it on.
+        """
         ticker = ticker.upper().strip()
         if contract is None:
             contract = self._find_put(ticker, strike, expiry)
@@ -163,26 +193,42 @@ class LLMROIAnalyzer:
                 expiry=expiry,
             )
 
-        premium_per_contract = mid * self._multiplier
-        margin_per_contract = self._margin_per_contract(
-            strike, underlying_price, mid
-        )
+        mult = self._multiplier
+        gross_premium = mid * mult
+        commission = settings.PAPER_OPTIONS_COMMISSION  # per contract
+        net_premium = gross_premium - commission
+        net_premium_per_share = net_premium / mult
+
+        # ── Primary margin: real (broker preview) with formula fallback ───────
+        margin_basis = settings.OPTIONS_MARGIN_BASIS
+        margin = None
+        if use_broker_margin:
+            margin = self._broker_margin_per_contract(ticker, contract, mid)
+            if margin is not None:
+                margin_basis = "schwab_preview"
+        if margin is None:
+            margin = self._margin_per_contract(strike, underlying_price, mid)
+
         days = self._days_to_expiry(expiry)
-        static_roi = (
-            (premium_per_contract / margin_per_contract * 100.0)
-            if margin_per_contract > 0
-            else 0.0
-        )
-        # Scale the period return to 30d / 365d horizons.
-        scale_days = max(days, 1)
-        monthly_roi = static_roi * (30.0 / scale_days)
-        annual_roi = static_roi * (365.0 / scale_days)
+        scale = max(days, 1)
+
+        def _roi(capital: float) -> tuple[float, float, float]:
+            static = (net_premium / capital * 100.0) if capital > 0 else 0.0
+            return static, static * (30.0 / scale), static * (365.0 / scale)
+
+        static_roi, monthly_roi, annual_roi = _roi(margin)
+
+        # ── Cash-secured companion (capital = strike × multiplier) ────────────
+        cs_margin = strike * mult
+        cs_static, cs_monthly, cs_annual = _roi(cs_margin)
 
         otm_pct = (
             (underlying_price - strike) / underlying_price * 100.0
             if underlying_price > 0
             else 0.0
         )
+        delta = self._clean_greek(contract.delta)
+        iv = self._normalize_iv(contract.implied_vol)
 
         result = PutROIResult(
             ticker=ticker,
@@ -193,21 +239,112 @@ class LLMROIAnalyzer:
             bid=round(contract.bid, 2),
             ask=round(contract.ask, 2),
             mid=round(mid, 2),
-            premium_per_contract=round(premium_per_contract, 2),
-            margin_per_contract=round(margin_per_contract, 2),
-            margin_basis=settings.OPTIONS_MARGIN_BASIS,
-            breakeven=round(strike - mid, 2),
+            delta=round(delta, 4) if delta is not None else None,
+            iv=iv,
+            gross_premium_per_contract=round(gross_premium, 2),
+            commission_per_contract=round(commission, 2),
+            premium_per_contract=round(net_premium, 2),
+            margin_per_contract=round(margin, 2),
+            margin_basis=margin_basis,
+            breakeven=round(strike - net_premium_per_share, 2),
             otm_pct=round(otm_pct, 2),
             static_roi_pct=round(static_roi, 2),
             monthly_roi_pct=round(monthly_roi, 2),
             annualized_roi_pct=round(annual_roi, 2),
+            cash_secured_margin_per_contract=round(cs_margin, 2),
+            cash_secured_roi_pct=round(cs_static, 2),
+            cash_secured_monthly_roi_pct=round(cs_monthly, 2),
+            cash_secured_annualized_roi_pct=round(cs_annual, 2),
         )
         logger.info(
-            "PutROI %s $%s %s: premium=$%.0f margin=$%.0f static=%.1f%% monthly=%.1f%%",
-            ticker, strike, expiry, premium_per_contract, margin_per_contract,
-            static_roi, monthly_roi,
+            "PutROI %s $%s %s: net_premium=$%.0f margin=$%.0f (%s) "
+            "monthly=%.1f%% | cash-secured monthly=%.1f%%",
+            ticker, strike, expiry, net_premium, margin, margin_basis,
+            monthly_roi, cs_monthly,
         )
         return result
+
+    def _broker_margin_per_contract(
+        self, ticker: str, contract: OptionsContract, mid: float
+    ) -> Optional[float]:
+        """Real per-contract margin via the broker preview API.
+
+        Mirrors the reference tool's approach: the true capital requirement is
+        the drop in account buying power Schwab projects for the order, i.e.
+        ``current_buying_power − projectedBuyingPower``. Returns None on any
+        failure (no broker, invalid preview, non-positive reduction) so the
+        caller falls back to the formula.
+        """
+        if self._broker is None:
+            return None
+        try:
+            from broker_core.base_broker import OptionsOrder
+
+            account = self._broker.get_account()
+            current_bp = float(account.buying_power or 0.0)
+            if current_bp <= 0:
+                return None
+            order = OptionsOrder(
+                ticker=ticker,
+                action="SELL_TO_OPEN",
+                contract=contract.symbol,
+                qty=1,
+                order_type="limit",
+                limit_price=round(mid, 2),
+                strategy_name="roi_preview",
+            )
+            preview = self._broker.preview_options_order(order)
+            # NOTE: do NOT gate on preview.is_valid. Schwab attaches benign
+            # informational *alerts* (e.g. the naked-put acknowledgment) to put
+            # previews, which flip is_valid to False even though the projected
+            # balance is perfectly usable. The balance projection is what we
+            # need; a real reject simply yields a non-positive/zero projection.
+            if preview.rejection_reason:
+                logger.debug(
+                    "Preview note for %s margin: %s",
+                    contract.symbol, preview.rejection_reason,
+                )
+            projected_bp = float(preview.buying_power_effect or 0.0)
+            if projected_bp <= 0:
+                return None
+            reduction = current_bp - projected_bp
+            # Sanity: a single contract can't tie up more than the whole account.
+            if 0 < reduction < current_bp:
+                return reduction
+            logger.debug(
+                "Implausible BP reduction (%.2f) for %s — using formula",
+                reduction, contract.symbol,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — degrade to formula
+            logger.debug("Broker margin preview failed for %s: %s", ticker, exc)
+            return None
+
+    @staticmethod
+    def _clean_greek(value: Optional[float]) -> Optional[float]:
+        """Reject Schwab's ``±999`` missing-data sentinels for Greeks/IV."""
+        if value is None:
+            return None
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return None
+        if abs(fv) >= 900:
+            return None
+        return fv
+
+    @staticmethod
+    def _normalize_iv(raw: Optional[float]) -> Optional[float]:
+        """Return implied vol as a percent, normalizing across data sources.
+
+        Schwab's ``volatility`` field is already a percent (70.82 = 70.82%);
+        yfinance's ``impliedVolatility`` is a fraction (0.62 = 62%). Values < 3
+        are treated as fractions and scaled up; ``±999`` sentinels are dropped.
+        """
+        iv = LLMROIAnalyzer._clean_greek(raw)
+        if iv is None or iv <= 0:
+            return None
+        return round(iv, 1) if iv >= 3 else round(iv * 100.0, 1)
 
     def analyze_put_opportunity(
         self, roi_result: PutROIResult, ticker: str
@@ -307,7 +444,8 @@ class LLMROIAnalyzer:
             "pct_from_low": None,
             "rsi": None,
             "macd_hist": None,
-            "iv": None,        # filled from the option chain if available
+            "delta": roi.delta,   # contract delta from the chain (≈ assignment prob)
+            "iv": roi.iv,         # contract IV from the chain (%), if present
             "hv_30": None,
             "volume_ratio": None,
             "sentiment_score": None,
@@ -398,6 +536,13 @@ class LLMROIAnalyzer:
         available. We report the contract IV and, when historical volatility is
         known, an honest IV/HV ratio (>1 = options richer than realized).
         """
+        # If the chain already supplied IV, just compute IV/HV and skip the
+        # extra yfinance round-trip.
+        if ctx.get("iv") is not None:
+            hv = ctx.get("hv_30")
+            if hv:
+                ctx["iv_vs_hv"] = round(ctx["iv"] / hv, 2)
+            return
         try:
             import yfinance as yf
 
@@ -408,9 +553,9 @@ class LLMROIAnalyzer:
                 puts = chain.puts
                 row = puts[abs(puts["strike"] - roi.strike) < 1e-6]
                 if not row.empty and "impliedVolatility" in row:
-                    iv = float(row["impliedVolatility"].iloc[0]) * 100.0
+                    iv = LLMROIAnalyzer._normalize_iv(float(row["impliedVolatility"].iloc[0]))
             if iv is not None:
-                ctx["iv"] = round(iv, 1)
+                ctx["iv"] = iv
                 hv = ctx.get("hv_30")
                 if hv:
                     ctx["iv_vs_hv"] = round(iv / hv, 2)
@@ -523,11 +668,16 @@ class LLMROIAnalyzer:
         return f"""TICKER: {ticker}
 
 OPTIONS DATA:
-Strike: {roi.strike}
+Strike: {roi.strike}  ({roi.otm_pct:.1f}% OTM)
 Expiry: {roi.expiry} ({roi.days_to_expiry} days)
-Premium/contract: ${roi.premium_per_contract:.2f}
+Bid/Ask/Mid: ${roi.bid:.2f} / ${roi.ask:.2f} / ${roi.mid:.2f}
+Contract delta: {fmt(roi.delta)}  (≈ assignment probability)
+Gross premium/contract: ${roi.gross_premium_per_contract:.2f}
+Commission/contract: ${roi.commission_per_contract:.2f}
+Net premium/contract: ${roi.premium_per_contract:.2f}
 Margin/contract: ${roi.margin_per_contract:.2f} ({roi.margin_basis})
-Static monthly ROI: {roi.monthly_roi_pct:.1f}%
+Static monthly ROI (margin): {roi.monthly_roi_pct:.1f}%  (annualized {roi.annualized_roi_pct:.1f}%)
+Cash-secured monthly ROI: {roi.cash_secured_monthly_roi_pct:.1f}% (capital ${roi.cash_secured_margin_per_contract:.0f})
 Breakeven: ${roi.breakeven:.2f}
 
 STOCK CONTEXT:

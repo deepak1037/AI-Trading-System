@@ -107,12 +107,14 @@ if run:
                     "DTE": roi.days_to_expiry,
                     "Bid": f"${roi.bid:.2f}",
                     "Ask": f"${roi.ask:.2f}",
-                    "Premium/contract": f"${roi.premium_per_contract:,.0f}",
-                    "Margin/contract": f"${roi.margin_per_contract:,.0f}",
+                    "Delta": f"{roi.delta:.2f}" if roi.delta is not None else "—",
+                    "Net premium": f"${roi.premium_per_contract:,.0f}",
+                    "Margin": f"${roi.margin_per_contract:,.0f}",
+                    "Basis": roi.margin_basis,
                     "OTM %": f"{roi.otm_pct:.1f}%",
-                    "Static ROI": f"{roi.static_roi_pct:.1f}%",
-                    "Monthly ROI": f"{roi.monthly_roi_pct:.1f}%",
-                    "Annualized": f"{roi.annualized_roi_pct:.1f}%",
+                    "Monthly ROI (margin)": f"{roi.monthly_roi_pct:.1f}%",
+                    "Monthly ROI (cash-sec)": f"{roi.cash_secured_monthly_roi_pct:.1f}%",
+                    "Annualized (margin)": f"{roi.annualized_roi_pct:.1f}%",
                 })
             except Exception as exc:  # noqa: BLE001 — skip expiries w/o this strike
                 rows.append({"Expiry": exp, "DTE": "—", "Static ROI": f"err: {exc}"})
