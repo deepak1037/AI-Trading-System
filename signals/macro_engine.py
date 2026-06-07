@@ -16,7 +16,6 @@ Supported release codes (FRED series IDs):
 from __future__ import annotations
 
 import sqlite3
-import statistics
 from datetime import datetime, timezone
 from typing import Optional
 

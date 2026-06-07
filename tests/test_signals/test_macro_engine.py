@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from signals.macro_engine import MacroEngine, _FALLBACK_STD
+from signals.macro_engine import MacroEngine
 from signals.signal_schema import Signal
 
 
@@ -137,7 +135,6 @@ class TestMacroEngineOnline:
         with patch.object(engine, "_fetch_series_latest", return_value=187.0) as mock_actual, \
              patch.object(engine, "_fetch_historical_std", return_value=75.0):
             # Also mock the fallback prior-obs forecast fetch
-            import fredapi
             with patch("fredapi.Fred") as MockFred:
                 mock_fred_inst = MagicMock()
                 import pandas as pd

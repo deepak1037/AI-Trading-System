@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from signals.signal_schema import Direction, MarketSnapshot, MarketState, Signal
+from signals.signal_schema import MarketSnapshot, MarketState, Signal
 
 
 def _now() -> datetime:

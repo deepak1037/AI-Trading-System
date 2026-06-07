@@ -15,12 +15,10 @@ TODO: Install transformers + torch to enable FinBERT:
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import datetime, timezone
-from typing import Optional
 
 from config.settings import settings
-from core.exceptions import DataError, SignalError
+from core.exceptions import DataError
 from core.logger import get_logger
 from core.retry import circuit_breaker, retry
 from signals.signal_schema import Direction, Signal
