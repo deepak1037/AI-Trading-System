@@ -147,10 +147,15 @@ if run:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         bases = {r.get("Basis") for r in rows if r.get("Basis")}
         if bases == {"schwab_preview"}:
-            st.caption("Margin = Schwab's real buying-power reduction (preview API) for every row.")
+            st.caption(
+                "Margin = Schwab's real available-funds reduction (preview API). It is "
+                "constant across expiries because it's collateral against the strike "
+                "(strike + underlying driven), which doesn't change with time — so ROI "
+                "varies by premium while margin stays put."
+            )
         elif "schwab_preview" in bases:
             st.caption(
-                "Margin is Schwab's real buying-power reduction where the preview "
+                "Margin is Schwab's real available-funds reduction where the preview "
                 "succeeded, else a Reg-T estimate (see the Basis column)."
             )
         else:
