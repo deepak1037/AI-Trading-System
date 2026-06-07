@@ -23,7 +23,7 @@ alpaca-py==0.33.1
 yfinance==0.2.49
 fredapi==0.5.2
 polygon-api-client==1.14.2
-edgartools==3.5.0
+edgartools==5.35.1   # imported as `edgar`; Form 4 / 13F parsing
 
 # ── NLP sentiment ─────────────────────────────────────────
 transformers==4.46.3

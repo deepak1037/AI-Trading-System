@@ -1,107 +1,145 @@
-"""Tests for scanner/fundamental_screen.py (Days 13-18)."""
+"""Tests for scanner/fundamental_screen.py (Days 13-18).
+
+The screen has two paths: FMP (when FMP_API_KEY is set) and a yfinance ``.info``
+fallback. Both are exercised here with mocks — no live network calls.
+"""
 
 from __future__ import annotations
 
 from scanner.fundamental_screen import FundamentalScreen
 
 
-def _make_earnings(actuals: list[float], estimates: list[float] | None = None) -> list[dict]:
-    """Build a list of earnings records from actuals and optional estimates."""
-    estimates = estimates or [0.0] * len(actuals)
-    return [
-        {"period": f"Q{i}", "actual": a, "estimate": e}
-        for i, (a, e) in enumerate(zip(actuals, estimates))
-    ]
+# ── _num helper ───────────────────────────────────────────────────────────────
+class TestNum:
+    def test_valid_numbers(self):
+        assert FundamentalScreen._num(1.5) == 1.5
+        assert FundamentalScreen._num("2.3") == 2.3
+        assert FundamentalScreen._num(0) == 0.0
+
+    def test_invalid_returns_none(self):
+        assert FundamentalScreen._num(None) is None
+        assert FundamentalScreen._num("n/a") is None
+        assert FundamentalScreen._num([]) is None
 
 
-class TestEpsAcceleration:
+# ── FMP path ──────────────────────────────────────────────────────────────────
+def _income(eps_rev: list[tuple[float, float]]) -> list[dict]:
+    """Build FMP income-statement rows (most recent first)."""
+    return [{"epsdiluted": e, "revenue": r} for e, r in eps_rev]
+
+
+class TestFmpPath:
     def setup_method(self):
-        self.screen = FundamentalScreen()
+        self.s = FundamentalScreen()
+        self.s._fmp_key = "test-key"  # force FMP path
 
-    def test_empty_earnings_returns_false(self):
-        assert self.screen._eps_accelerating([]) is False
+    def test_eps_qoq_growth_passes(self, monkeypatch):
+        # latest EPS > prior quarter → pass
+        monkeypatch.setattr(self.s, "_fmp_get", lambda path, **k: _income(
+            [(2.0, 100), (1.5, 95)]
+        ))
+        assert self.s._passes_fmp("X") is True
 
-    def test_not_enough_quarters(self):
-        earnings = _make_earnings([1.0, 1.2])
-        assert self.screen._eps_accelerating(earnings) is False
+    def test_revenue_yoy_growth_passes(self, monkeypatch):
+        # flat EPS but revenue up >5% YoY (q0 vs q4) → pass
+        rows = _income([(1.0, 130), (1.0, 125), (1.0, 120), (1.0, 118), (1.0, 110)])
+        monkeypatch.setattr(self.s, "_fmp_get", lambda path, **k: rows)
+        assert self.s._passes_fmp("X") is True
 
-    def test_accelerating_eps(self):
-        # current vs year-ago: growth improving
-        # [q0, q1, q2, q3, q4_yago, q5_yago, q6_yago, q7_yago]
-        # YoY growth: q0/q4_yago, q1/q5_yago
-        actuals = [2.0, 1.8, 1.5, 1.3, 1.0, 1.0, 1.0, 1.0]
-        earnings = _make_earnings(actuals)
-        result = self.screen._eps_accelerating(earnings, min_quarters=2)
-        # YoY growth[0] = (2.0-1.0)/1.0=100%, growth[1] = (1.8-1.0)/1.0=80%
-        # growth[0] > growth[1]? 100% > 80% → True (accelerating means latest > prior)
-        # Actually our check is: for i in range(min_quarters-1): growths[i] <= growths[i+1] → False
-        # So accelerating means growths[0] > growths[1] → 100 > 80 → True
-        assert isinstance(result, bool)
+    def test_no_growth_fails(self, monkeypatch):
+        # declining EPS, flat revenue, no estimates → fail
+        rows = _income([(1.0, 100), (1.5, 100), (2.0, 100), (2.5, 100), (3.0, 100)])
+        monkeypatch.setattr(self.s, "_fmp_get", lambda path, **k: rows)
+        monkeypatch.setattr(self.s, "_fmp_estimates_positive", lambda t: False)
+        assert self.s._passes_fmp("X") is False
 
-    def test_decelerating_eps_returns_false(self):
-        actuals = [1.0, 1.2, 1.5, 1.8, 2.0, 2.0, 2.0, 2.0]
-        earnings = _make_earnings(actuals)
-        result = self.screen._eps_accelerating(earnings, min_quarters=2)
-        assert isinstance(result, bool)
+    def test_insufficient_data_fails(self, monkeypatch):
+        monkeypatch.setattr(self.s, "_fmp_get", lambda path, **k: [])
+        assert self.s._passes_fmp("X") is False
+
+    def test_estimate_revision_rescues(self, monkeypatch):
+        # no eps/rev growth, but rising estimates → pass
+        rows = _income([(1.0, 100), (2.0, 100)])
+        monkeypatch.setattr(self.s, "_fmp_get", lambda path, **k: rows)
+        monkeypatch.setattr(self.s, "_fmp_estimates_positive", lambda t: True)
+        assert self.s._passes_fmp("X") is True
 
 
-class TestRevenueReacceleration:
+# ── Fallback path (yfinance .info) ────────────────────────────────────────────
+class TestFallbackPath:
     def setup_method(self):
-        self.screen = FundamentalScreen()
+        self.s = FundamentalScreen()
+        self.s._fmp_key = ""  # force fallback
 
-    def test_empty_revenues_returns_false(self):
-        assert self.screen._revenue_reaccelerating([]) is False
+    def _patch_info(self, monkeypatch, info: dict):
+        import sys
+        import types
+        fake_yf = types.ModuleType("yfinance")
 
-    def test_not_enough_revenues(self):
-        assert self.screen._revenue_reaccelerating([100.0, 110.0]) is False
+        class _T:
+            def __init__(self, *a, **k):
+                self.info = info
 
-    def test_reaccelerating_revenue(self):
-        # revenues latest first: [130, 125, 118, 112, 110]
-        # QoQ: 130/125=4%, 125/118=5.9%, 118/112=5.4%
-        # growths[0] > growths[1]? 4% > 5.9% → False → not re-accel
-        revenues = [130.0, 125.0, 118.0, 112.0, 110.0]
-        result = self.screen._revenue_reaccelerating(revenues)
-        assert isinstance(result, bool)
+        fake_yf.Ticker = _T  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
 
-    def test_monotone_revenue_growth(self):
-        # Steady growth — not re-acceleration
-        revenues = [110.0, 100.0, 91.0, 83.0, 76.0]
-        result = self.screen._revenue_reaccelerating(revenues)
-        assert isinstance(result, bool)
+    def test_profitable_and_growing_passes(self, monkeypatch):
+        self._patch_info(monkeypatch, {"trailingEps": 3.2, "revenueGrowth": 0.08})
+        assert self.s._passes_fallback("X") is True
 
+    def test_strong_earnings_growth_passes(self, monkeypatch):
+        self._patch_info(monkeypatch, {"trailingEps": -0.5, "earningsGrowth": 0.4})
+        assert self.s._passes_fallback("X") is True
 
-class TestEstimateRevisions:
-    def setup_method(self):
-        self.screen = FundamentalScreen()
+    def test_high_revenue_growth_passes(self, monkeypatch):
+        self._patch_info(monkeypatch, {"revenueGrowth": 0.15})
+        assert self.s._passes_fallback("X") is True
 
-    def test_all_beats_returns_true(self):
-        earnings = _make_earnings([2.0, 2.5, 1.8], [1.5, 2.0, 1.5])
-        assert self.screen._estimate_revisions_positive(earnings) is True
+    def test_declining_unprofitable_fails(self, monkeypatch):
+        self._patch_info(monkeypatch, {
+            "trailingEps": -1.0, "revenueGrowth": -0.05,
+            "earningsGrowth": -0.2, "grossMargins": 0.1,
+        })
+        assert self.s._passes_fallback("X") is False
 
-    def test_mostly_misses_returns_false(self):
-        earnings = _make_earnings([1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 1.5])
-        assert self.screen._estimate_revisions_positive(earnings) is False
-
-    def test_exactly_75pct_beats(self):
-        # 3 out of 4 = 75%
-        earnings = _make_earnings([2.0, 2.0, 2.0, 1.0], [1.5, 1.5, 1.5, 2.0])
-        assert self.screen._estimate_revisions_positive(earnings) is True
-
-    def test_empty_estimates_returns_false(self):
-        earnings = _make_earnings([1.0, 1.0], [0.0, 0.0])
-        assert self.screen._estimate_revisions_positive(earnings) is False
+    def test_empty_info_fails(self, monkeypatch):
+        self._patch_info(monkeypatch, {})
+        assert self.s._passes_fallback("X") is False
 
 
+# ── Integration ───────────────────────────────────────────────────────────────
 class TestFundamentalScreenIntegration:
     def test_screen_empty_tickers(self):
-        screen = FundamentalScreen()
-        result = screen.screen([])
-        assert result == []
+        assert FundamentalScreen().screen([]) == []
 
-    def test_screen_returns_subset(self):
-        screen = FundamentalScreen()
-        # With offline data these will likely return empty (API unavailable)
-        # Just verify it returns a list
-        result = screen.screen(["AAPL", "MSFT"])
-        assert isinstance(result, list)
-        assert len(result) <= 2
+    def test_screen_routes_to_fallback_when_no_key(self, monkeypatch):
+        s = FundamentalScreen()
+        s._fmp_key = ""
+        calls = {"fallback": 0, "fmp": 0}
+        monkeypatch.setattr(s, "_passes_fallback", lambda t: calls.__setitem__("fallback", calls["fallback"] + 1) or True)
+        monkeypatch.setattr(s, "_passes_fmp", lambda t: calls.__setitem__("fmp", calls["fmp"] + 1) or True)
+        result = s.screen(["AAPL", "MSFT"])
+        assert result == ["AAPL", "MSFT"]
+        assert calls["fallback"] == 2 and calls["fmp"] == 0
+
+    def test_screen_routes_to_fmp_when_key_set(self, monkeypatch):
+        s = FundamentalScreen()
+        s._fmp_key = "test-key"
+        calls = {"fallback": 0, "fmp": 0}
+        monkeypatch.setattr(s, "_passes_fallback", lambda t: calls.__setitem__("fallback", calls["fallback"] + 1) or True)
+        monkeypatch.setattr(s, "_passes_fmp", lambda t: calls.__setitem__("fmp", calls["fmp"] + 1) or True)
+        s.screen(["AAPL"])
+        assert calls["fmp"] == 1 and calls["fallback"] == 0
+
+    def test_screen_survives_per_ticker_errors(self, monkeypatch):
+        s = FundamentalScreen()
+        s._fmp_key = ""
+
+        def _boom(t):
+            if t == "BAD":
+                raise RuntimeError("data error")
+            return True
+
+        monkeypatch.setattr(s, "_passes_fallback", _boom)
+        result = s.screen(["GOOD", "BAD", "GOOD2"])
+        assert result == ["GOOD", "GOOD2"]  # BAD skipped, no crash

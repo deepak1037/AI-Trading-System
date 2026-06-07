@@ -17,7 +17,6 @@ import pandas as pd
 
 from config.settings import settings
 from core.logger import get_logger
-from core.retry import retry
 
 logger = get_logger(__name__)
 

@@ -1,12 +1,13 @@
 """Scanner Stage 4: Institutional accumulation screen (Days 13-18).
 
 Filters ~400 fundamental stocks to ~120 by:
-  - 13F new institutional buyers (edgartools or EDGAR API)
-  - Form 4 insider buying clusters (edgartools)
-  - Short interest declining (yfinance shortRatio proxy)
+  - Institutional ownership (13F holdings — yfinance, since reverse per-ticker
+    13F lookup across all filers is not feasible cheaply)
+  - Form 4 insider buying clusters (edgartools / SEC EDGAR)
+  - Short interest not excessive (yfinance shortRatio proxy)
 
-Uses edgartools library (Apache 2.0) where available.
-TODO: wire up edgartools MCP server for Claude Code integration.
+Uses the ``edgartools`` library (Apache 2.0), imported as ``edgar``. SEC
+requires a User-Agent identity, set from ``settings.EDGAR_IDENTITY``.
 """
 
 from __future__ import annotations
@@ -30,13 +31,19 @@ class AccumulationScreen:
 
     def _check_edgar(self) -> bool:
         try:
-            import edgartools  # type: ignore[import-untyped]  # noqa: F401
+            import edgar  # type: ignore[import-untyped]
+
+            # SEC requires a declared identity (User-Agent) on every request.
+            edgar.set_identity(settings.EDGAR_IDENTITY)
             return True
         except ImportError:
             logger.warning(
-                "edgartools not installed — Stage 4 will use yfinance proxies only. "
-                "TODO: pip install edgartools for full 13F/Form4 support"
+                "edgartools (import name 'edgar') not installed — Stage 4 using "
+                "yfinance proxies only. Run: pip install edgartools"
             )
+            return False
+        except Exception as exc:  # noqa: BLE001 — bad identity, network, etc.
+            logger.warning("edgar init failed (%s) — using yfinance proxies", exc)
             return False
 
     def _get_institutional_holders(self, ticker: str) -> dict:
@@ -69,46 +76,64 @@ class AccumulationScreen:
         except Exception:
             return 0.0
 
-    def _get_edgar_form4_buys(self, ticker: str) -> int:
-        """Return count of Form 4 insider buy transactions in last 90 days."""
+    def _get_edgar_form4_buys(self, ticker: str, scan_filings: int = 8) -> int:
+        """Count open-market insider *purchases* across recent Form 4 filings.
+
+        Uses edgartools' parsed ``Form4.common_stock_purchases`` DataFrame
+        (open-market buys, transaction code "P"). Scans the most recent
+        ``scan_filings`` Form 4s — each ``.obj()`` is one HTTP fetch, so we cap
+        it to keep the per-ticker cost bounded.
+        """
         if not self._edgar_available:
             return 0
         try:
-            from edgartools import Company  # type: ignore[import-untyped]
+            from edgar import Company  # type: ignore[import-untyped]
 
             company = Company(ticker)
-            form4_filings = company.get_filings(form="4", limit=20)
+            filings = company.get_filings(form="4")
+            if filings is None or len(filings) == 0:
+                return 0
             buy_count = 0
-            for filing in form4_filings:
+            for filing in filings.head(scan_filings):
                 try:
-                    data = filing.obj()
-                    if hasattr(data, "transactions"):
-                        for txn in data.transactions:
-                            if getattr(txn, "transaction_code", "") in ("P", "A"):
-                                buy_count += 1
-                except Exception:
-                    pass
+                    form4 = filing.obj()
+                    purchases = getattr(form4, "common_stock_purchases", None)
+                    if purchases is not None and not purchases.empty:
+                        buy_count += len(purchases)
+                except Exception:  # noqa: BLE001 — skip unparseable filing
+                    continue
             return buy_count
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("Stage4: Form4 fetch failed for %s: %s", ticker, exc)
             return 0
 
     def _passes_accumulation(self, ticker: str) -> bool:
-        """Return True if stock shows institutional accumulation signals."""
+        """Return True if stock shows institutional accumulation signals.
+
+        Primary gate: meaningful institutional ownership and not heavily shorted.
+        A Form 4 open-market insider-buying *cluster* (2+ purchases) can rescue a
+        name that lacks institutional-ownership data. Insider buying is NOT a
+        mandatory requirement — open-market insider buys are genuinely rare, so
+        requiring them would filter out almost everything.
+
+        The expensive edgar lookup runs only for names that fail the
+        institutional gate, keeping per-ticker cost bounded.
+        """
         holders = self._get_institutional_holders(ticker)
         short_ratio = self._get_short_ratio(ticker)
-        form4_buys = self._get_edgar_form4_buys(ticker)
 
-        # Institutional ownership > 20% (signals institutional interest)
         inst_interest = holders["holder_count"] >= 5 or holders["pct_held"] >= 0.20
-
-        # Short interest < 20 days to cover (not heavily shorted against)
         short_ok = short_ratio < 20.0 or short_ratio == 0.0
 
-        # Insider buying cluster: 2+ Form 4 buy transactions (only if edgartools available)
-        insider_buying = form4_buys >= 2 if self._edgar_available else True
+        if not short_ok:
+            return False
+        if inst_interest:
+            return True
 
-        return inst_interest and short_ok and insider_buying
+        # Rescue path: insider buying cluster (only query edgar when needed).
+        if self._edgar_available and self._get_edgar_form4_buys(ticker) >= 2:
+            return True
+        return False
 
     def screen(self, tickers: list[str]) -> list[str]:
         """Run Stage 4 screening. Returns tickers showing accumulation."""

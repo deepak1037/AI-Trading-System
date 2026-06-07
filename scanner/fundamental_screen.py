@@ -1,180 +1,187 @@
 """Scanner Stage 3: Fundamental inflection screen (Days 13-18).
 
-Filters ~1,800 liquidity-passing stocks to ~400 by:
-  - EPS acceleration for 2+ consecutive quarters
-  - Revenue re-acceleration (at least 1 quarter of re-accel after slowdown)
-  - Earnings estimate revisions > 75% upward (beats rate)
+Filters the liquidity-passing universe to fundamentally healthy names by:
+  - EPS growth (quarterly / YoY)
+  - Revenue growth (quarterly / YoY)
+  - Analyst estimate revisions (FMP only)
 
-Data source: yfinance (free) — uses earnings_dates for EPS/estimates,
-quarterly_income_stmt for revenue.
+Data source priority:
+  1. Financial Modeling Prep (FMP) free API when ``FMP_API_KEY`` is set —
+     reliable quarterly income statements + analyst estimates.
+  2. Fallback: yfinance ``.info`` dict (trailingEps, revenueGrowth,
+     earningsGrowth, grossMargins) with lenient thresholds, when no FMP key.
+
+yfinance's earnings *calendar* (``earnings_dates`` / ``quarterly_earnings``) is
+NOT used — it now returns "No earnings dates found" for nearly every ticker.
 """
 
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
+
+import requests
 
 from config.settings import settings
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
+_FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
 
 class FundamentalScreen:
-    """Stage 3: EPS acceleration + revenue re-accel + estimate revisions."""
+    """Stage 3: EPS growth + revenue growth + estimate revisions."""
 
     def __init__(self, db_path: Optional[str] = None) -> None:
         self._db_path = db_path or settings.DB_PATH
+        self._fmp_key = settings.FMP_API_KEY
+        self._session = requests.Session()
+        self._session.headers["User-Agent"] = "AI-Trading-System/1.0"
+        if not self._fmp_key:
+            logger.warning(
+                "FMP_API_KEY not set — Stage 3 using simplified yfinance .info "
+                "filter with lenient thresholds. Set FMP_API_KEY in .env for the "
+                "full EPS/revenue/estimate-revision screen."
+            )
 
-    def _get_earnings_data(self, ticker: str) -> list[dict]:
-        """Fetch earnings history via earnings_dates (replaces deprecated quarterly_earnings).
+    # ── FMP path ─────────────────────────────────────────────────────────────
+    def _fmp_get(self, path: str, **params) -> Any:
+        params["apikey"] = self._fmp_key
+        try:
+            resp = self._session.get(
+                f"{_FMP_BASE}/{path}", params=params, timeout=15
+            )
+            if resp.status_code == 429:
+                logger.warning("FMP rate limited on %s — backing off", path)
+                time.sleep(2.0)
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("FMP %s failed: %s", path, exc)
+            return None
 
-        Returns list of {period, actual, estimate} dicts, most recent first.
+    def _passes_fmp(self, ticker: str) -> bool:
+        """Pass condition (OR logic) using FMP quarterly fundamentals.
+
+          - EPS accelerating (latest quarter beats prior) OR growing YoY
+          - Revenue growing YoY (>5%)
+          - Positive analyst estimate revisions (best-effort bonus)
+        """
+        income = self._fmp_get(
+            f"income-statement/{ticker}", period="quarter", limit=8
+        )
+        if not isinstance(income, list) or len(income) < 2:
+            return False
+
+        eps = [self._num(q.get("epsdiluted", q.get("eps"))) for q in income]
+        rev = [self._num(q.get("revenue")) for q in income]
+
+        eps_qoq = eps[0] is not None and eps[1] is not None and eps[0] > eps[1]
+        eps_yoy = (
+            len(eps) >= 5 and eps[0] is not None and eps[4] is not None
+            and eps[4] != 0 and eps[0] > eps[4]
+        )
+        rev_yoy = (
+            len(rev) >= 5 and rev[0] is not None and rev[4] is not None
+            and rev[4] > 0 and rev[0] > rev[4] * 1.05
+        )
+        est_ok = self._fmp_estimates_positive(ticker)
+
+        passed = eps_qoq or eps_yoy or rev_yoy or est_ok
+        logger.debug(
+            "Stage3 FMP %s: eps_qoq=%s eps_yoy=%s rev_yoy=%s est_ok=%s -> %s",
+            ticker, eps_qoq, eps_yoy, rev_yoy, est_ok, passed,
+        )
+        return passed
+
+    def _fmp_estimates_positive(self, ticker: str) -> bool:
+        """Best-effort: analyst estimating rising EPS next quarter vs current."""
+        data = self._fmp_get(
+            f"analyst-estimates/{ticker}", period="quarter", limit=2
+        )
+        if not isinstance(data, list) or len(data) < 2:
+            return False
+        # FMP returns most-recent first; compare next-period estimate to current.
+        nxt = self._num(data[0].get("estimatedEpsAvg"))
+        cur = self._num(data[1].get("estimatedEpsAvg"))
+        return nxt is not None and cur is not None and cur != 0 and nxt > cur
+
+    # ── Fallback path (yfinance .info, no earnings calendar) ─────────────────
+    def _passes_fallback(self, ticker: str) -> bool:
+        """Lenient filter from yfinance ``.info`` — no earnings calendar.
+
+        A name passes if it shows *any* of: positive earnings, positive revenue
+        growth, positive earnings growth, or a healthy gross margin. Thresholds
+        are deliberately loose so a reasonable slice (~50–100 of a few hundred)
+        survives without the richer FMP data.
         """
         try:
             import yfinance as yf
 
-            t = yf.Ticker(ticker)
-            df = t.earnings_dates
-            if df is None or df.empty:
-                return []
+            info = yf.Ticker(ticker).info or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Stage3 fallback: .info failed for %s: %s", ticker, exc)
+            return False
+        if not info:
+            return False
 
-            records = []
-            for idx, row in df.iterrows():
-                actual = row.get("Reported EPS")
-                estimate = row.get("EPS Estimate")
-                if actual is None and estimate is None:
-                    continue
-                try:
-                    records.append({
-                        "period": str(idx),
-                        "actual": float(actual) if actual is not None else 0.0,
-                        "estimate": float(estimate) if estimate is not None else 0.0,
-                    })
-                except (TypeError, ValueError):
-                    continue
-            return records[:8]  # last 8 quarters, most recent first
-        except Exception as exc:
-            logger.debug("FundamentalScreen: earnings_dates fetch failed for %s: %s", ticker, exc)
-            return []
+        trailing_eps = self._num(info.get("trailingEps"))
+        rev_growth = self._num(info.get("revenueGrowth"))
+        earn_growth = self._num(info.get("earningsGrowth")) or self._num(
+            info.get("earningsQuarterlyGrowth")
+        )
+        gross_margin = self._num(info.get("grossMargins"))
 
-    def _get_quarterly_revenue(self, ticker: str) -> list[float]:
-        """Fetch quarterly revenue from yfinance income statement."""
+        profitable = trailing_eps is not None and trailing_eps > 0
+        growing_rev = rev_growth is not None and rev_growth > 0
+        growing_earn = earn_growth is not None and earn_growth > 0
+        healthy_margin = gross_margin is not None and gross_margin > 0.25
+
+        # Lenient OR: any genuine sign of fundamental health.
+        passed = (
+            (profitable and growing_rev)
+            or growing_earn
+            or (growing_rev and healthy_margin)
+            or (rev_growth is not None and rev_growth > 0.10)
+        )
+        logger.debug(
+            "Stage3 fallback %s: eps=%s revG=%s earnG=%s gm=%s -> %s",
+            ticker, trailing_eps, rev_growth, earn_growth, gross_margin, passed,
+        )
+        return passed
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _num(value: object) -> Optional[float]:
+        """Coerce to float, returning None for missing/invalid values."""
+        if value is None:
+            return None
         try:
-            import yfinance as yf
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
 
-            t = yf.Ticker(ticker)
-            fin = t.quarterly_income_stmt
-            if fin is None or fin.empty:
-                return []
-            rev_row = None
-            for row_name in ("Total Revenue", "Revenue", "TotalRevenue"):
-                if row_name in fin.index:
-                    rev_row = fin.loc[row_name]
-                    break
-            if rev_row is None:
-                return []
-            return [float(v) for v in rev_row.values[:8] if v is not None]
-        except Exception as exc:
-            logger.debug("FundamentalScreen: revenue fetch failed for %s: %s", ticker, exc)
-            return []
-
-    def _eps_accelerating(self, earnings: list[dict], min_quarters: int = 2) -> bool:
-        """Return True if EPS beats are improving (actual > estimate) for min_quarters."""
-        # With earnings_dates, actuals are in chronological order (most recent = index 0)
-        # Check that recent quarters are positive surprises and beat rate is high
-        valid = [e for e in earnings if e["estimate"] != 0]
-        if len(valid) < min_quarters:
-            return False
-
-        # Check last N quarters all beat
-        recent = valid[:min_quarters]
-        return all(e["actual"] > e["estimate"] for e in recent)
-
-    def _eps_yoy_accelerating(self, earnings: list[dict]) -> bool:
-        """Return True if EPS growth YoY is accelerating (need 8 quarters)."""
-        actuals = [e["actual"] for e in earnings]
-        if len(actuals) < 6:
-            return False
-        # Compare Q0 vs Q4 (YoY) and Q1 vs Q5 (YoY) — check recent is better
-        try:
-            growth_recent = (actuals[0] - actuals[4]) / abs(actuals[4]) if actuals[4] != 0 else 0
-            growth_prior = (actuals[1] - actuals[5]) / abs(actuals[5]) if actuals[5] != 0 else 0
-            return growth_recent > growth_prior
-        except Exception:
-            return False
-
-    def _revenue_reaccelerating(self, revenues: list[float]) -> bool:
-        """Return True if revenue growth re-accelerated after a period of slowdown."""
-        if len(revenues) < 4:
-            return False
-        # revenues[0] = most recent quarter (yfinance orders newest first)
-        # Compute QoQ growth for recent 3 quarters
-        growths = []
-        for i in range(min(len(revenues) - 1, 4)):
-            prior = revenues[i + 1]
-            if prior > 0:
-                growths.append((revenues[i] - prior) / prior)
-        if len(growths) < 2:
-            return False
-        # Re-accel: most recent growth > prior growth
-        return growths[0] > growths[1]
-
-    def _revenue_yoy_growing(self, revenues: list[float]) -> bool:
-        """Return True if revenue is growing YoY."""
-        if len(revenues) < 5:
-            return False
-        # Compare most recent quarter to same quarter a year ago
-        try:
-            return revenues[0] > revenues[4] * 1.05  # 5% YoY growth floor
-        except Exception:
-            return False
-
-    def _estimate_revisions_positive(self, earnings: list[dict]) -> bool:
-        """Return True if EPS beat rate >= 75% in recent quarters."""
-        valid = [e for e in earnings if e["estimate"] != 0 and e["actual"] != 0]
-        if not valid:
-            return False
-        beats = sum(1 for e in valid if e["actual"] > e["estimate"])
-        return (beats / len(valid)) >= 0.75
-
+    # ── Public API ───────────────────────────────────────────────────────────
     def screen(self, tickers: list[str]) -> list[str]:
-        """Run Stage 3 screening. Returns tickers that pass fundamental criteria.
-
-        Pass condition (OR logic — any one is enough):
-          - EPS accelerating (recent quarters beating estimates)
-          - Revenue re-accelerating AND strong beat rate (> 75%)
-          - EPS YoY accelerating AND revenue growing YoY
-        """
+        """Run Stage 3 screening. Returns tickers that pass fundamental criteria."""
+        use_fmp = bool(self._fmp_key)
         passing: list[str] = []
-
         for ticker in tickers:
             try:
-                earnings = self._get_earnings_data(ticker)
-                revenues = self._get_quarterly_revenue(ticker)
-
-                eps_beats = self._eps_accelerating(earnings)
-                rev_reaccel = self._revenue_reaccelerating(revenues)
-                est_ok = self._estimate_revisions_positive(earnings)
-                eps_yoy = self._eps_yoy_accelerating(earnings)
-                rev_yoy = self._revenue_yoy_growing(revenues)
-
-                if eps_beats or (rev_reaccel and est_ok) or (eps_yoy and rev_yoy):
+                ok = self._passes_fmp(ticker) if use_fmp else self._passes_fallback(ticker)
+                if ok:
                     passing.append(ticker)
-                    logger.debug(
-                        "Stage3 PASS %s eps_beats=%s rev_reaccel=%s est_ok=%s eps_yoy=%s rev_yoy=%s",
-                        ticker, eps_beats, rev_reaccel, est_ok, eps_yoy, rev_yoy,
-                    )
-                else:
-                    logger.debug(
-                        "Stage3 FAIL %s eps_beats=%s rev_reaccel=%s est_ok=%s eps_yoy=%s rev_yoy=%s",
-                        ticker, eps_beats, rev_reaccel, est_ok, eps_yoy, rev_yoy,
-                    )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug("Stage3: error for %s: %s", ticker, exc)
 
-        logger.info("Stage 3 fundamental screen: %d/%d pass", len(passing), len(tickers))
+        mode = "FMP" if use_fmp else "yfinance-fallback"
+        logger.info(
+            "Stage 3 fundamental screen (%s): %d/%d pass", mode, len(passing), len(tickers)
+        )
         return passing
 
     def log_run(self, tickers_in: int, tickers_out: int) -> None:

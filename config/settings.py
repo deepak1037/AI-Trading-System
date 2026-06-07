@@ -120,6 +120,7 @@ class Settings(BaseSettings):
     POLYGON_API_KEY: str = ""
     FRED_API_KEY: str = ""
     NEWS_API_KEY: str = ""
+    FMP_API_KEY: str = ""  # Financial Modeling Prep — Stage 3 fundamentals
 
     # ── LLM (Claude) — options ROI analysis ───────────────────
     ANTHROPIC_API_KEY: str = ""
