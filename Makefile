@@ -82,26 +82,12 @@ stop:
 .PHONY: scanner
 scanner: _check_venv _mklogs
 	@echo "Running multi-bagger scanner (Stages 1-5)..."
-	@$(PYTHON) -c "\
-from scanner.universe import UniverseDownloader; \
-from scanner.fundamental_screen import FundamentalScreen; \
-from scanner.accumulation_screen import AccumulationScreen; \
-from scanner.technical_screen import TechnicalScreen; \
-from scanner.scorer import CompositeScorer; \
-from scanner.watchlist_manager import WatchlistManager; \
-import logging; logging.basicConfig(level=logging.INFO, format='%(levelname)s | %(name)s | %(message)s'); \
-print('Stage 1-2: Universe + liquidity filter'); \
-u = UniverseDownloader(); tickers = u.run(); print(f'  → {len(tickers)} liquid stocks'); \
-print('Stage 3: Fundamental screen'); \
-f = FundamentalScreen(); tickers = f.screen(tickers); print(f'  → {len(tickers)} pass fundamentals'); \
-print('Stage 4: Accumulation screen'); \
-a = AccumulationScreen(); tickers = a.screen(tickers); print(f'  → {len(tickers)} pass accumulation'); \
-print('Stage 5: Technical screen'); \
-t = TechnicalScreen(); tickers = t.screen(tickers); print(f'  → {len(tickers)} pass technical (watchlist candidates)'); \
-print('Updating watchlist...'); \
-wm = WatchlistManager(); wm.update_from_stage4(tickers); \
-print(f'Done. {len(wm.get_active())} stocks on watchlist.') \
-" 2>&1 | tee -a $(LOG_FILE)
+	@$(PYTHON) scripts/run_scanner.py 2>&1 | tee -a $(LOG_FILE)
+
+# ── build-watchlist: reliable curated-universe watchlist (recommended) ───────
+.PHONY: build-watchlist
+build-watchlist: _check_venv _mklogs
+	@$(PYTHON) scripts/build_watchlist.py 2>&1 | tee -a $(LOG_FILE)
 
 # ── watchlist: print current watchlist from SQLite ───────────────────────────
 .PHONY: watchlist

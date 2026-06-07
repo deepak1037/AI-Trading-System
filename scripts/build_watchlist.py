@@ -100,27 +100,19 @@ def run_pipeline(universe: list[str]) -> int:
     import config.settings as cs
     cs.settings.SCANNER_YF_PACE_SECONDS = SCAN_PACE
 
-    from scanner.accumulation_screen import AccumulationScreen
-    from scanner.fundamental_screen import FundamentalScreen
+    from scanner.pipeline import run_funnel
     from scanner.watchlist_manager import WatchlistManager
 
-    logger.info("Stage 3: fundamental screen on %d tickers (paced %.2fs)", len(universe), SCAN_PACE)
-    s3 = FundamentalScreen().screen(universe)
-    logger.info("Stage 3 -> %d pass", len(s3))
-    if not s3:
+    logger.info("Funnel (Stages 3-4) on %d tickers (paced %.2fs)", len(universe), SCAN_PACE)
+    stage4_data = run_funnel(universe)
+    logger.info("Funnel produced data for %d tickers", len(stage4_data))
+    if not stage4_data:
         return 0
 
-    logger.info("Stage 4: accumulation screen on %d tickers", len(s3))
-    s4 = AccumulationScreen().screen(s3)
-    logger.info("Stage 4 -> %d pass", len(s4))
-
-    # update_from_stage4 runs Stage 5 (technical) internally, scores survivors,
-    # and adds those clearing the composite threshold. Don't let an over-strict
-    # Stage 4 zero out the input.
-    s4_input = s4 or s3
-    logger.info("Watchlist update (runs Stage 5 internally) on %d tickers", len(s4_input))
+    # update_from_stage4 runs Stage 5 (technical) internally and scores each
+    # survivor from its real per-stock data.
     wm = WatchlistManager()
-    wm.update_from_stage4(s4_input)
+    wm.update_from_stage4(stage4_data)
     active = len(wm.get_active())
     logger.info("Watchlist updated: %d active", active)
     return active

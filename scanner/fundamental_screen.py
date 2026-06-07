@@ -64,18 +64,17 @@ class FundamentalScreen:
             logger.debug("FMP %s failed: %s", path, exc)
             return None
 
-    def _passes_fmp(self, ticker: str) -> bool:
-        """Pass condition (OR logic) using FMP quarterly fundamentals.
+    def _fmp_flags(self, ticker: str) -> Optional[dict]:
+        """Return fundamental flags from FMP quarterly data, or None if failing.
 
-          - EPS accelerating (latest quarter beats prior) OR growing YoY
-          - Revenue growing YoY (>5%)
-          - Positive analyst estimate revisions (best-effort bonus)
+        Flags: ``eps_accelerating``, ``rev_reaccelerating``, ``est_revisions_up``.
+        A ticker passes if any flag is True.
         """
         income = self._fmp_get(
             f"income-statement/{ticker}", period="quarter", limit=8
         )
         if not isinstance(income, list) or len(income) < 2:
-            return False
+            return None
 
         eps = [self._num(q.get("epsdiluted", q.get("eps"))) for q in income]
         rev = [self._num(q.get("revenue")) for q in income]
@@ -89,14 +88,13 @@ class FundamentalScreen:
             len(rev) >= 5 and rev[0] is not None and rev[4] is not None
             and rev[4] > 0 and rev[0] > rev[4] * 1.05
         )
-        est_ok = self._fmp_estimates_positive(ticker)
-
-        passed = eps_qoq or eps_yoy or rev_yoy or est_ok
-        logger.debug(
-            "Stage3 FMP %s: eps_qoq=%s eps_yoy=%s rev_yoy=%s est_ok=%s -> %s",
-            ticker, eps_qoq, eps_yoy, rev_yoy, est_ok, passed,
-        )
-        return passed
+        flags = {
+            "eps_accelerating": bool(eps_qoq or eps_yoy),
+            "rev_reaccelerating": bool(rev_yoy),
+            "est_revisions_up": bool(self._fmp_estimates_positive(ticker)),
+        }
+        logger.debug("Stage3 FMP %s: %s", ticker, flags)
+        return flags if any(flags.values()) else None
 
     def _fmp_estimates_positive(self, ticker: str) -> bool:
         """Best-effort: analyst estimating rising EPS next quarter vs current."""
@@ -111,13 +109,12 @@ class FundamentalScreen:
         return nxt is not None and cur is not None and cur != 0 and nxt > cur
 
     # ── Fallback path (yfinance .info, no earnings calendar) ─────────────────
-    def _passes_fallback(self, ticker: str) -> bool:
-        """Lenient filter from yfinance ``.info`` — no earnings calendar.
+    def _fallback_flags(self, ticker: str) -> Optional[dict]:
+        """Return fundamental flags from yfinance ``.info``, or None if failing.
 
-        A name passes if it shows *any* of: positive earnings, positive revenue
-        growth, positive earnings growth, or a healthy gross margin. Thresholds
-        are deliberately loose so a reasonable slice (~50–100 of a few hundred)
-        survives without the richer FMP data.
+        No earnings calendar (it is unreliable). Maps available ``.info`` fields
+        to the same three flags the scorer expects. Lenient — a name passes if
+        any flag is True.
         """
         try:
             import yfinance as yf
@@ -125,9 +122,9 @@ class FundamentalScreen:
             info = yf.Ticker(ticker).info or {}
         except Exception as exc:  # noqa: BLE001
             logger.debug("Stage3 fallback: .info failed for %s: %s", ticker, exc)
-            return False
+            return None
         if not info:
-            return False
+            return None
 
         trailing_eps = self._num(info.get("trailingEps"))
         rev_growth = self._num(info.get("revenueGrowth"))
@@ -137,22 +134,24 @@ class FundamentalScreen:
         gross_margin = self._num(info.get("grossMargins"))
 
         profitable = trailing_eps is not None and trailing_eps > 0
-        growing_rev = rev_growth is not None and rev_growth > 0
-        growing_earn = earn_growth is not None and earn_growth > 0
         healthy_margin = gross_margin is not None and gross_margin > 0.25
 
-        # Lenient OR: any genuine sign of fundamental health.
-        passed = (
-            (profitable and growing_rev)
-            or growing_earn
-            or (growing_rev and healthy_margin)
-            or (rev_growth is not None and rev_growth > 0.10)
-        )
+        flags = {
+            # earnings growth → EPS acceleration proxy
+            "eps_accelerating": bool(earn_growth is not None and earn_growth > 0),
+            # revenue growth → revenue re-acceleration proxy
+            "rev_reaccelerating": bool(rev_growth is not None and rev_growth > 0),
+            # profitable + healthy margin → positive-outlook proxy (no estimates in .info)
+            "est_revisions_up": bool(profitable and healthy_margin),
+        }
+        # Strong top-line growth alone is enough to keep a name in.
+        if rev_growth is not None and rev_growth > 0.10:
+            flags["rev_reaccelerating"] = True
         logger.debug(
             "Stage3 fallback %s: eps=%s revG=%s earnG=%s gm=%s -> %s",
-            ticker, trailing_eps, rev_growth, earn_growth, gross_margin, passed,
+            ticker, trailing_eps, rev_growth, earn_growth, gross_margin, flags,
         )
-        return passed
+        return flags if any(flags.values()) else None
 
     # ── Helpers ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -166,18 +165,23 @@ class FundamentalScreen:
             return None
 
     # ── Public API ───────────────────────────────────────────────────────────
-    def screen(self, tickers: list[str]) -> list[str]:
-        """Run Stage 3 screening. Returns tickers that pass fundamental criteria."""
+    def screen(self, tickers: list[str]) -> list[dict]:
+        """Run Stage 3 screening. Returns per-stock dicts for passing tickers::
+
+            {ticker, eps_accelerating, rev_reaccelerating, est_revisions_up}
+
+        so downstream scoring uses real fundamental flags, not a flat value.
+        """
         use_fmp = bool(self._fmp_key)
         pace = settings.SCANNER_YF_PACE_SECONDS
-        passing: list[str] = []
+        passing: list[dict] = []
         for ticker in tickers:
             if pace and not use_fmp:  # only the yfinance .info path needs pacing
                 time.sleep(pace)
             try:
-                ok = self._passes_fmp(ticker) if use_fmp else self._passes_fallback(ticker)
-                if ok:
-                    passing.append(ticker)
+                flags = self._fmp_flags(ticker) if use_fmp else self._fallback_flags(ticker)
+                if flags is not None:
+                    passing.append({"ticker": ticker, **flags})
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Stage3: error for %s: %s", ticker, exc)
 

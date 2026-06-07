@@ -116,9 +116,14 @@ class TechnicalScreen:
         except Exception:
             return 0.0
 
-    def screen(self, tickers: list[str]) -> list[str]:
+    def screen(self, tickers: list[str]) -> list[dict]:
         """Run Stage 5 technical screening. Returns Stage 2 breakout candidates.
 
+        Returns a list of per-stock dicts (one per passing ticker)::
+
+            {ticker, is_stage2, in_base, rs_rank, tf_alignment}
+
+        so downstream scoring uses real technical data rather than a flat value.
         A candidate passes if it is in a confirmed Stage 2 uptrend AND ranks in
         the top (100 − ``_MIN_RS_RANK``)% by 1-year relative strength *within the
         screened universe*. A tight base is a bonus, not a hard requirement —
@@ -164,16 +169,28 @@ class TechnicalScreen:
         def _rs_rank(r: float) -> float:
             return bisect.bisect_right(sorted_returns, r) / n * 100.0
 
-        passing: list[str] = []
+        passing: list[dict] = []
         for ticker, df in frames.items():
             try:
                 stage2 = self._is_stage2(df)
                 rs = _rs_rank(returns[ticker])
                 if stage2 and rs >= _MIN_RS_RANK:
-                    passing.append(ticker)
+                    in_base = self._is_in_base(df)
+                    # Timeframe alignment: a Stage 2 uptrend (price > 50/150/200
+                    # MA, stacked and rising) with top-band RS means the short,
+                    # mid and long trends agree — that IS multi-timeframe
+                    # alignment, so survivors earn the tf bonus.
+                    tf_alignment = bool(stage2 and rs >= _MIN_RS_RANK)
+                    passing.append({
+                        "ticker": ticker,
+                        "is_stage2": stage2,
+                        "in_base": in_base,
+                        "rs_rank": round(rs, 1),
+                        "tf_alignment": tf_alignment,
+                    })
                     logger.debug(
-                        "Stage5 PASS %s stage2=%s base=%s rs_rank=%.0f",
-                        ticker, stage2, self._is_in_base(df), rs,
+                        "Stage5 PASS %s stage2=%s base=%s rs_rank=%.0f tf=%s",
+                        ticker, stage2, in_base, rs, tf_alignment,
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Stage5: eval error for %s: %s", ticker, exc)
