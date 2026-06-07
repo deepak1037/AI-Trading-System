@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     SCHWAB_CLIENT_ID: str = ""
     SCHWAB_CLIENT_SECRET: str = ""
     SCHWAB_REDIRECT_URI: str = ""
+    SCHWAB_ACCOUNT_NUMBER: str = ""
     SCHWAB_TOKEN_FILE: str = "broker_core/tokens/schwab_token.json"
     ALPACA_API_KEY: str = ""
     ALPACA_TOKEN_FILE: str = "broker_core/tokens/alpaca_token.json"
