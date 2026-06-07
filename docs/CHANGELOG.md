@@ -85,6 +85,23 @@ Not in `CLAUDE_SETTINGS.md`:
     `earningsGrowth`, `grossMargins`) with lenient OR thresholds.
   - Earnings calendar is no longer used at all. (`710cfcf`.)
 
+- **`scanner/technical_screen.py` (Stage 5)**: could **never** pass a stock —
+  `close.rolling(252).max()` needs 252 rows but 1 year of daily bars is ~251, so
+  `high_52w`/`low_52w` were NaN and every `last >= 0.75*NaN` comparison was False.
+  (Hidden until Stage 3 was fixed and the funnel finally reached Stage 5.) Fixed
+  with `min_periods=100`. Also: fetch each ticker's OHLCV once (was downloading
+  twice — once for Stage 2, again for RS), RS is now a true **percentile rank**
+  within the universe, and a tight base is a bonus not a hard gate (requiring a
+  base AND a breakout simultaneously is near-contradictory). (`<this commit>`.)
+
+- **yfinance rate-limiting starved the funnel**: Stages 3+4 burned ~970 yfinance
+  calls and tripped the rate limit before Stage 5 ran, so Stage 5 got empty
+  frames → 0. The full 15,749-ticker Stage 1/2 made it worse (exhausted yfinance
+  for ~30 min). Mitigations: new `SCANNER_YF_PACE_SECONDS` (default 0) paces
+  per-ticker calls in Stages 3/4/5; `scripts/build_watchlist.py` uses a curated
+  liquid universe (no 15k download) + pacing + recovery-wait to build the
+  watchlist reliably.
+
 - **`scanner/accumulation_screen.py` (Stage 4)**: the package imports as
   **`edgar`**, not `edgartools`, so `import edgartools` always failed into the
   TODO/proxy path. Fixed: `import edgar` + `edgar.set_identity(...)`, Form 4
