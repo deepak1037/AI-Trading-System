@@ -137,8 +137,13 @@ class AccumulationScreen:
 
     def screen(self, tickers: list[str]) -> list[str]:
         """Run Stage 4 screening. Returns tickers showing accumulation."""
+        import time
+
+        pace = settings.SCANNER_YF_PACE_SECONDS
         passing: list[str] = []
         for ticker in tickers:
+            if pace:
+                time.sleep(pace)
             try:
                 if self._passes_accumulation(ticker):
                     passing.append(ticker)

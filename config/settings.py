@@ -157,6 +157,10 @@ class Settings(BaseSettings):
     SCANNER_WATCHLIST_THRESHOLD: int = 65  # min composite score to enter watchlist
     SCANNER_FULL_RUN_DAY: str = "sunday"
     SCANNER_DAILY_RUN_HOUR: int = 6  # 6 AM ET
+    # Sleep between per-ticker yfinance calls in Stages 3-5 (seconds). 0 = no
+    # pacing. Set >0 (e.g. 0.6) to stay under yfinance's burst rate limit on
+    # large universes, so the later stages aren't starved of data.
+    SCANNER_YF_PACE_SECONDS: float = 0.0
 
     # ── Validators ────────────────────────────────────────────
     _VALID_ENVS: ClassVar[set[str]] = {"development", "backtest", "paper", "live"}

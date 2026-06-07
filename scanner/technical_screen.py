@@ -70,10 +70,15 @@ class TechnicalScreen:
         last_ma200 = ma200.iloc[-1]
         ma200_month_ago = ma200.iloc[-22] if len(ma200) >= 22 else ma200.iloc[0]
 
-        high_52w = close.rolling(252).max().iloc[-1]
-        low_52w = close.rolling(252).min().iloc[-1]
+        # min_periods: 1 year of daily bars is ~251 rows, one short of a full
+        # 252 window — without it max()/min() would be NaN and reject every stock.
+        high_52w = close.rolling(252, min_periods=100).max().iloc[-1]
+        low_52w = close.rolling(252, min_periods=100).min().iloc[-1]
 
-        if any(pd.isna(v) for v in [last_ma50, last_ma150, last_ma200, ma200_month_ago]):
+        if any(
+            pd.isna(v)
+            for v in [last_ma50, last_ma150, last_ma200, ma200_month_ago, high_52w, low_52w]
+        ):
             return False
 
         return bool(
@@ -112,37 +117,71 @@ class TechnicalScreen:
             return 0.0
 
     def screen(self, tickers: list[str]) -> list[str]:
-        """Run Stage 5 technical screening. Returns Stage 2 breakout candidates."""
-        # Get SPY 1-year return for RS computation
-        spy_return = 0.0
-        try:
-            spy_df = self._get_ohlcv(_RS_BENCHMARK, period="1y")
-            if spy_df is not None and len(spy_df) > 1:
-                spy_return = (spy_df["close"].iloc[-1] / spy_df["close"].iloc[0] - 1) * 100
-        except Exception as exc:
-            logger.warning("TechnicalScreen: SPY fetch failed: %s", exc)
+        """Run Stage 5 technical screening. Returns Stage 2 breakout candidates.
 
-        passing: list[str] = []
+        A candidate passes if it is in a confirmed Stage 2 uptrend AND ranks in
+        the top (100 − ``_MIN_RS_RANK``)% by 1-year relative strength *within the
+        screened universe*. A tight base is a bonus, not a hard requirement —
+        requiring a base AND a breakout simultaneously is near-contradictory and
+        zeroes out the funnel.
+
+        Each ticker's OHLCV is fetched exactly once (RS is computed from the same
+        frame, not a second download), and calls are paced by
+        ``SCANNER_YF_PACE_SECONDS`` so a large universe doesn't trip yfinance's
+        rate limit and starve this stage of data.
+        """
+        import time
+
+        pace = settings.SCANNER_YF_PACE_SECONDS
+
+        # ── Pass 1: fetch each ticker once; record frame + 1y return ───────────
+        frames: dict[str, pd.DataFrame] = {}
+        returns: dict[str, float] = {}
         for ticker in tickers:
+            if pace:
+                time.sleep(pace)
             try:
                 df = self._get_ohlcv(ticker)
-                if df is None:
+                if df is None or len(df) < 50:
                     continue
+                frames[ticker] = df
+                returns[ticker] = float(df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Stage5: fetch error for %s: %s", ticker, exc)
 
+        if not frames:
+            logger.warning(
+                "Stage 5: no OHLCV fetched for any of %d tickers (yfinance "
+                "throttled?) — 0 pass", len(tickers),
+            )
+            return []
+
+        # ── Percentile RS rank within the fetched universe ────────────────────
+        import bisect
+        sorted_returns = sorted(returns.values())
+        n = len(sorted_returns)
+
+        def _rs_rank(r: float) -> float:
+            return bisect.bisect_right(sorted_returns, r) / n * 100.0
+
+        passing: list[str] = []
+        for ticker, df in frames.items():
+            try:
                 stage2 = self._is_stage2(df)
-                in_base = self._is_in_base(df)
-                rs = self._compute_rs_rank(ticker, spy_return)
-
-                if stage2 and in_base and rs >= _MIN_RS_RANK:
+                rs = _rs_rank(returns[ticker])
+                if stage2 and rs >= _MIN_RS_RANK:
                     passing.append(ticker)
                     logger.debug(
-                        "Stage5 PASS %s stage2=%s base=%s rs=%.1f",
-                        ticker, stage2, in_base, rs,
+                        "Stage5 PASS %s stage2=%s base=%s rs_rank=%.0f",
+                        ticker, stage2, self._is_in_base(df), rs,
                     )
-            except Exception as exc:
-                logger.debug("Stage5: error for %s: %s", ticker, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Stage5: eval error for %s: %s", ticker, exc)
 
-        logger.info("Stage 5 technical screen: %d/%d pass", len(passing), len(tickers))
+        logger.info(
+            "Stage 5 technical screen: %d/%d pass (%d had data)",
+            len(passing), len(tickers), len(frames),
+        )
         return passing
 
     def log_run(self, tickers_in: int, tickers_out: int) -> None:

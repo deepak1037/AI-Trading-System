@@ -169,8 +169,11 @@ class FundamentalScreen:
     def screen(self, tickers: list[str]) -> list[str]:
         """Run Stage 3 screening. Returns tickers that pass fundamental criteria."""
         use_fmp = bool(self._fmp_key)
+        pace = settings.SCANNER_YF_PACE_SECONDS
         passing: list[str] = []
         for ticker in tickers:
+            if pace and not use_fmp:  # only the yfinance .info path needs pacing
+                time.sleep(pace)
             try:
                 ok = self._passes_fmp(ticker) if use_fmp else self._passes_fallback(ticker)
                 if ok:

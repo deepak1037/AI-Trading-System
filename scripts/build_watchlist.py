@@ -30,8 +30,9 @@ logger = get_logger("build_watchlist")
 
 PROBE_TICKERS = ["AAPL", "MSFT", "NVDA", "JPM", "XOM", "WMT", "KO", "PFE"]
 COOLDOWN_SECONDS = 900          # wait between attempts when yfinance is blocked
-MAX_ATTEMPTS = 12               # 12 * 15min ≈ 3h of patience
-PACE_SECONDS = 0.25             # gentle pacing between yfinance calls
+MAX_ATTEMPTS = 10               # 10 * 15min ≈ 2.5h of patience
+PROBE_PACE = 0.25               # pacing for the health probe
+SCAN_PACE = 0.6                 # per-ticker pacing during the funnel (stay under yf limit)
 
 
 # ── Curated liquid universe (no yfinance needed) ──────────────────────────────
@@ -86,20 +87,24 @@ def yfinance_healthy() -> bool:
                 ok += 1
         except Exception:  # noqa: BLE001
             pass
-        time.sleep(PACE_SECONDS)
+        time.sleep(PROBE_PACE)
     healthy = ok >= max(2, len(PROBE_TICKERS) // 2)
     logger.info("yfinance probe: %d/%d healthy -> %s", ok, len(PROBE_TICKERS), healthy)
     return healthy
 
 
-# ── One full attempt: Stages 3→4→5 + watchlist ────────────────────────────────
+# ── One full attempt: Stages 3→4 then watchlist (which runs Stage 5) ──────────
 def run_pipeline(universe: list[str]) -> int:
+    # Pace every per-ticker yfinance call in the scanner so the funnel doesn't
+    # trip the rate limit and starve Stage 5 (the cause of empty watchlists).
+    import config.settings as cs
+    cs.settings.SCANNER_YF_PACE_SECONDS = SCAN_PACE
+
     from scanner.accumulation_screen import AccumulationScreen
     from scanner.fundamental_screen import FundamentalScreen
-    from scanner.technical_screen import TechnicalScreen
     from scanner.watchlist_manager import WatchlistManager
 
-    logger.info("Stage 3: fundamental screen on %d tickers", len(universe))
+    logger.info("Stage 3: fundamental screen on %d tickers (paced %.2fs)", len(universe), SCAN_PACE)
     s3 = FundamentalScreen().screen(universe)
     logger.info("Stage 3 -> %d pass", len(s3))
     if not s3:
@@ -109,14 +114,13 @@ def run_pipeline(universe: list[str]) -> int:
     s4 = AccumulationScreen().screen(s3)
     logger.info("Stage 4 -> %d pass", len(s4))
 
-    s5_input = s4 or s3  # don't let an over-strict Stage 4 zero out the funnel
-    logger.info("Stage 5: technical screen on %d tickers", len(s5_input))
-    s5 = TechnicalScreen().screen(s5_input)
-    logger.info("Stage 5 -> %d pass (watchlist candidates)", len(s5))
-
-    candidates = s5 or s4 or s3[:40]  # always seed *something* sensible
+    # update_from_stage4 runs Stage 5 (technical) internally, scores survivors,
+    # and adds those clearing the composite threshold. Don't let an over-strict
+    # Stage 4 zero out the input.
+    s4_input = s4 or s3
+    logger.info("Watchlist update (runs Stage 5 internally) on %d tickers", len(s4_input))
     wm = WatchlistManager()
-    wm.update_from_stage4(candidates)
+    wm.update_from_stage4(s4_input)
     active = len(wm.get_active())
     logger.info("Watchlist updated: %d active", active)
     return active
