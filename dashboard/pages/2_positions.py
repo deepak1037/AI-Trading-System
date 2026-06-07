@@ -18,9 +18,8 @@ st.title("Open Positions")
 
 # ── Source selector ───────────────────────────────────────────────────────────
 
-sources = list(settings.PAPER_ACCOUNTS)
-if settings.BROKER == "schwab":
-    sources = ["schwab_live"] + sources
+live_label = f"{settings.BROKER}_live"
+sources = [live_label] + list(settings.PAPER_ACCOUNTS)
 
 source = st.selectbox("Account", sources)
 
@@ -38,10 +37,10 @@ def _load_paper_positions(account_id: str) -> list[dict]:
     return state.get("open_positions", [])  # type: ignore[no-any-return]
 
 
-def _load_schwab_positions() -> list[dict]:
+def _load_broker_positions() -> list[dict]:
     try:
-        from broker_core.schwab_broker import SchwabBroker
-        broker = SchwabBroker()
+        from broker_core.factory import get_broker
+        broker = get_broker()
         raw = broker.get_positions()
         return [
             {
@@ -59,7 +58,7 @@ def _load_schwab_positions() -> list[dict]:
             for p in raw
         ]
     except Exception as exc:
-        st.error(f"Failed to load Schwab positions: {exc}")
+        st.error(f"Failed to load {settings.BROKER} positions: {exc}")
         return []
 
 
@@ -76,9 +75,9 @@ def _get_live_price(ticker: str) -> float | None:
 
 # ── Load positions ────────────────────────────────────────────────────────────
 
-if source == "schwab_live":
-    with st.spinner("Fetching positions from Schwab..."):
-        positions = _load_schwab_positions()
+if source == live_label:
+    with st.spinner(f"Fetching positions from {settings.BROKER}..."):
+        positions = _load_broker_positions()
 else:
     positions = _load_paper_positions(source)
 
@@ -93,7 +92,7 @@ rows = []
 for pos in positions:
     ticker = pos.get("ticker", "")
 
-    if source == "schwab_live":
+    if source == live_label:
         live_price = pos.get("current_price") or _get_live_price(ticker) or 0.0
     else:
         live_price = _get_live_price(ticker) or pos.get("current_price", pos.get("entry_price", 0))
@@ -101,7 +100,7 @@ for pos in positions:
     qty = pos.get("qty", 0)
     entry = pos.get("entry_price", 0)
 
-    if source == "schwab_live" and pos.get("unrealized_pnl") is not None:
+    if source == live_label and pos.get("unrealized_pnl") is not None:
         unrealized_pnl = pos["unrealized_pnl"]
         pnl_pct = unrealized_pnl / (entry * qty) * 100 if entry and qty else 0.0
     else:
@@ -145,6 +144,6 @@ col1.metric("Total Unrealized P&L", f"${total_pnl:+,.2f}")
 col2.metric("Open Positions", len(positions))
 
 st.caption(
-    f"Source: {'Schwab Live API' if source == 'schwab_live' else source} | "
+    f"Source: {settings.BROKER.title() + ' Live API' if source == live_label else source} | "
     f"Auto-refresh: every {settings.DASHBOARD_REFRESH_SECONDS}s"
 )
