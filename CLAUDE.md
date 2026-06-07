@@ -4,6 +4,10 @@
 # This is the single source of truth for architecture, conventions,
 # module interfaces, and build order. Never deviate from these
 # decisions without updating this file first.
+#
+# >>> See docs/CHANGELOG.md for everything built/fixed BEYOND this spec
+#     (new LLM ROI analyzer, new settings, scanner Stage 3/4 fixes,
+#     broker model additions, dependency bumps). Read it after this file.
 # ============================================================
 
 ---
