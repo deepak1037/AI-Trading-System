@@ -119,36 +119,47 @@ class TestFallbackFlags:
 class TestFundamentalScreenIntegration:
     def test_screen_empty_tickers(self):
         s = FundamentalScreen()
-        s._use_fmp = False  # avoid the capability network probe
+        s._source = "yfinance"  # avoid the source-resolution network probe
         assert s.screen([]) == []
 
-    def test_screen_routes_to_fallback_when_no_key(self, monkeypatch):
+    def test_screen_routes_to_yfinance_when_fallback(self, monkeypatch):
         s = FundamentalScreen()
-        s._fmp_key = ""
-        s._use_fmp = False  # resolved (no key)
-        calls = {"fallback": 0, "fmp": 0}
+        s._source = "yfinance"
+        calls = {"fallback": 0, "fmp": 0, "moomoo": 0}
         flags = {"eps_accelerating": True, "rev_reaccelerating": False, "est_revisions_up": False}
         monkeypatch.setattr(s, "_fallback_flags", lambda t: calls.__setitem__("fallback", calls["fallback"] + 1) or flags)
         monkeypatch.setattr(s, "_fmp_flags", lambda t: calls.__setitem__("fmp", calls["fmp"] + 1) or flags)
+        monkeypatch.setattr(s, "_moomoo_flags", lambda t: calls.__setitem__("moomoo", calls["moomoo"] + 1) or flags)
         result = s.screen(["AAPL", "MSFT"])
         assert [d["ticker"] for d in result] == ["AAPL", "MSFT"]
         assert result[0]["eps_accelerating"] is True
-        assert calls["fallback"] == 2 and calls["fmp"] == 0
+        assert calls["fallback"] == 2 and calls["fmp"] == 0 and calls["moomoo"] == 0
 
-    def test_screen_routes_to_fmp_when_key_set(self, monkeypatch):
+    def test_screen_routes_to_moomoo(self, monkeypatch):
         s = FundamentalScreen()
-        s._fmp_key = "test-key"
-        s._use_fmp = True  # resolved (key has fundamentals access)
-        calls = {"fallback": 0, "fmp": 0}
+        s._source = "moomoo"
+        calls = {"fallback": 0, "fmp": 0, "moomoo": 0}
+        flags = {"eps_accelerating": True, "rev_reaccelerating": True, "est_revisions_up": False}
+        monkeypatch.setattr(s, "_fallback_flags", lambda t: calls.__setitem__("fallback", calls["fallback"] + 1) or flags)
+        monkeypatch.setattr(s, "_fmp_flags", lambda t: calls.__setitem__("fmp", calls["fmp"] + 1) or flags)
+        monkeypatch.setattr(s, "_moomoo_flags", lambda t: calls.__setitem__("moomoo", calls["moomoo"] + 1) or flags)
+        s.screen(["CRWD"])
+        assert calls["moomoo"] == 1 and calls["fmp"] == 0 and calls["fallback"] == 0
+
+    def test_screen_routes_to_fmp(self, monkeypatch):
+        s = FundamentalScreen()
+        s._source = "fmp"
+        calls = {"fallback": 0, "fmp": 0, "moomoo": 0}
         flags = {"eps_accelerating": True, "rev_reaccelerating": False, "est_revisions_up": False}
         monkeypatch.setattr(s, "_fallback_flags", lambda t: calls.__setitem__("fallback", calls["fallback"] + 1) or flags)
         monkeypatch.setattr(s, "_fmp_flags", lambda t: calls.__setitem__("fmp", calls["fmp"] + 1) or flags)
+        monkeypatch.setattr(s, "_moomoo_flags", lambda t: calls.__setitem__("moomoo", calls["moomoo"] + 1) or flags)
         s.screen(["AAPL"])
-        assert calls["fmp"] == 1 and calls["fallback"] == 0
+        assert calls["fmp"] == 1 and calls["fallback"] == 0 and calls["moomoo"] == 0
 
     def test_screen_skips_failing_and_survives_errors(self, monkeypatch):
         s = FundamentalScreen()
-        s._fmp_key = ""
+        s._source = "yfinance"
         flags = {"eps_accelerating": True, "rev_reaccelerating": False, "est_revisions_up": False}
 
         def _f(t):

@@ -42,31 +42,115 @@ class FundamentalScreen:
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "AI-Trading-System/1.0"
         # Resolved lazily on first screen() so construction stays network-free.
-        self._use_fmp: Optional[bool] = None
+        self._source: Optional[str] = None  # "moomoo" | "fmp" | "yfinance"
+        self._moomoo_ctx: Any = None
 
-    def _resolve_source(self) -> bool:
-        """Decide FMP vs yfinance once, log it, and cache the decision.
+    def _resolve_source(self) -> str:
+        """Pick the fundamentals source once, log it, and cache the decision.
 
-        Only uses FMP if the key can actually pull fundamentals — the FMP FREE
-        tier returns HTTP 402 for income statements on non-demo symbols, so a
-        set-but-unprivileged key must still fall back to yfinance.
+        Priority:
+          1. Moomoo OpenD (free, local, accurate non-GAAP quarterly EPS)
+          2. FMP — only if a key can actually pull fundamentals (paid plan; the
+             free tier returns 402 for income statements)
+          3. yfinance ``.info`` fallback (GAAP earnings, always available)
         """
-        if self._use_fmp is not None:
-            return self._use_fmp
-        self._use_fmp = bool(self._fmp_key) and self._fmp_fundamentals_available()
-        if self._use_fmp:
+        if self._source is not None:
+            return self._source
+        if self._moomoo_available():
+            self._source = "moomoo"
+            logger.info("Scanner data source: Moomoo")
+        elif bool(self._fmp_key) and self._fmp_fundamentals_available():
+            self._source = "fmp"
             logger.info("Scanner data source: FMP")
-        elif self._fmp_key:
-            logger.warning(
-                "Scanner data source: yfinance fallback — FMP_API_KEY is set but "
-                "fundamentals are not accessible on this plan (free tier returns "
-                "402 for income statements). A paid FMP plan is required."
-            )
         else:
-            logger.warning(
-                "Scanner data source: yfinance fallback — FMP_API_KEY not set."
+            self._source = "yfinance"
+            reason = (
+                "FMP key set but fundamentals not accessible (free tier 402)"
+                if self._fmp_key else "no Moomoo OpenD, no FMP key"
             )
-        return self._use_fmp
+            logger.warning("Scanner data source: yfinance fallback — %s.", reason)
+        return self._source
+
+    # ── Moomoo OpenD path (priority 1) ───────────────────────────────────────
+    def _ensure_moomoo_ctx(self) -> Any:
+        if self._moomoo_ctx is None:
+            import moomoo as ft  # type: ignore[import-untyped]
+
+            self._moomoo_ctx = ft.OpenQuoteContext(
+                host=settings.MOOMOO_HOST, port=settings.MOOMOO_PORT
+            )
+        return self._moomoo_ctx
+
+    def _close_moomoo(self) -> None:
+        if self._moomoo_ctx is not None:
+            try:
+                self._moomoo_ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._moomoo_ctx = None
+
+    def _moomoo_available(self) -> bool:
+        """True if OpenD is reachable and serves quarterly financials."""
+        try:
+            import moomoo as ft  # type: ignore[import-untyped]
+
+            ctx = self._ensure_moomoo_ctx()
+            ret, data = ctx.get_financials_statements(
+                "US.CRWD", statement_type=1, financial_type=10, num=2
+            )
+            return ret == ft.RET_OK and isinstance(data, dict) and bool(data.get("report_list"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Moomoo OpenD not available: %s", exc)
+            return False
+
+    def _moomoo_flags(self, ticker: str) -> Optional[dict]:
+        """Fundamental flags from Moomoo quarterly statements, or None if failing.
+
+        Income statement field ids: 8048 = Diluted EPS, 8001 = Total Revenue.
+        ``report_list`` interleaves quarterly and annual (FY) rows — we keep only
+        quarters and compare most-recent-first.
+        """
+        try:
+            import moomoo as ft  # type: ignore[import-untyped]
+
+            ctx = self._ensure_moomoo_ctx()
+            ret, data = ctx.get_financials_statements(
+                f"US.{ticker}", statement_type=1, financial_type=10, num=12
+            )
+            if ret != ft.RET_OK or not isinstance(data, dict):
+                return None
+            quarters = []
+            for rep in data.get("report_list", []):
+                if "Q" not in str(rep.get("period_text", "")).upper():
+                    continue  # skip annual (FY) rows
+                items = {it["field_id"]: it for it in rep.get("item_list", [])}
+                quarters.append((
+                    self._num(items.get(8048, {}).get("data")),  # diluted EPS
+                    self._num(items.get(8001, {}).get("data")),  # revenue
+                ))
+            if len(quarters) < 2:
+                return None
+            eps = [q[0] for q in quarters]
+            rev = [q[1] for q in quarters]
+            eps_qoq = eps[0] is not None and eps[1] is not None and eps[0] > eps[1]
+            eps_yoy = (
+                len(eps) >= 5 and eps[0] is not None and eps[4] is not None
+                and eps[0] > eps[4]
+            )
+            rev_yoy = (
+                len(rev) >= 5 and rev[0] is not None and rev[4] is not None
+                and rev[4] > 0 and rev[0] > rev[4] * 1.05
+            )
+            flags = {
+                "eps_accelerating": bool(eps_qoq or eps_yoy),
+                "rev_reaccelerating": bool(rev_yoy),
+                "est_revisions_up": bool(eps_qoq and eps_yoy),
+            }
+            logger.debug("Stage3 Moomoo %s: %s", ticker, flags)
+            return flags if any(flags.values()) else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Moomoo flags failed for %s: %s", ticker, exc)
+            return None
 
     # ── FMP path ─────────────────────────────────────────────────────────────
     def _fmp_get(self, endpoint: str, **params) -> Any:
@@ -204,22 +288,31 @@ class FundamentalScreen:
 
         so downstream scoring uses real fundamental flags, not a flat value.
         """
-        use_fmp = self._resolve_source()
-        pace = settings.SCANNER_YF_PACE_SECONDS
-        passing: list[dict] = []
-        for ticker in tickers:
-            if pace and not use_fmp:  # only the yfinance .info path needs pacing
-                time.sleep(pace)
-            try:
-                flags = self._fmp_flags(ticker) if use_fmp else self._fallback_flags(ticker)
-                if flags is not None:
-                    passing.append({"ticker": ticker, **flags})
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Stage3: error for %s: %s", ticker, exc)
+        source = self._resolve_source()
+        # Only the yfinance .info path is rate-limited; Moomoo is local, FMP paid.
+        pace = settings.SCANNER_YF_PACE_SECONDS if source == "yfinance" else 0.0
+        flag_fn = {
+            "moomoo": self._moomoo_flags,
+            "fmp": self._fmp_flags,
+            "yfinance": self._fallback_flags,
+        }[source]
 
-        mode = "FMP" if use_fmp else "yfinance-fallback"
+        passing: list[dict] = []
+        try:
+            for ticker in tickers:
+                if pace:
+                    time.sleep(pace)
+                try:
+                    flags = flag_fn(ticker)
+                    if flags is not None:
+                        passing.append({"ticker": ticker, **flags})
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Stage3: error for %s: %s", ticker, exc)
+        finally:
+            self._close_moomoo()
+
         logger.info(
-            "Stage 3 fundamental screen (%s): %d/%d pass", mode, len(passing), len(tickers)
+            "Stage 3 fundamental screen (%s): %d/%d pass", source, len(passing), len(tickers)
         )
         return passing
 

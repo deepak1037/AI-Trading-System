@@ -121,6 +121,9 @@ class Settings(BaseSettings):
     FRED_API_KEY: str = ""
     NEWS_API_KEY: str = ""
     FMP_API_KEY: str = ""  # Financial Modeling Prep — Stage 3 fundamentals
+    # Moomoo OpenD (local gateway) — primary Stage 3 fundamentals source.
+    MOOMOO_HOST: str = "127.0.0.1"
+    MOOMOO_PORT: int = 11111
 
     # ── LLM (Claude) — options ROI analysis ───────────────────
     ANTHROPIC_API_KEY: str = ""
