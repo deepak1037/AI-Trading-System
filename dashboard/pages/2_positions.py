@@ -91,21 +91,20 @@ if not positions:
 rows = []
 for pos in positions:
     ticker = pos.get("ticker", "")
-
-    if source == live_label:
-        live_price = pos.get("current_price") or _get_live_price(ticker) or 0.0
-    else:
-        live_price = _get_live_price(ticker) or pos.get("current_price", pos.get("entry_price", 0))
-
     qty = pos.get("qty", 0)
     entry = pos.get("entry_price", 0)
     pos_type = pos.get("position_type", "")
     multiplier = 100 if "option" in pos_type else 1
 
-    broker_pnl = pos.get("unrealized_pnl")
-    if source == live_label and broker_pnl is not None and broker_pnl != 0.0:
-        unrealized_pnl = broker_pnl
+    if source == live_label:
+        # Broker supplies current_price (per-share) and unrealized_pnl directly.
+        # Do NOT fall back to a computed formula — broker values may be 0 for
+        # positions opened today, but a computed fallback using stale prices
+        # produces nonsense (especially for options where multiplier=100).
+        live_price = pos.get("current_price") or entry
+        unrealized_pnl = pos.get("unrealized_pnl") or 0.0
     else:
+        live_price = _get_live_price(ticker) or pos.get("current_price", entry)
         unrealized_pnl = (live_price - entry) * qty * multiplier
 
     cost_basis = abs(entry * qty * multiplier)
