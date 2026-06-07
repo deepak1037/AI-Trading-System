@@ -37,17 +37,25 @@ def _load_paper_positions(account_id: str) -> list[dict]:
     return state.get("open_positions", [])  # type: ignore[no-any-return]
 
 
-def _strategy_map_from_db() -> dict[str, str]:
-    """Return {ticker: strategy} for all open positions in SQLite."""
+def _db_meta_from_db() -> dict[str, dict]:
+    """Return {ticker: {strategy, stop_loss, take_profit}} for open positions in SQLite."""
     import sqlite3
     try:
         with sqlite3.connect(settings.DB_PATH) as conn:
             rows = conn.execute(
-                "SELECT ticker, strategy FROM positions WHERE is_open=1"
+                "SELECT ticker, strategy, stop_loss, take_profit FROM positions WHERE is_open=1"
             ).fetchall()
-        return {row[0]: row[1] for row in rows}
+        return {
+            row[0]: {"strategy": row[1], "stop_loss": row[2], "take_profit": row[3]}
+            for row in rows
+        }
     except Exception:
         return {}
+
+
+def _strategy_map_from_db() -> dict[str, str]:
+    """Return {ticker: strategy} for all open positions in SQLite."""
+    return {t: m["strategy"] for t, m in _db_meta_from_db().items()}
 
 
 def _load_broker_positions() -> list[dict]:
@@ -55,18 +63,18 @@ def _load_broker_positions() -> list[dict]:
         from broker_core.factory import get_broker
         broker = get_broker()
         raw = broker.get_positions()
-        db_strategies = _strategy_map_from_db()
+        db_meta = _db_meta_from_db()
         return [
             {
                 "ticker": p.ticker,
-                "strategy": db_strategies.get(p.ticker, "manual"),
+                "strategy": db_meta.get(p.ticker, {}).get("strategy", "manual"),
                 "position_type": p.position_type,
                 "qty": p.qty,
                 "entry_price": p.avg_cost,
                 "current_price": p.current_price,
                 "unrealized_pnl": p.unrealized_pnl,
-                "stop_loss": None,
-                "take_profit": None,
+                "stop_loss": db_meta.get(p.ticker, {}).get("stop_loss"),
+                "take_profit": db_meta.get(p.ticker, {}).get("take_profit"),
                 "entry_date": str(p.opened_at.date()) if p.opened_at else "",
             }
             for p in raw
@@ -164,3 +172,84 @@ st.caption(
     f"Source: {settings.BROKER.title() + ' Live API' if source == live_label else source} | "
     f"Auto-refresh: every {settings.DASHBOARD_REFRESH_SECONDS}s"
 )
+
+# ── Stop-loss / take-profit editor ───────────────────────────────────────────
+
+st.divider()
+st.subheader("Set Stop-Loss / Take-Profit")
+st.caption(
+    "Levels are saved to the SQLite positions table and picked up by PositionWatcher. "
+    "For broker positions not yet in SQLite, an entry is created on save."
+)
+
+tickers = [pos.get("ticker", "") for pos in positions if pos.get("ticker")]
+if tickers:
+    edit_ticker = st.selectbox("Select position", tickers, key="sl_tp_ticker")
+    current_pos = next((p for p in positions if p.get("ticker") == edit_ticker), {})
+    current_sl = current_pos.get("stop_loss") or 0.0
+    current_tp = current_pos.get("take_profit") or 0.0
+    entry_price = current_pos.get("entry_price", 0.0)
+
+    col_sl, col_tp = st.columns(2)
+    with col_sl:
+        new_sl = st.number_input(
+            f"Stop Loss (entry: ${entry_price:.2f})",
+            min_value=0.0,
+            value=float(current_sl),
+            step=0.5,
+            format="%.2f",
+            key="sl_input",
+            help="PositionWatcher closes the position when price drops to or below this level.",
+        )
+    with col_tp:
+        new_tp = st.number_input(
+            f"Take Profit (entry: ${entry_price:.2f})",
+            min_value=0.0,
+            value=float(current_tp),
+            step=0.5,
+            format="%.2f",
+            key="tp_input",
+            help="PositionWatcher closes the position when price rises to or above this level.",
+        )
+
+    if st.button("Save Levels", type="primary", key="save_levels"):
+        try:
+            import sqlite3
+            sl_val = float(new_sl) if new_sl > 0 else None
+            tp_val = float(new_tp) if new_tp > 0 else None
+            with sqlite3.connect(settings.DB_PATH) as conn:
+                existing = conn.execute(
+                    "SELECT id FROM positions WHERE ticker=? AND is_open=1",
+                    (edit_ticker,),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE positions SET stop_loss=?, take_profit=? WHERE ticker=? AND is_open=1",
+                        (sl_val, tp_val, edit_ticker),
+                    )
+                else:
+                    # Broker position not yet tracked in SQLite — create stub row
+                    from datetime import datetime, timezone
+                    conn.execute(
+                        """INSERT INTO positions
+                           (account_id, ticker, strategy, position_type, qty,
+                            entry_price, stop_loss, take_profit, opened_at, is_open)
+                           VALUES (?,?,?,?,?,?,?,?,?,1)""",
+                        (
+                            source,
+                            edit_ticker,
+                            current_pos.get("strategy", "manual"),
+                            current_pos.get("position_type", "equity_long"),
+                            current_pos.get("qty", 0),
+                            current_pos.get("entry_price", 0.0),
+                            sl_val,
+                            tp_val,
+                            datetime.now(tz=timezone.utc).isoformat(),
+                        ),
+                    )
+            sl_str = f"${sl_val:.2f}" if sl_val else "cleared"
+            tp_str = f"${tp_val:.2f}" if tp_val else "cleared"
+            st.success(f"{edit_ticker} — stop: {sl_str} | target: {tp_str}")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Failed to save levels: {exc}")

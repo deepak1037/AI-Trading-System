@@ -119,5 +119,22 @@ class PositionManager:
         if ticker in self._cache:
             self._cache[ticker]["stop_loss"] = new_stop
 
+    def update_take_profit(self, ticker: str, new_target: float) -> None:
+        """Update the take-profit target for an open position."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                "UPDATE positions SET take_profit=? WHERE ticker=? AND is_open=1",
+                (new_target, ticker),
+            )
+        if ticker in self._cache:
+            self._cache[ticker]["take_profit"] = new_target
+
+    def update_levels(self, ticker: str, stop_loss: float | None, take_profit: float | None) -> None:
+        """Update stop-loss and/or take-profit in one call."""
+        if stop_loss is not None:
+            self.update_stop_loss(ticker, stop_loss)
+        if take_profit is not None:
+            self.update_take_profit(ticker, take_profit)
+
 
 __all__ = ["PositionManager"]
