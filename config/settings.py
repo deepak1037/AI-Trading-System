@@ -120,6 +120,16 @@ class Settings(BaseSettings):
     POLYGON_API_KEY: str = ""
     FRED_API_KEY: str = ""
     NEWS_API_KEY: str = ""
+
+    # ── LLM (Claude) — options ROI analysis ───────────────────
+    ANTHROPIC_API_KEY: str = ""
+    LLM_MODEL: str = "claude-sonnet-4-6"
+    LLM_MAX_TOKENS: int = 1024
+    LLM_TIMEOUT_SECONDS: float = 60.0
+
+    # ── Options ROI ───────────────────────────────────────────
+    OPTIONS_CONTRACT_MULTIPLIER: int = 100  # shares per contract
+    OPTIONS_MARGIN_BASIS: str = "reg_t"  # reg_t | cash_secured
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_FROM_NUMBER: str = ""
@@ -158,6 +168,7 @@ class Settings(BaseSettings):
     }
     _VALID_FILL_METHODS: ClassVar[set[str]] = {"next_open", "vwap", "worst_case"}
     _VALID_BROKERS: ClassVar[set[str]] = {"alpaca", "schwab", "ibkr"}
+    _VALID_MARGIN_BASES: ClassVar[set[str]] = {"reg_t", "cash_secured"}
 
     @model_validator(mode="after")
     def _validate(self) -> Settings:
@@ -183,6 +194,12 @@ class Settings(BaseSettings):
                 "Invalid PAPER_FILL_METHOD",
                 value=self.PAPER_FILL_METHOD,
                 allowed=sorted(self._VALID_FILL_METHODS),
+            )
+        if self.OPTIONS_MARGIN_BASIS not in self._VALID_MARGIN_BASES:
+            raise ConfigError(
+                "Invalid OPTIONS_MARGIN_BASIS",
+                value=self.OPTIONS_MARGIN_BASIS,
+                allowed=sorted(self._VALID_MARGIN_BASES),
             )
 
         # Signal fusion weights must sum to 100 (the tf-alignment bonus is a

@@ -7,15 +7,13 @@ Usage:
 
 from __future__ import annotations
 
-import importlib
 import os
 import signal
 import sys
 import time
 import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 # Ensure project root is on sys.path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -317,6 +315,7 @@ def _check_dashboard():
         "3_performance.py",
         "4_account_mgmt.py",
         "5_orders.py",
+        "6_options_analyzer.py",
     ]
     missing = []
     parse_errors = []

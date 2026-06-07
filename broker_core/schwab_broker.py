@@ -14,7 +14,7 @@ Key design decisions:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from config.settings import settings
@@ -558,8 +558,10 @@ class SchwabBroker(BaseBroker):
                 include_underlying_quote = True,
             )
             if expiry:
-                kwargs["from_date"] = expiry
-                kwargs["to_date"]   = expiry
+                # schwab-py expects datetime.date for from/to, not a string.
+                exp_date = date.fromisoformat(expiry)
+                kwargs["from_date"] = exp_date
+                kwargs["to_date"]   = exp_date
 
             resp = self._client.get_option_chain(**kwargs)
             resp.raise_for_status()

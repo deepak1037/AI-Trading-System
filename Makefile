@@ -183,6 +183,15 @@ lint: _check_venv
 healthcheck: _check_venv _mklogs
 	@$(PYTHON) scripts/healthcheck.py
 
+# ── analyze: LLM-augmented put ROI analysis ──────────────────────────────────
+#   make analyze ticker=HOOD strike=8 expiry=2026-07-18
+.PHONY: analyze
+analyze: _check_venv _mklogs
+	@test -n "$(ticker)" || (echo "Usage: make analyze ticker=HOOD strike=8 expiry=2026-07-18" && exit 1)
+	@test -n "$(strike)" || (echo "Usage: make analyze ticker=HOOD strike=8 expiry=2026-07-18" && exit 1)
+	@test -n "$(expiry)" || (echo "Usage: make analyze ticker=HOOD strike=8 expiry=2026-07-18" && exit 1)
+	@$(PYTHON) scripts/analyze_put.py --ticker $(ticker) --strike $(strike) --expiry $(expiry)
+
 # ── paper-balance: paper account summary ─────────────────────────────────────
 .PHONY: paper-balance
 paper-balance: _check_venv

@@ -29,6 +29,9 @@ edgartools==3.5.0
 transformers==4.46.3
 torch==2.5.1
 
+# ── LLM (Claude) — options ROI analysis ───────────────────
+anthropic==0.39.0
+
 # ── Backtesting / volatility ──────────────────────────────
 lumibot==3.8.6
 vectorbt==0.27.2
