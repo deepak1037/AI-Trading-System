@@ -84,6 +84,19 @@ def _make_chain(expiry: str, ticker: str = "HOOD") -> OptionsChain:
     return OptionsChain(ticker=ticker, expiry=expiry, calls=[], puts=puts)
 
 
+def _make_multi_expiry_chain(expiries: list[str], ticker: str = "HOOD") -> OptionsChain:
+    """A single chain spanning several expiries (as Schwab's nearest call returns)."""
+    puts = []
+    for i, exp in enumerate(expiries):
+        for strike in (7.0, 8.0, 9.0):
+            puts.append(OptionsContract(
+                symbol=f"{ticker}{exp}P{int(strike)}", expiry=exp, strike=strike,
+                option_type="put", bid=0.70 + i * 0.1, ask=0.80 + i * 0.1,
+                delta=-0.25,
+            ))
+    return OptionsChain(ticker=ticker, expiry="nearest", calls=[], puts=puts)
+
+
 class _FakeBlock:
     def __init__(self, text: str) -> None:
         self.type = "text"
@@ -291,6 +304,60 @@ class TestBuildPutROI:
         a = LLMROIAnalyzer(broker=FakeBroker(chain))
         with pytest.raises(DataError):
             a.build_put_roi("Z", 8.0, expiry, underlying_price=12.0)
+
+
+# ── Expiry listing + ROI table (single chain fetch) ───────────────────────────
+class TestListExpiries:
+    def test_broker_first(self):
+        exps = [_future_expiry(10), _future_expiry(40), _future_expiry(70)]
+        broker = FakeBroker(_make_multi_expiry_chain(exps))
+        a = LLMROIAnalyzer(broker=broker)
+        out = a.list_expiries("HOOD")
+        assert out == sorted(exps)  # soonest-first, deduped
+
+    def test_limit_applied(self):
+        exps = [_future_expiry(d) for d in (5, 12, 19, 26, 33)]
+        broker = FakeBroker(_make_multi_expiry_chain(exps))
+        a = LLMROIAnalyzer(broker=broker)
+        assert len(a.list_expiries("HOOD", limit=3)) == 3
+
+    def test_no_broker_returns_empty_or_yf(self, monkeypatch):
+        # No broker → tries yfinance; force it to fail → empty list (no raise).
+        a = LLMROIAnalyzer(broker=None)
+        import sys
+        import types
+        fake_yf = types.ModuleType("yfinance")
+        def _boom(*args, **kwargs):
+            raise RuntimeError("rate limited")
+        fake_yf.Ticker = _boom  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+        assert a.list_expiries("HOOD") == []
+
+
+class TestBuildRoiTable:
+    def test_one_fetch_all_expiries(self):
+        exps = [_future_expiry(10), _future_expiry(40), _future_expiry(70)]
+        broker = FakeBroker(_make_multi_expiry_chain(exps), last=12.9)
+        a = LLMROIAnalyzer(broker=broker)
+        table = a.build_roi_table("HOOD", 8.0, underlying_price=12.9)
+        assert len(table) == 3
+        assert all(isinstance(r, PutROIResult) for r in table)
+        assert [r.expiry for r in table] == sorted(exps)
+        # All rows are for the requested strike, formula margin (no preview).
+        assert all(r.strike == 8.0 for r in table)
+        assert all(r.margin_basis in ("reg_t", "cash_secured") for r in table)
+
+    def test_closest_strike_when_exact_missing(self):
+        exps = [_future_expiry(10)]
+        broker = FakeBroker(_make_multi_expiry_chain(exps))
+        a = LLMROIAnalyzer(broker=broker)
+        table = a.build_roi_table("HOOD", 8.4, underlying_price=12.9)  # no 8.4 → 8.0
+        assert len(table) == 1
+        assert table[0].strike == 8.0
+
+    def test_no_broker_returns_empty(self):
+        a = LLMROIAnalyzer(broker=None)
+        assert a.build_roi_table("HOOD", 8.0) == []
 
 
 # ── JSON parsing ──────────────────────────────────────────────────────────────

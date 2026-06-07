@@ -49,14 +49,21 @@ def _get_broker():
         return None
 
 
-def _list_expiries(ticker: str, limit: int = 10) -> list[str]:
-    try:
-        import yfinance as yf
-        exps = list(yf.Ticker(ticker).options or [])
-        return exps[:limit]
-    except Exception as exc:  # noqa: BLE001
-        st.warning(f"Could not list expiries for {ticker}: {exc}")
-        return []
+def _roi_row(roi) -> dict:
+    return {
+        "Expiry": roi.expiry,
+        "DTE": roi.days_to_expiry,
+        "Bid": f"${roi.bid:.2f}",
+        "Ask": f"${roi.ask:.2f}",
+        "Delta": f"{roi.delta:.2f}" if roi.delta is not None else "—",
+        "Net premium": f"${roi.premium_per_contract:,.0f}",
+        "Margin": f"${roi.margin_per_contract:,.0f}",
+        "Basis": roi.margin_basis,
+        "OTM %": f"{roi.otm_pct:.1f}%",
+        "Monthly ROI (margin)": f"{roi.monthly_roi_pct:.1f}%",
+        "Monthly ROI (cash-sec)": f"{roi.cash_secured_monthly_roi_pct:.1f}%",
+        "Annualized (margin)": f"{roi.annualized_roi_pct:.1f}%",
+    }
 
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
@@ -93,40 +100,48 @@ if run:
 
     # ── ROI table across all expiries ─────────────────────────────────────────
     st.subheader(f"ROI across expiries — {ticker} ${strike:g} put")
-    expiries = _list_expiries(ticker)
-    if expiry and expiry not in expiries:
-        expiries = [expiry] + expiries  # ensure the requested expiry is included
 
-    rows = []
-    with st.spinner("Computing ROI across expiries..."):
-        for exp in expiries:
-            try:
-                roi = analyzer.build_put_roi(ticker, float(strike), exp)
-                rows.append({
-                    "Expiry": roi.expiry,
-                    "DTE": roi.days_to_expiry,
-                    "Bid": f"${roi.bid:.2f}",
-                    "Ask": f"${roi.ask:.2f}",
-                    "Delta": f"{roi.delta:.2f}" if roi.delta is not None else "—",
-                    "Net premium": f"${roi.premium_per_contract:,.0f}",
-                    "Margin": f"${roi.margin_per_contract:,.0f}",
-                    "Basis": roi.margin_basis,
-                    "OTM %": f"{roi.otm_pct:.1f}%",
-                    "Monthly ROI (margin)": f"{roi.monthly_roi_pct:.1f}%",
-                    "Monthly ROI (cash-sec)": f"{roi.cash_secured_monthly_roi_pct:.1f}%",
-                    "Annualized (margin)": f"{roi.annualized_roi_pct:.1f}%",
-                })
-            except Exception as exc:  # noqa: BLE001 — skip expiries w/o this strike
-                rows.append({"Expiry": exp, "DTE": "—", "Static ROI": f"err: {exc}"})
+    rows: list[dict] = []
+    with st.spinner("Fetching chain and computing ROI across expiries..."):
+        # Fast path: one broker chain fetch → ROI for every expiry in memory.
+        results = []
+        try:
+            results = analyzer.build_roi_table(ticker, float(strike))
+        except Exception as exc:  # noqa: BLE001 — fall back below
+            st.caption(f"Chain fetch note: {exc}")
+
+        if results:
+            rows = [_roi_row(r) for r in results]
+        else:
+            # Fallback (no broker): list expiries + per-expiry compute via yfinance.
+            expiries = analyzer.list_expiries(ticker)
+            if expiry and expiry not in expiries:
+                expiries = [expiry] + expiries
+            if not expiries:
+                st.warning(
+                    f"Could not list expiries for {ticker} (broker unavailable and "
+                    "yfinance rate-limited). Try again shortly."
+                )
+                st.stop()
+            for exp in expiries:
+                try:
+                    rows.append(_roi_row(analyzer.build_put_roi(ticker, float(strike), exp)))
+                except Exception as exc:  # noqa: BLE001 — skip bad expiries
+                    rows.append({"Expiry": exp, "DTE": "—", "Net premium": f"err: {exc}"})
 
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "Table margin uses the Reg-T estimate for speed; the Claude analysis "
+            "below uses Schwab's real buying-power margin for the chosen expiry."
+        )
     else:
         st.warning("No ROI rows could be computed (no options data for this strike).")
         st.stop()
 
     # ── LLM assessment for the chosen expiry ──────────────────────────────────
-    target_expiry = expiry or (expiries[0] if expiries else "")
+    # Use the typed expiry, else the soonest in the table (rows are sorted).
+    target_expiry = expiry or (rows[0].get("Expiry", "") if rows else "")
     if not target_expiry:
         st.stop()
 

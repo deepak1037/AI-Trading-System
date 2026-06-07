@@ -39,6 +39,8 @@ start: _check_venv _mkpids _mklogs
 # ── dashboard: Streamlit in foreground ───────────────────────────────────────
 .PHONY: dashboard
 dashboard: _check_venv
+	@echo "Stopping any running Streamlit..."
+	@pkill -f streamlit || true
 	@$(STREAMLIT) run dashboard/app.py \
 		--server.port $$(grep -E "^DASHBOARD_PORT=" .env 2>/dev/null | cut -d= -f2 || echo 8501) \
 		--server.headless true \

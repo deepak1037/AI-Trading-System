@@ -158,6 +158,86 @@ class LLMROIAnalyzer:
         roi = self.build_put_roi(ticker, strike, expiry, use_broker_margin=True)
         return self.analyze_put_opportunity(roi, ticker)
 
+    def list_expiries(self, ticker: str, limit: int = 12) -> list[str]:
+        """Return available put expiries (YYYY-MM-DD), soonest first.
+
+        Prefers the broker's chain (one authenticated call, no rate limit);
+        falls back to yfinance only when no broker is configured or the broker
+        call fails. yfinance's ``.options`` endpoint rate-limits aggressively,
+        so the broker path is strongly preferred when available.
+        """
+        ticker = ticker.upper().strip()
+        if self._broker is not None:
+            try:
+                chain = self._broker.get_options_chain(ticker)
+                exps = sorted({p.expiry for p in chain.puts if p.expiry})
+                if exps:
+                    return exps[:limit]
+            except Exception as exc:  # noqa: BLE001 — fall back to yfinance
+                logger.debug("Broker expiry list failed for %s: %s", ticker, exc)
+        try:
+            import yfinance as yf
+
+            return list(yf.Ticker(ticker).options or [])[:limit]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("yfinance expiry list failed for %s: %s", ticker, exc)
+            return []
+
+    def build_roi_table(
+        self,
+        ticker: str,
+        strike: float,
+        limit: int = 12,
+        underlying_price: Optional[float] = None,
+    ) -> list[PutROIResult]:
+        """ROI for a strike across all expiries, from a SINGLE chain fetch.
+
+        Fetches the broker's full chain once and computes per-expiry ROI from
+        the in-memory contracts (no per-expiry API call, no broker-margin
+        preview) — fast enough to render a table without hitting rate limits.
+        Picks the exact strike at each expiry, or the closest listed strike.
+        Returns [] when no broker is configured (caller should fall back to a
+        per-expiry path).
+        """
+        ticker = ticker.upper().strip()
+        if self._broker is None:
+            return []
+        try:
+            chain = self._broker.get_options_chain(ticker)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Broker chain fetch failed for %s: %s", ticker, exc)
+            return []
+        if underlying_price is None:
+            underlying_price = self._current_price(ticker)
+
+        by_expiry: dict[str, list[OptionsContract]] = {}
+        for put in chain.puts:
+            if put.expiry:
+                by_expiry.setdefault(put.expiry, []).append(put)
+
+        results: list[PutROIResult] = []
+        for expiry in sorted(by_expiry)[:limit]:
+            puts = [p for p in by_expiry[expiry] if (p.bid or p.ask or p.last)]
+            if not puts:
+                continue
+            exact = [p for p in puts if abs(p.strike - strike) < 1e-6]
+            contract = exact[0] if exact else min(
+                puts, key=lambda p: abs(p.strike - strike)
+            )
+            try:
+                results.append(
+                    self.build_put_roi(
+                        ticker,
+                        contract.strike,
+                        expiry,
+                        contract=contract,
+                        underlying_price=underlying_price,
+                    )
+                )
+            except DataError:
+                continue
+        return results
+
     def build_put_roi(
         self,
         ticker: str,
