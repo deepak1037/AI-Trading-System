@@ -189,15 +189,21 @@ class LLMROIAnalyzer:
         strike: float,
         limit: int = 12,
         underlying_price: Optional[float] = None,
+        use_broker_margin: bool = False,
     ) -> list[PutROIResult]:
         """ROI for a strike across all expiries, from a SINGLE chain fetch.
 
         Fetches the broker's full chain once and computes per-expiry ROI from
-        the in-memory contracts (no per-expiry API call, no broker-margin
-        preview) — fast enough to render a table without hitting rate limits.
-        Picks the exact strike at each expiry, or the closest listed strike.
-        Returns [] when no broker is configured (caller should fall back to a
-        per-expiry path).
+        the in-memory contracts — fast enough to render a table without hitting
+        rate limits. Picks the exact strike at each expiry, or the closest
+        listed strike. Returns [] when no broker is configured (caller should
+        fall back to a per-expiry path).
+
+        Args:
+            use_broker_margin: When True, each row's margin is Schwab's real
+                buying-power reduction (one preview call per expiry — slower but
+                accurate). Account buying power is fetched once and reused across
+                rows. When False (default), each row uses the fast Reg-T formula.
         """
         ticker = ticker.upper().strip()
         if self._broker is None:
@@ -209,6 +215,14 @@ class LLMROIAnalyzer:
             return []
         if underlying_price is None:
             underlying_price = self._current_price(ticker)
+
+        # Fetch account buying power once so per-row previews don't each re-fetch.
+        current_bp: Optional[float] = None
+        if use_broker_margin:
+            try:
+                current_bp = float(self._broker.get_account().buying_power or 0.0)
+            except Exception as exc:  # noqa: BLE001 — rows fall back to formula
+                logger.debug("Account fetch failed for %s: %s", ticker, exc)
 
         by_expiry: dict[str, list[OptionsContract]] = {}
         for put in chain.puts:
@@ -232,6 +246,8 @@ class LLMROIAnalyzer:
                         expiry,
                         contract=contract,
                         underlying_price=underlying_price,
+                        use_broker_margin=use_broker_margin,
+                        current_buying_power=current_bp,
                     )
                 )
             except DataError:
@@ -246,6 +262,7 @@ class LLMROIAnalyzer:
         contract: Optional[OptionsContract] = None,
         underlying_price: Optional[float] = None,
         use_broker_margin: bool = False,
+        current_buying_power: Optional[float] = None,
     ) -> PutROIResult:
         """Locate the put contract and compute its quantitative ROI.
 
@@ -257,6 +274,10 @@ class LLMROIAnalyzer:
                 an invalid preview). Off by default because it adds an API
                 round-trip per contract — callers scanning many expiries should
                 leave it off; the single deep analysis turns it on.
+            current_buying_power: Optional pre-fetched account buying power, so
+                a caller computing many contracts (build_roi_table) avoids one
+                get_account() call per contract. Ignored unless
+                use_broker_margin is True.
         """
         ticker = ticker.upper().strip()
         if contract is None:
@@ -283,7 +304,9 @@ class LLMROIAnalyzer:
         margin_basis = settings.OPTIONS_MARGIN_BASIS
         margin = None
         if use_broker_margin:
-            margin = self._broker_margin_per_contract(ticker, contract, mid)
+            margin = self._broker_margin_per_contract(
+                ticker, contract, mid, current_bp=current_buying_power
+            )
             if margin is not None:
                 margin_basis = "schwab_preview"
         if margin is None:
@@ -345,7 +368,11 @@ class LLMROIAnalyzer:
         return result
 
     def _broker_margin_per_contract(
-        self, ticker: str, contract: OptionsContract, mid: float
+        self,
+        ticker: str,
+        contract: OptionsContract,
+        mid: float,
+        current_bp: Optional[float] = None,
     ) -> Optional[float]:
         """Real per-contract margin via the broker preview API.
 
@@ -354,14 +381,18 @@ class LLMROIAnalyzer:
         ``current_buying_power − projectedBuyingPower``. Returns None on any
         failure (no broker, invalid preview, non-positive reduction) so the
         caller falls back to the formula.
+
+        ``current_bp`` may be passed pre-fetched to avoid one get_account() call
+        per contract when computing a whole table.
         """
         if self._broker is None:
             return None
         try:
             from broker_core.base_broker import OptionsOrder
 
-            account = self._broker.get_account()
-            current_bp = float(account.buying_power or 0.0)
+            if current_bp is None:
+                account = self._broker.get_account()
+                current_bp = float(account.buying_power or 0.0)
             if current_bp <= 0:
                 return None
             order = OptionsOrder(

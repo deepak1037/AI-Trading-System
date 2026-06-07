@@ -359,6 +359,30 @@ class TestBuildRoiTable:
         a = LLMROIAnalyzer(broker=None)
         assert a.build_roi_table("HOOD", 8.0) == []
 
+    def test_real_margin_per_row_fetches_account_once(self):
+        exps = [_future_expiry(10), _future_expiry(40), _future_expiry(70)]
+
+        class CountingBroker(FakeBroker):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.account_calls = 0
+
+            def get_account(self):
+                self.account_calls += 1
+                return super().get_account()
+
+        broker = CountingBroker(
+            _make_multi_expiry_chain(exps), buying_power=10_000.0, projected_bp=9_000.0
+        )
+        a = LLMROIAnalyzer(broker=broker)
+        table = a.build_roi_table("HOOD", 8.0, underlying_price=12.9, use_broker_margin=True)
+        assert len(table) == 3
+        # Every row uses the real (preview) margin: 10000 − 9000 = 1000.
+        assert all(r.margin_basis == "schwab_preview" for r in table)
+        assert all(r.margin_per_contract == pytest.approx(1000.0) for r in table)
+        # Account buying power fetched ONCE for the whole table, not per row.
+        assert broker.account_calls == 1
+
 
 # ── JSON parsing ──────────────────────────────────────────────────────────────
 class TestParseAssessment:

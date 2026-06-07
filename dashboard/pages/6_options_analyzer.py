@@ -77,6 +77,13 @@ with col3:
         "Expiry (YYYY-MM-DD, blank = nearest)", value="", placeholder="2026-07-18"
     ).strip()
 
+real_margin = st.checkbox(
+    "Use real Schwab margin for every row (slower — one preview call per expiry)",
+    value=True,
+    help="When off, the table uses the fast Reg-T estimate. The Claude analysis "
+         "below always uses real Schwab margin regardless of this toggle.",
+)
+
 run = st.button("Run Full Analysis", type="primary", use_container_width=True)
 
 if not settings.ANTHROPIC_API_KEY:
@@ -102,11 +109,18 @@ if run:
     st.subheader(f"ROI across expiries — {ticker} ${strike:g} put")
 
     rows: list[dict] = []
-    with st.spinner("Fetching chain and computing ROI across expiries..."):
+    spinner_msg = (
+        "Fetching chain + previewing real margin per expiry (slower)..."
+        if real_margin else
+        "Fetching chain and computing ROI across expiries..."
+    )
+    with st.spinner(spinner_msg):
         # Fast path: one broker chain fetch → ROI for every expiry in memory.
         results = []
         try:
-            results = analyzer.build_roi_table(ticker, float(strike))
+            results = analyzer.build_roi_table(
+                ticker, float(strike), use_broker_margin=real_margin
+            )
         except Exception as exc:  # noqa: BLE001 — fall back below
             st.caption(f"Chain fetch note: {exc}")
 
@@ -131,10 +145,19 @@ if run:
 
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "Table margin uses the Reg-T estimate for speed; the Claude analysis "
-            "below uses Schwab's real buying-power margin for the chosen expiry."
-        )
+        bases = {r.get("Basis") for r in rows if r.get("Basis")}
+        if bases == {"schwab_preview"}:
+            st.caption("Margin = Schwab's real buying-power reduction (preview API) for every row.")
+        elif "schwab_preview" in bases:
+            st.caption(
+                "Margin is Schwab's real buying-power reduction where the preview "
+                "succeeded, else a Reg-T estimate (see the Basis column)."
+            )
+        else:
+            st.caption(
+                "Table margin uses the Reg-T estimate for speed; the Claude analysis "
+                "below uses Schwab's real buying-power margin for the chosen expiry."
+            )
     else:
         st.warning("No ROI rows could be computed (no options data for this strike).")
         st.stop()
