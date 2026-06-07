@@ -37,15 +37,29 @@ def _load_paper_positions(account_id: str) -> list[dict]:
     return state.get("open_positions", [])  # type: ignore[no-any-return]
 
 
+def _strategy_map_from_db() -> dict[str, str]:
+    """Return {ticker: strategy} for all open positions in SQLite."""
+    import sqlite3
+    try:
+        with sqlite3.connect(settings.DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT ticker, strategy FROM positions WHERE is_open=1"
+            ).fetchall()
+        return {row[0]: row[1] for row in rows}
+    except Exception:
+        return {}
+
+
 def _load_broker_positions() -> list[dict]:
     try:
         from broker_core.factory import get_broker
         broker = get_broker()
         raw = broker.get_positions()
+        db_strategies = _strategy_map_from_db()
         return [
             {
                 "ticker": p.ticker,
-                "strategy": p.strategy_name,
+                "strategy": db_strategies.get(p.ticker, "manual"),
                 "position_type": p.position_type,
                 "qty": p.qty,
                 "entry_price": p.avg_cost,
