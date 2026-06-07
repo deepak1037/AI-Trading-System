@@ -39,8 +39,9 @@ class Settings(BaseSettings):
     SCHWAB_CLIENT_ID: str = ""
     SCHWAB_CLIENT_SECRET: str = ""
     SCHWAB_REDIRECT_URI: str = ""
-    SCHWAB_TOKEN_FILE: str = "schwab_token.json"
+    SCHWAB_TOKEN_FILE: str = "broker_core/tokens/schwab_token.json"
     ALPACA_API_KEY: str = ""
+    ALPACA_TOKEN_FILE: str = "broker_core/tokens/alpaca_token.json"
     ALPACA_SECRET_KEY: str = ""
     ALPACA_PAPER: bool = True
     ALPACA_BASE_URL: str = "https://paper-api.alpaca.markets"
