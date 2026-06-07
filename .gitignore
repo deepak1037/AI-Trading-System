@@ -32,6 +32,9 @@ paper_trading/backups/*.json
 # Keep the data directories themselves tracked.
 !**/.gitkeep
 
+# ── Runtime pid files ─────────────────────────────────────
+.pids/
+
 # ── OS / editor ───────────────────────────────────────────
 .DS_Store
 .idea/
