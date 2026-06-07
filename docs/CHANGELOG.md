@@ -57,12 +57,20 @@ from its own data, threaded through the stages:
 
 Live (paced, 502-name universe): 82 names, scores **65–80**, 15 distinct values.
 
-**Known calibration limits** (not bugs):
-- Range tops out ~80, not 95: `squeeze` (15%) + `tf_alignment` (10%) are ~0 for
-  quality momentum names (low short interest), capping the top.
-- Without `FMP_API_KEY`, Stage 3 uses yfinance `.info` GAAP earnings growth,
-  which misranks growth names (e.g. CRWD marked `eps_accelerating=False`). FMP
-  is the biggest lever for fundamental accuracy.
+**Re-weighted** (fundamental 35 / institutional 25 / technical 30 / squeeze 5 /
+tf 5, from 30/25/20/15/10) via new `SCANNER_WEIGHT_*` settings — squeeze/tf cut
+because quality momentum leaders rarely have short-squeeze setups. Result: range
+65–83, 96 names; NVDA=74, ASML=71, AMD=74 now rank above F=67, CVS=67, INTC(<65).
+
+**FMP free tier is unusable for fundamentals.** FMP deprecated `/api/v3`
+(Aug 2025) and made per-symbol income statements paid — a free key returns HTTP
+402 for non-demo symbols. `fundamental_screen` now uses the `/stable` API and
+probes capability once (income-statement for CRWD); a free/legacy key auto-falls
+back to yfinance `.info` (GAAP earnings) with a clear warning, and logs "Scanner
+data source: FMP" only when fundamentals are genuinely accessible (paid plan).
+The GAAP fallback misranks growth names (e.g. CRWD marked `eps_accelerating=False`
+→ stays below threshold). A **paid FMP plan** is the only fix for accurate
+growth-stock fundamentals.
 
 ## New settings (config/settings.py + .env.example)
 
