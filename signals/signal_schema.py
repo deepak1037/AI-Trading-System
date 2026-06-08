@@ -47,6 +47,18 @@ class MarketState(BaseModel):
     def regime_changed(self) -> bool:
         return self.previous_regime != self.current_regime
 
+    @property
+    def direction(self) -> Regime:
+        """Alias for current_regime (same Direction literal values)."""
+        return self.current_regime
+
+    @property
+    def confidence(self) -> int:
+        """Mean confidence of the active source signals (0 if none)."""
+        if not self.signals_active:
+            return 0
+        return round(sum(s.confidence for s in self.signals_active) / len(self.signals_active))
+
 
 class MarketSnapshot(BaseModel):
     """Real-time market data snapshot for one ticker."""

@@ -139,3 +139,57 @@ class TestMarketStateTracker:
         # Should not raise
         state = tracker.update([_sig("long", "macro", 80)])
         assert state is not None
+
+
+class TestComputeAndCollect:
+    def test_compute_fuses_collected_signals(self, monkeypatch):
+        f = SignalFusion()
+        monkeypatch.setattr(f, "collect_signals", lambda benchmark="SPY": [
+            _sig("long", source="technical", confidence=60),
+        ])
+        state = f.compute()
+        assert state.current_regime in ("strong_short", "short", "neutral", "long", "strong_long")
+        assert 0 <= state.composite_score <= 100
+        assert state.confidence == 60  # mean of one signal
+
+    def test_compute_empty_signals_is_neutral(self, monkeypatch):
+        f = SignalFusion()
+        monkeypatch.setattr(f, "collect_signals", lambda benchmark="SPY": [])
+        state = f.compute()
+        assert state.current_regime == "neutral"
+        assert state.composite_score == 50
+        assert state.confidence == 0
+
+    def test_collect_signals_guards_source_failures(self, monkeypatch):
+        # Make the technical source blow up; collect_signals must not raise.
+        import signals.technical_module as tm
+
+        class _Boom:
+            def score_ticker(self, *a, **k):
+                raise RuntimeError("yfinance down")
+
+        monkeypatch.setattr(tm, "TechnicalModule", _Boom)
+        f = SignalFusion()
+        # yield source also unconfigured in test env → both guarded → []
+        result = f.collect_signals()
+        assert isinstance(result, list)
+
+
+class TestMarketStateProperties:
+    def _state(self, regime, sigs):
+        from signals.signal_schema import MarketState
+        return MarketState(
+            current_regime=regime, composite_score=50,
+            last_updated=datetime.now(tz=timezone.utc), signals_active=sigs,
+        )
+
+    def test_direction_aliases_regime(self):
+        st = self._state("long", [])
+        assert st.direction == "long" == st.current_regime
+
+    def test_confidence_is_mean(self):
+        st = self._state("neutral", [_sig("neutral", confidence=30), _sig("long", confidence=50)])
+        assert st.confidence == 40
+
+    def test_confidence_zero_when_no_signals(self):
+        assert self._state("neutral", []).confidence == 0

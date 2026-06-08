@@ -129,6 +129,25 @@ class TestAlertEngineDiscord:
         assert send.call_args.args[1]["color"] == 3447003  # blue
 
 
+class TestAlertEngineSignalAlert:
+    def test_high_composite_routes_to_send_high(self, engine, mocker):
+        high = mocker.patch.object(engine, "send_high", return_value=True)
+        crit = mocker.patch.object(engine, "send_critical", return_value=True)
+        state = MagicMock(current_regime="long", composite_score=70, confidence=68)
+        engine.send_signal_alert(state)
+        high.assert_called_once()
+        crit.assert_not_called()
+        assert "direction=long" in high.call_args.args[0]
+
+    def test_critical_composite_routes_to_send_critical(self, engine, mocker):
+        high = mocker.patch.object(engine, "send_high", return_value=True)
+        crit = mocker.patch.object(engine, "send_critical", return_value=True)
+        state = MagicMock(current_regime="strong_long", composite_score=85, confidence=90)
+        engine.send_signal_alert(state)
+        crit.assert_called_once()
+        high.assert_not_called()
+
+
 class TestAlertEngineExceptionHandling:
     def test_critical_exception_sends_sms(self, engine, mocker):
         mock_sms = mocker.patch.object(engine, "send_critical")

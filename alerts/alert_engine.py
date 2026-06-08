@@ -335,6 +335,22 @@ class AlertEngine:
             self._log_to_db("email", "eod", body[:500])
         return sent
 
+    def send_signal_alert(self, state: object, signal_id: Optional[int] = None) -> bool:
+        """Send a signal alert from a MarketState (Slack/SMS + Discord #signals).
+
+        Routes by composite score: ≥CONFIDENCE_CRITICAL → critical, else high.
+        """
+        direction = getattr(state, "current_regime", getattr(state, "direction", "?"))
+        composite = int(getattr(state, "composite_score", 0))
+        confidence = int(getattr(state, "confidence", 0))
+        msg = (
+            f"Signal: direction={direction} | confidence={confidence} | "
+            f"composite={composite}"
+        )
+        if composite >= settings.CONFIDENCE_CRITICAL:
+            return self.send_critical(msg, signal_id=signal_id)
+        return self.send_high(msg, signal_id=signal_id)
+
     def handle_exception(self, exc: TradingSystemError) -> None:
         """Route exceptions to appropriate channel based on severity."""
         msg = f"{type(exc).__name__}: {exc}"

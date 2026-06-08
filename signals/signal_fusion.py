@@ -48,6 +48,9 @@ class SignalFusion:
 
     def __init__(self) -> None:
         self._current_state: Optional[MarketState] = None
+        # Source instances are cached so repeated ticks don't re-init heavy
+        # models (e.g. the technical module / FRED client).
+        self._sources: dict[str, object] = {}
 
     def _weighted_score(self, signals: list[Signal]) -> int:
         """Return a composite 0-100 score from weighted signal directions."""
@@ -137,6 +140,51 @@ class SignalFusion:
 
         self._current_state = new_state
         return new_state
+
+    def collect_signals(self, benchmark: str = "SPY") -> list[Signal]:
+        """Collect best-effort signals from the routinely-pollable sources.
+
+        Each source is independently guarded — one that fails (missing API key,
+        no data, model not downloaded) is skipped rather than aborting the tick.
+        Technical (yfinance) is the reliable anchor; Treasury-yield delta is
+        added when FRED is configured. Macro (NFP/CPI) and pre-market are
+        event-driven, not routine, so they're not polled here.
+        """
+        signals: list[Signal] = []
+
+        # ── Technical (reliable, no credentials) ─────────────────────────────
+        try:
+            from signals.technical_module import TechnicalModule
+            tech = self._sources.get("technical")
+            if tech is None:
+                tech = TechnicalModule()
+                self._sources["technical"] = tech
+            signals.append(tech.score_ticker(benchmark))  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("collect_signals: technical failed: %s", exc)
+
+        # ── Treasury-yield delta (needs FRED) ────────────────────────────────
+        try:
+            from signals.yield_monitor import YieldMonitor
+            ym = self._sources.get("yield")
+            if ym is None:
+                ym = YieldMonitor()
+                self._sources["yield"] = ym
+            ysig = ym.check_delta()  # type: ignore[attr-defined]
+            if ysig is not None:
+                signals.append(ysig)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("collect_signals: yield failed: %s", exc)
+
+        logger.debug("collect_signals: gathered %d signal(s)", len(signals))
+        return signals
+
+    def compute(self, benchmark: str = "SPY") -> MarketState:
+        """Collect signals from available sources and fuse them into a MarketState.
+
+        Convenience entry point for the watcher tick: ``SignalFusion().compute()``.
+        """
+        return self.fuse(self.collect_signals(benchmark))
 
     @property
     def current_state(self) -> Optional[MarketState]:

@@ -42,13 +42,27 @@ def main() -> None:
 
     scheduler = WatcherScheduler(calendar=guard)
 
+    from alerts.alert_engine import AlertEngine
+    from signals.signal_fusion import SignalFusion
+    fusion = SignalFusion()
+    alert_engine = AlertEngine()
+
     def phase_tick(phase: str) -> None:
-        """Run one watcher tick for the active market phase."""
+        """Run one watcher tick for the active market phase: compute + route."""
         logger.info(
             "Watcher tick | phase=%s | market_open=%s",
             phase, guard.is_market_open(),
         )
-        # TODO: collect this phase's signals / update MarketState here.
+        try:
+            state = fusion.compute()
+            logger.info(
+                "Signal computed | direction=%s | confidence=%d | composite=%d",
+                state.current_regime, state.confidence, state.composite_score,
+            )
+            if state.confidence >= settings.CONFIDENCE_HIGH:
+                alert_engine.send_signal_alert(state)
+        except Exception as exc:  # noqa: BLE001 — a tick must never crash the loop
+            logger.error("Signal computation failed: %s", exc)
 
     def eod_report() -> None:
         logger.info("EOD report job fired (16:05 ET)")
