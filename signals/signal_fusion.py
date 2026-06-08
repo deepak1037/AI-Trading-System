@@ -52,6 +52,7 @@ class SignalFusion:
         # models (FinBERT loads ONCE on the cached SentimentScorer, not per tick).
         self._sources: dict[str, object] = {}
         self._sentiment_skip_logged = False
+        self._sentiment_disabled = False  # set if FinBERT fails to load (torch, etc.)
 
     # Phases (ET) during which pre-market futures/crypto are still meaningful:
     # 7:00–8:15 (premarket) + 8:15–9:30 (macro) = pre-open. Skipped once the
@@ -59,11 +60,15 @@ class SignalFusion:
     _PREMARKET_PHASES = frozenset({"premarket", "macro"})
 
     def _ensure_sentiment(self) -> Optional[object]:
-        """Return a cached SentimentScorer, or None when sentiment is disabled.
+        """Return a cached SentimentScorer, or None when sentiment is unavailable.
 
         Gated on NEWS_API_KEY (rule): without it we skip sentiment entirely
         rather than loading the heavy FinBERT model for RSS-only headlines.
+        NEVER raises — if FinBERT fails to load (e.g. torch too old), sentiment
+        is disabled for the process and the tick continues without it.
         """
+        if self._sentiment_disabled:
+            return None
         if not settings.NEWS_API_KEY:
             if not self._sentiment_skip_logged:
                 logger.info("Sentiment skipped — no NEWS_API_KEY")
@@ -71,15 +76,26 @@ class SignalFusion:
             return None
         scorer = self._sources.get("sentiment")
         if scorer is None:
-            from signals.sentiment_scorer import SentimentScorer
-            scorer = SentimentScorer()
-            scorer.ensure_loaded()  # type: ignore[attr-defined]  # load FinBERT once
-            self._sources["sentiment"] = scorer
+            try:
+                from signals.sentiment_scorer import SentimentScorer
+                scorer = SentimentScorer()
+                scorer.ensure_loaded()  # type: ignore[attr-defined]  # load FinBERT once
+                self._sources["sentiment"] = scorer
+            except Exception as exc:  # noqa: BLE001 — never fatal
+                logger.warning(
+                    "Sentiment disabled — FinBERT failed to load: %s "
+                    "(check torch version: transformers needs torch>=2.4)", exc,
+                )
+                self._sentiment_disabled = True
+                return None
         return scorer
 
     def warmup(self) -> None:
-        """Pre-load heavy models at startup (FinBERT) so the first tick is fast."""
-        self._ensure_sentiment()
+        """Pre-load heavy models at startup (FinBERT). Best-effort — never fatal."""
+        try:
+            self._ensure_sentiment()
+        except Exception as exc:  # noqa: BLE001 — must not crash startup
+            logger.warning("SignalFusion.warmup failed (non-fatal): %s", exc)
 
     def _weighted_score(self, signals: list[Signal]) -> int:
         """Return a composite 0-100 score from weighted signal directions."""
