@@ -49,8 +49,37 @@ class SignalFusion:
     def __init__(self) -> None:
         self._current_state: Optional[MarketState] = None
         # Source instances are cached so repeated ticks don't re-init heavy
-        # models (e.g. the technical module / FRED client).
+        # models (FinBERT loads ONCE on the cached SentimentScorer, not per tick).
         self._sources: dict[str, object] = {}
+        self._sentiment_skip_logged = False
+
+    # Phases (ET) during which pre-market futures/crypto are still meaningful:
+    # 7:00–8:15 (premarket) + 8:15–9:30 (macro) = pre-open. Skipped once the
+    # market opens (session/power_hour) since intraday prices supersede futures.
+    _PREMARKET_PHASES = frozenset({"premarket", "macro"})
+
+    def _ensure_sentiment(self) -> Optional[object]:
+        """Return a cached SentimentScorer, or None when sentiment is disabled.
+
+        Gated on NEWS_API_KEY (rule): without it we skip sentiment entirely
+        rather than loading the heavy FinBERT model for RSS-only headlines.
+        """
+        if not settings.NEWS_API_KEY:
+            if not self._sentiment_skip_logged:
+                logger.info("Sentiment skipped — no NEWS_API_KEY")
+                self._sentiment_skip_logged = True
+            return None
+        scorer = self._sources.get("sentiment")
+        if scorer is None:
+            from signals.sentiment_scorer import SentimentScorer
+            scorer = SentimentScorer()
+            scorer.ensure_loaded()  # type: ignore[attr-defined]  # load FinBERT once
+            self._sources["sentiment"] = scorer
+        return scorer
+
+    def warmup(self) -> None:
+        """Pre-load heavy models at startup (FinBERT) so the first tick is fast."""
+        self._ensure_sentiment()
 
     def _weighted_score(self, signals: list[Signal]) -> int:
         """Return a composite 0-100 score from weighted signal directions."""
@@ -141,14 +170,21 @@ class SignalFusion:
         self._current_state = new_state
         return new_state
 
-    def collect_signals(self, benchmark: str = "SPY") -> list[Signal]:
+    def collect_signals(
+        self, benchmark: str = "SPY", phase: Optional[str] = None
+    ) -> list[Signal]:
         """Collect best-effort signals from the routinely-pollable sources.
 
         Each source is independently guarded — one that fails (missing API key,
         no data, model not downloaded) is skipped rather than aborting the tick.
-        Technical (yfinance) is the reliable anchor; Treasury-yield delta is
-        added when FRED is configured. Macro (NFP/CPI) and pre-market are
-        event-driven, not routine, so they're not polled here.
+
+        - Technical (yfinance): reliable anchor, always polled.
+        - Treasury-yield delta: added when FRED is configured.
+        - Sentiment (FinBERT): polled only when NEWS_API_KEY is set; model is
+          loaded once and cached.
+        - Pre-market futures/crypto: polled only in the pre-open phases
+          (``premarket``/``macro``); skipped during the session (stale).
+        - Macro (NFP/CPI): event-driven, fired on release — not polled here.
         """
         signals: list[Signal] = []
 
@@ -176,15 +212,36 @@ class SignalFusion:
         except Exception as exc:  # noqa: BLE001
             logger.debug("collect_signals: yield failed: %s", exc)
 
+        # ── Sentiment (FinBERT; gated on NEWS_API_KEY, model cached) ──────────
+        try:
+            scorer = self._ensure_sentiment()
+            if scorer is not None:
+                signals.append(scorer.score())  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("collect_signals: sentiment failed: %s", exc)
+
+        # ── Pre-market futures/crypto (only pre-open phases) ──────────────────
+        if phase in self._PREMARKET_PHASES:
+            try:
+                from signals.premarket_watcher import PremarketWatcher
+                pw = self._sources.get("premarket")
+                if pw is None:
+                    pw = PremarketWatcher()
+                    self._sources["premarket"] = pw
+                signals.append(pw.check())  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("collect_signals: premarket failed: %s", exc)
+
         logger.debug("collect_signals: gathered %d signal(s)", len(signals))
         return signals
 
-    def compute(self, benchmark: str = "SPY") -> MarketState:
+    def compute(self, benchmark: str = "SPY", phase: Optional[str] = None) -> MarketState:
         """Collect signals from available sources and fuse them into a MarketState.
 
-        Convenience entry point for the watcher tick: ``SignalFusion().compute()``.
+        Convenience entry point for the watcher tick:
+        ``SignalFusion().compute(phase=phase)``.
         """
-        return self.fuse(self.collect_signals(benchmark))
+        return self.fuse(self.collect_signals(benchmark, phase=phase))
 
     @property
     def current_state(self) -> Optional[MarketState]:

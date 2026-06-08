@@ -53,6 +53,10 @@ class SentimentScorer:
         self._pipeline = None
         self._seen_hashes: set[str] = set()
 
+    def ensure_loaded(self) -> None:
+        """Pre-load FinBERT now (e.g. at startup) so the first score() is fast."""
+        self._load_model()
+
     def _load_model(self) -> None:
         if self._pipeline is not None:
             return

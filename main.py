@@ -46,6 +46,7 @@ def main() -> None:
     from signals.signal_fusion import SignalFusion
     fusion = SignalFusion()
     alert_engine = AlertEngine()
+    fusion.warmup()  # pre-load FinBERT once at startup (if NEWS_API_KEY set)
 
     def phase_tick(phase: str) -> None:
         """Run one watcher tick for the active market phase: compute + route."""
@@ -54,7 +55,7 @@ def main() -> None:
             phase, guard.is_market_open(),
         )
         try:
-            state = fusion.compute()
+            state = fusion.compute(phase=phase)
             logger.info(
                 "Signal computed | direction=%s | confidence=%d | composite=%d",
                 state.current_regime, state.confidence, state.composite_score,

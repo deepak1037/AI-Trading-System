@@ -144,7 +144,7 @@ class TestMarketStateTracker:
 class TestComputeAndCollect:
     def test_compute_fuses_collected_signals(self, monkeypatch):
         f = SignalFusion()
-        monkeypatch.setattr(f, "collect_signals", lambda benchmark="SPY": [
+        monkeypatch.setattr(f, "collect_signals", lambda benchmark="SPY", phase=None: [
             _sig("long", source="technical", confidence=60),
         ])
         state = f.compute()
@@ -154,7 +154,7 @@ class TestComputeAndCollect:
 
     def test_compute_empty_signals_is_neutral(self, monkeypatch):
         f = SignalFusion()
-        monkeypatch.setattr(f, "collect_signals", lambda benchmark="SPY": [])
+        monkeypatch.setattr(f, "collect_signals", lambda benchmark="SPY", phase=None: [])
         state = f.compute()
         assert state.current_regime == "neutral"
         assert state.composite_score == 50
@@ -193,3 +193,80 @@ class TestMarketStateProperties:
 
     def test_confidence_zero_when_no_signals(self):
         assert self._state("neutral", []).confidence == 0
+
+
+class TestSentimentAndPremarketGating:
+    def _mock_core_sources(self, monkeypatch):
+        # Replace network sources so collect_signals is hermetic.
+        class _Tech:
+            def score_ticker(self, *a, **k):
+                return _sig("neutral", source="technical", confidence=34)
+
+        class _Yield:
+            def check_delta(self):
+                return None  # FRED not configured
+
+        monkeypatch.setattr("signals.technical_module.TechnicalModule", _Tech)
+        monkeypatch.setattr("signals.yield_monitor.YieldMonitor", _Yield)
+
+    def test_sentiment_skipped_without_news_key(self, monkeypatch):
+        monkeypatch.setattr("signals.signal_fusion.settings.NEWS_API_KEY", "")
+        f = SignalFusion()
+        assert f._ensure_sentiment() is None
+
+    def test_sentiment_loaded_once_with_news_key(self, monkeypatch):
+        monkeypatch.setattr("signals.signal_fusion.settings.NEWS_API_KEY", "k")
+        loaded = {"n": 0}
+
+        class _Scorer:
+            def ensure_loaded(self):
+                loaded["n"] += 1
+
+            def score(self):
+                return _sig("long", source="sentiment", confidence=60)
+
+        monkeypatch.setattr("signals.sentiment_scorer.SentimentScorer", _Scorer)
+        f = SignalFusion()
+        assert f._ensure_sentiment() is not None
+        f._ensure_sentiment()  # cached — must NOT reload
+        assert loaded["n"] == 1
+
+    def test_sentiment_included_when_configured(self, monkeypatch):
+        self._mock_core_sources(monkeypatch)
+        monkeypatch.setattr("signals.signal_fusion.settings.NEWS_API_KEY", "k")
+
+        class _Scorer:
+            def ensure_loaded(self):
+                pass
+
+            def score(self):
+                return _sig("long", source="sentiment", confidence=60)
+
+        monkeypatch.setattr("signals.sentiment_scorer.SentimentScorer", _Scorer)
+        sources = [s.source for s in SignalFusion().collect_signals(phase="session")]
+        assert "sentiment" in sources
+
+    def test_premarket_polled_in_preopen_phase(self, monkeypatch):
+        self._mock_core_sources(monkeypatch)
+        monkeypatch.setattr("signals.signal_fusion.settings.NEWS_API_KEY", "")
+
+        class _PW:
+            def check(self):
+                return _sig("short", source="premarket", confidence=50)
+
+        monkeypatch.setattr("signals.premarket_watcher.PremarketWatcher", _PW)
+        for phase in ("premarket", "macro"):
+            sources = [s.source for s in SignalFusion().collect_signals(phase=phase)]
+            assert "premarket" in sources, phase
+
+    def test_premarket_skipped_during_session(self, monkeypatch):
+        self._mock_core_sources(monkeypatch)
+        monkeypatch.setattr("signals.signal_fusion.settings.NEWS_API_KEY", "")
+
+        class _PW:
+            def check(self):
+                return _sig("short", source="premarket", confidence=50)
+
+        monkeypatch.setattr("signals.premarket_watcher.PremarketWatcher", _PW)
+        sources = [s.source for s in SignalFusion().collect_signals(phase="session")]
+        assert "premarket" not in sources
