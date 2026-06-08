@@ -11,8 +11,12 @@ tenacity==9.0.0
 
 # ── Data / numerics ───────────────────────────────────────
 pandas==2.2.3
-numpy==2.1.3
-pandas-ta==0.3.14b0
+# numpy: Intel-Mac (x86_64 darwin) caps torch at 2.2.2, which needs numpy<2;
+# Linux/Apple-Silicon use the modern build. pandas-ta 0.4.x prefers numpy>=2.2
+# but works with 1.26 on the Mac.
+numpy==2.2.6; sys_platform != "darwin" or platform_machine != "x86_64"
+numpy==1.26.4; sys_platform == "darwin" and platform_machine == "x86_64"
+pandas-ta==0.4.71b0   # 0.3.14b0 was removed from PyPI
 pandas_market_calendars==4.4.1
 
 # ── Brokers ───────────────────────────────────────────────
@@ -26,8 +30,12 @@ polygon-api-client==1.14.2
 edgartools==5.35.1   # imported as `edgar`; Form 4 / 13F parsing
 
 # ── NLP sentiment ─────────────────────────────────────────
-transformers==4.46.3
-torch==2.5.1
+transformers==4.46.3   # 4.x supports torch>=2.0; transformers 5.x requires torch>=2.4
+# torch: Intel Mac (x86_64) has no wheel >2.2.2 (PyTorch dropped it); Linux/ARM
+# get the modern build. FinBERT needs torch present, so sentiment runs on Linux
+# and Apple-Silicon; on Intel Mac it degrades gracefully (logged, non-fatal).
+torch==2.5.1; sys_platform != "darwin" or platform_machine != "x86_64"
+torch==2.2.2; sys_platform == "darwin" and platform_machine == "x86_64"
 
 # ── LLM (Claude) — options ROI analysis ───────────────────
 # >=0.40 required: 0.39 passes the removed `proxies` kwarg to httpx>=0.28.
