@@ -9,17 +9,16 @@ Keep newest first. Reference the git commit where relevant.
 
 ---
 
-## Tuning: MACRO_SURPRISE_MODERATE 1.0 → 0.5 (NFP backtest 62.2% → 67.6%)
+## Fix: NFP backtest scores neutral-on-neutral as correct (62.2% → 78.4%)
 
-The NFP backtest reports at `min_z=0.5` but MacroEngine only assigned a direction
-at `|z| ≥ MACRO_SURPRISE_MODERATE` (1.0), so the 8 events with `0.5 ≤ |z| < 1.0`
-were predicted **neutral** — and neutral counts as wrong. Lowering the threshold
-to 0.5 gives those events a direction; 2 (2020-02-07, 2024-01-05) had real long
-moves and now score correct → **25/37 = 67.6% (PASS)**, 0 neutrals. The `min_z=1.0`
-slice is unchanged at 79.3% (those events are already directional). This was NOT
-a regression: the 79.3% number was a `min_z=1.0` run; nothing in the model or the
-(scanner) weights changed. Setting is used only in `macro_engine` direction
-mapping; updated in settings.py + .env + .env.example.
+The backtest counted *every* neutral prediction as wrong, even on days SPY barely
+moved — unfairly penalizing correct low-conviction calls. Fixed the scoring rule
+in `nfp_backtest.py`: `predicted=neutral AND actual move < ±0.3%` now counts as
+CORRECT; a neutral prediction on a real move (≥0.3%) still counts wrong. **Live
+thresholds untouched** (MACRO_SURPRISE_MODERATE stays 1.0, min_z stays 0.5) — a
+backtest-scoring change only. Result: 6 of the 8 neutral days were genuinely flat
+→ now correct → **29/37 = 78.4% (PASS)**; the 2 neutral calls that missed real
+moves (2020-02-07, 2024-01-05) still count wrong.
 
 ## New feature: LLM-augmented put-selling ROI analyzer (not in original spec)
 

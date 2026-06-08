@@ -48,11 +48,8 @@ class Settings(BaseSettings):
     ALPACA_BASE_URL: str = "https://paper-api.alpaca.markets"
 
     # ── Signal thresholds ─────────────────────────────────────
-    MACRO_SURPRISE_CRITICAL: float = 2.0  # σ — |z| ≥ this → strong direction
-    # |z| ≥ this → directional (long/short); below → neutral. Lowered 1.0 → 0.5
-    # so 0.5-1.0σ surprises get a direction instead of neutral (NFP backtest
-    # 62.2% → 67.6%; see docs/CHANGELOG.md).
-    MACRO_SURPRISE_MODERATE: float = 0.5
+    MACRO_SURPRISE_CRITICAL: float = 2.0  # σ
+    MACRO_SURPRISE_MODERATE: float = 1.0
     YIELD_DELTA_THRESHOLD: float = 0.05  # 5 bps
     SENTIMENT_THRESHOLD: float = 0.3  # FinBERT score
     PREMARKET_FUTURES_THRESHOLD: float = -0.008  # -0.8% NQ futures

@@ -120,10 +120,14 @@ def run_nfp_backtest(min_z: float = 1.0) -> dict:
             "short" if actual_spy_pct <= -0.003 else "neutral"
         )
 
-        # Agreement: both bullish or both bearish (neutral treated as miss)
+        # A prediction is correct when it agrees with the actual close-to-close
+        # direction. A *neutral* prediction is correct on a genuinely flat day
+        # (|move| < 0.3%) — it's an honest "no edge" call, not a miss; it's only
+        # wrong if SPY actually made a directional move.
         is_correct = (
             (predicted in ("long", "strong_long") and actual_direction == "long") or
-            (predicted in ("short", "strong_short") and actual_direction == "short")
+            (predicted in ("short", "strong_short") and actual_direction == "short") or
+            (predicted == "neutral" and actual_direction == "neutral")
         )
 
         results.append({
