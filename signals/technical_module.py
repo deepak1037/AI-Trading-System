@@ -128,6 +128,12 @@ class TechnicalModule:
         Returns:
             Signal with source="technical".
         """
+        if not isinstance(df, pd.DataFrame):
+            raise SignalError(
+                f"score() expects an OHLCV DataFrame, got {type(df).__name__}. "
+                "To score by symbol, use score_ticker('SPY').",
+                ticker=ticker if isinstance(ticker, str) else "UNKNOWN",
+            )
         if len(df) < 30:
             raise SignalError(
                 f"Insufficient data for technical analysis: {len(df)} rows (need ≥30)",
@@ -219,6 +225,30 @@ class TechnicalModule:
                 "composite_score": round(composite, 3),
             },
         )
+
+    def score_ticker(self, ticker: str, period: str = "1y") -> Signal:
+        """Fetch OHLCV for ``ticker`` via yfinance, then score it.
+
+        Convenience wrapper around ``score(df)`` for when you have a symbol
+        rather than a DataFrame::
+
+            TechnicalModule().score_ticker("SPY")
+
+        Args:
+            ticker: Symbol, e.g. "SPY".
+            period: yfinance history period (default "1y" — enough for the
+                200-day MA).
+        """
+        try:
+            import yfinance as yf
+        except ImportError as exc:  # pragma: no cover - import guard
+            raise DataError("yfinance not installed") from exc
+
+        df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+        if df is None or df.empty:
+            raise SignalError(f"No OHLCV data returned for {ticker}", ticker=ticker)
+        df.columns = [c.lower() for c in df.columns]
+        return self.score(df, ticker=ticker)
 
 
 __all__ = ["TechnicalModule"]

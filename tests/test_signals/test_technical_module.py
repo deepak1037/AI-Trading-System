@@ -57,6 +57,52 @@ class TestTechnicalModule:
         with pytest.raises(SignalError):
             module.score(df)
 
+    def test_score_with_string_gives_clear_error(self, module):
+        # Passing a ticker string instead of a DataFrame must explain itself.
+        with pytest.raises(SignalError, match="score_ticker"):
+            module.score("SPY")
+
+    def test_score_ticker_fetches_and_scores(self, module, monkeypatch):
+        import sys
+        import types
+
+        df = _make_ohlcv(250, trend="up")
+        df.columns = [c.capitalize() for c in df.columns]  # yfinance returns Title-case
+
+        fake_yf = types.ModuleType("yfinance")
+
+        class _T:
+            def __init__(self, *a, **k):
+                pass
+
+            def history(self, **k):
+                return df
+
+        fake_yf.Ticker = _T  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+
+        sig = module.score_ticker("SPY")
+        assert sig.source == "technical"
+        assert sig.metadata["ticker"] == "SPY"
+
+    def test_score_ticker_empty_raises(self, module, monkeypatch):
+        import sys
+        import types
+
+        fake_yf = types.ModuleType("yfinance")
+
+        class _T:
+            def __init__(self, *a, **k):
+                pass
+
+            def history(self, **k):
+                return pd.DataFrame()
+
+        fake_yf.Ticker = _T  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+        with pytest.raises(SignalError, match="No OHLCV"):
+            module.score_ticker("ZZZZ")
+
     def test_confidence_in_range(self, module):
         for trend in ("up", "down"):
             df = _make_ohlcv(250, trend=trend)
