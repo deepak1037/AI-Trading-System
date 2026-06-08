@@ -49,3 +49,38 @@ class TestCalendarGuard:
         # Sunday midnight UTC
         dt = datetime(2024, 1, 7, 0, 0, 0, tzinfo=timezone.utc)
         assert guard.is_market_open(dt) is False
+
+
+class TestCurrentPhase:
+    # 2024-01-08 is a Monday (trading day). EST = UTC-5, so UTC = ET + 5h.
+    def _utc_for_et(self, hh: int, mm: int) -> datetime:
+        return datetime(2024, 1, 8, hh + 5, mm, 0, tzinfo=timezone.utc)
+
+    def test_session_phase_midday(self, guard):
+        assert guard.current_phase(self._utc_for_et(10, 39)) == "session"
+
+    def test_open_phase(self, guard):
+        assert guard.current_phase(self._utc_for_et(9, 45)) == "open"
+
+    def test_macro_phase(self, guard):
+        assert guard.current_phase(self._utc_for_et(9, 0)) == "macro"
+
+    def test_premarket_phase(self, guard):
+        assert guard.current_phase(self._utc_for_et(7, 30)) == "premarket"
+
+    def test_overnight_phase(self, guard):
+        assert guard.current_phase(self._utc_for_et(5, 0)) == "overnight"
+
+    def test_power_hour_phase(self, guard):
+        assert guard.current_phase(self._utc_for_et(15, 30)) == "power_hour"
+
+    def test_after_close_is_closed(self, guard):
+        assert guard.current_phase(self._utc_for_et(17, 0)) == "closed"
+
+    def test_dead_of_night_is_closed(self, guard):
+        assert guard.current_phase(self._utc_for_et(2, 0)) == "closed"
+
+    def test_holiday_is_closed(self, guard):
+        # Christmas 2023, midday ET — not a trading day.
+        dt = datetime(2023, 12, 25, 17, 0, 0, tzinfo=timezone.utc)
+        assert guard.current_phase(dt) == "closed"

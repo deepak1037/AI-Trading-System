@@ -41,6 +41,21 @@ def main() -> None:
     logger.info("PositionWatcher started")
 
     scheduler = WatcherScheduler(calendar=guard)
+
+    def phase_tick(phase: str) -> None:
+        """Run one watcher tick for the active market phase."""
+        logger.info(
+            "Watcher tick | phase=%s | market_open=%s",
+            phase, guard.is_market_open(),
+        )
+        # TODO: collect this phase's signals / update MarketState here.
+
+    def eod_report() -> None:
+        logger.info("EOD report job fired (16:05 ET)")
+
+    # Register all phase jobs up front; whatever phase the market is already in
+    # fires immediately (no waiting for the next scheduled transition).
+    scheduler.register_default_jobs(phase_tick, on_eod=eod_report)
     scheduler.start()
     logger.info("WatcherScheduler started — running phases per market calendar")
 

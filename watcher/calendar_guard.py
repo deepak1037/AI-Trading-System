@@ -111,5 +111,34 @@ class CalendarGuard:
         et = dt.astimezone(zoneinfo.ZoneInfo("America/New_York"))
         return time(15, 0) <= et.time() < time(16, 0) and self.is_trading_day(et.date())
 
+    def current_phase(self, dt: Optional[datetime] = None) -> str:
+        """Return the active watcher phase for ``dt`` (CLAUDE.md Section 12).
+
+        One of: ``overnight`` | ``premarket`` | ``macro`` | ``open`` |
+        ``session`` | ``power_hour`` | ``closed``. Returns ``closed`` on
+        non-trading days and outside 04:00–16:00 ET.
+        """
+        import zoneinfo
+        from datetime import time
+
+        dt = dt or datetime.now(tz=timezone.utc)
+        et = dt.astimezone(zoneinfo.ZoneInfo("America/New_York"))
+        if not self.is_trading_day(et.date()):
+            return "closed"
+        t = et.time()
+        # (start, end, phase) windows in ET; end-exclusive.
+        windows = [
+            (time(4, 0), time(7, 0), "overnight"),
+            (time(7, 0), time(8, 15), "premarket"),
+            (time(8, 15), time(9, 30), "macro"),
+            (time(9, 30), time(10, 0), "open"),
+            (time(10, 0), time(15, 0), "session"),
+            (time(15, 0), time(16, 0), "power_hour"),
+        ]
+        for start, end, phase in windows:
+            if start <= t < end:
+                return phase
+        return "closed"
+
 
 __all__ = ["CalendarGuard"]

@@ -74,3 +74,30 @@ class TestWatcherScheduler:
             raise RuntimeError("boom")
         guarded = scheduler._guarded("test", bad_fn)
         guarded()  # Should not raise
+
+    def test_phase_gated_skips_wrong_phase(self, scheduler):
+        scheduler._calendar.current_phase.return_value = "session"
+        fn = MagicMock()
+        guarded = scheduler._guarded("open", fn, phase_gated=True)
+        guarded()
+        fn.assert_not_called()  # current phase is session, job is for open
+
+    def test_phase_gated_runs_matching_phase(self, scheduler):
+        scheduler._calendar.current_phase.return_value = "session"
+        fn = MagicMock()
+        guarded = scheduler._guarded("session", fn, phase_gated=True)
+        guarded()
+        fn.assert_called_once()
+
+    def test_register_default_jobs_registers_all(self, scheduler):
+        scheduler._calendar.current_phase.return_value = "session"
+        scheduler.register_default_jobs(MagicMock(), on_eod=MagicMock())
+        jobs = scheduler.get_jobs()
+        for p in ("overnight", "premarket", "macro", "open", "session", "power_hour", "eod"):
+            assert p in jobs
+
+    def test_register_fires_current_phase_immediately(self, scheduler):
+        # The current phase's job gets an immediate next_run_time.
+        scheduler._calendar.current_phase.return_value = "session"
+        scheduler.register_default_jobs(MagicMock())
+        assert scheduler._jobs["session"].next_run_time is not None
