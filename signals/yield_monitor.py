@@ -127,55 +127,81 @@ class YieldMonitor:
 
         return current_yield - self._baseline
 
-    def check_delta(self, current_yield: Optional[float] = None) -> Optional[Signal]:
-        """Return a Signal if yield delta exceeds threshold, else None.
+    def _signal_from_delta(self, delta: float) -> Signal:
+        """Map a yield delta to a directional Signal.
 
         Positive delta (rising yields) → bearish (short / strong_short).
         Negative delta (falling yields) → bullish (long / strong_long).
-        Threshold from settings.YIELD_DELTA_THRESHOLD (default 0.05 = 5 bps).
+        Below ``YIELD_DELTA_THRESHOLD`` → neutral with confidence scaling toward
+        the threshold (so it's still a usable continuous reading).
         """
-        delta = self.get_delta(current_yield)
         abs_delta = abs(delta)
+        thr = settings.YIELD_DELTA_THRESHOLD
 
-        if abs_delta < settings.YIELD_DELTA_THRESHOLD:
-            logger.debug(
-                "YieldMonitor: delta=%.4f below threshold=%.4f — no signal",
-                delta,
-                settings.YIELD_DELTA_THRESHOLD,
-            )
-            return None
-
-        # Map magnitude to direction/confidence
-        # 5 bps → confidence 55, every additional 5 bps adds ~10 pts, cap 95
-        confidence = min(95, 55 + int((abs_delta - settings.YIELD_DELTA_THRESHOLD) / 0.05 * 10))
-
-        if abs_delta >= settings.YIELD_DELTA_THRESHOLD * 4:
-            direction: Direction = "strong_short" if delta > 0 else "strong_long"
-        elif abs_delta >= settings.YIELD_DELTA_THRESHOLD * 2:
-            direction = "short" if delta > 0 else "long"
+        if abs_delta < thr:
+            direction: Direction = "neutral"
+            confidence = int(abs_delta / thr * 50) if thr > 0 else 0
         else:
-            direction = "short" if delta > 0 else "long"
+            # 5 bps → confidence 55, every additional 5 bps adds ~10 pts, cap 95
+            confidence = min(95, 55 + int((abs_delta - thr) / 0.05 * 10))
+            if abs_delta >= thr * 4:
+                direction = "strong_short" if delta > 0 else "strong_long"
+            else:
+                direction = "short" if delta > 0 else "long"
 
-        assert self._baseline is not None
-        current = self._baseline + delta
-
-        signal = Signal(
+        baseline = self._baseline if self._baseline is not None else 0.0
+        current = baseline + delta
+        return Signal(
             direction=direction,
             confidence=confidence,
             source="yield",
             timestamp=datetime.now(tz=timezone.utc),
             metadata={
                 "yield_current": round(current, 4),
-                "yield_baseline": round(self._baseline, 4),
+                "yield_baseline": round(baseline, 4),
                 "yield_delta": round(delta, 4),
-                "threshold": settings.YIELD_DELTA_THRESHOLD,
+                "threshold": thr,
             },
         )
+
+    def check_delta(self, current_yield: Optional[float] = None) -> Optional[Signal]:
+        """Return a Signal only if the yield delta exceeds threshold (alerts).
+
+        Use ``read()`` for a continuous reading in the fusion tick.
+        """
+        delta = self.get_delta(current_yield)
+        if abs(delta) < settings.YIELD_DELTA_THRESHOLD:
+            logger.debug(
+                "YieldMonitor: delta=%.4f below threshold=%.4f — no signal",
+                delta, settings.YIELD_DELTA_THRESHOLD,
+            )
+            return None
+        signal = self._signal_from_delta(delta)
         logger.info(
             "YieldMonitor: delta=%.4f%% → direction=%s confidence=%d",
-            delta,
-            direction,
-            confidence,
+            delta, signal.direction, signal.confidence,
+        )
+        return signal
+
+    def read(self) -> Optional[Signal]:
+        """Continuous yield reading for the fusion tick — always a Signal.
+
+        Auto-sets the baseline on first call (the cause of yield never appearing:
+        ``check_delta()`` raises if no baseline). Below-threshold moves return a
+        neutral reading so yield contributes every tick alongside technical/
+        sentiment. Returns None only if the yield data can't be fetched at all.
+        """
+        try:
+            if self._baseline is None:
+                self.set_baseline()  # intraday yfinance (FRED daily fallback)
+            delta = self.get_delta()
+        except (SignalError, DataError) as exc:
+            logger.debug("YieldMonitor.read: %s", exc)
+            return None
+        signal = self._signal_from_delta(delta)
+        logger.debug(
+            "YieldMonitor.read: delta=%.4f dir=%s conf=%d",
+            delta, signal.direction, signal.confidence,
         )
         return signal
 

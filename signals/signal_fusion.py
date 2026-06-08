@@ -215,14 +215,14 @@ class SignalFusion:
         except Exception as exc:  # noqa: BLE001
             logger.debug("collect_signals: technical failed: %s", exc)
 
-        # ── Treasury-yield delta (needs FRED) ────────────────────────────────
+        # ── Treasury-yield delta (continuous read; needs FRED/yfinance) ──────
         try:
             from signals.yield_monitor import YieldMonitor
             ym = self._sources.get("yield")
             if ym is None:
                 ym = YieldMonitor()
                 self._sources["yield"] = ym
-            ysig = ym.check_delta()  # type: ignore[attr-defined]
+            ysig = ym.read()  # type: ignore[attr-defined]  # sets baseline + always returns a reading
             if ysig is not None:
                 signals.append(ysig)
         except Exception as exc:  # noqa: BLE001

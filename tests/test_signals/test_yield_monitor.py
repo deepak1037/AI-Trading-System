@@ -81,3 +81,38 @@ class TestYieldMonitorSignal:
         # Exactly at threshold — should be None (< threshold)
         signal = monitor.check_delta(4.00 + settings.YIELD_DELTA_THRESHOLD - 0.001)
         assert signal is None
+
+
+class TestYieldRead:
+    """read() — continuous reading for the fusion tick (the fix)."""
+
+    def test_read_autosets_baseline(self, monitor, mocker):
+        mocker.patch.object(monitor, "_fetch_current_yield", side_effect=[4.00, 4.00])
+        sig = monitor.read()
+        assert sig is not None
+        assert sig.source == "yield"
+        assert monitor.baseline == 4.00  # baseline set automatically
+
+    def test_read_neutral_below_threshold(self, monitor, mocker):
+        mocker.patch.object(monitor, "_fetch_current_yield", side_effect=[4.00, 4.02])  # 2 bps
+        sig = monitor.read()
+        assert sig is not None
+        assert sig.direction == "neutral"  # still returns a signal (continuous)
+
+    def test_read_directional_above_threshold(self, monitor, mocker):
+        mocker.patch.object(monitor, "_fetch_current_yield", side_effect=[4.00, 4.10])  # +10 bps
+        sig = monitor.read()
+        assert sig.direction in ("short", "strong_short")  # rising yields = bearish
+        assert sig.confidence >= 55
+
+    def test_read_returns_none_when_no_data(self, monitor, mocker):
+        from core.exceptions import DataError
+        mocker.patch.object(monitor, "_fetch_current_yield", side_effect=DataError("no intraday"))
+        mocker.patch.object(monitor, "_fetch_fred_daily_yield", side_effect=DataError("no fred"))
+        assert monitor.read() is None
+
+    def test_signal_from_delta_neutral_and_directional(self, monitor):
+        monitor.set_baseline(4.00)
+        assert monitor._signal_from_delta(0.01).direction == "neutral"   # 1 bp
+        assert monitor._signal_from_delta(0.10).direction in ("short", "strong_short")
+        assert monitor._signal_from_delta(-0.10).direction in ("long", "strong_long")
