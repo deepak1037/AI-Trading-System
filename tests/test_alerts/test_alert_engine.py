@@ -77,6 +77,58 @@ class TestAlertEngineSendGrid:
         assert result is False
 
 
+class TestAlertEngineDiscord:
+    def test_send_discord_returns_true_on_204(self, engine, mocker):
+        resp = MagicMock(status_code=204)
+        post = mocker.patch("requests.post", return_value=resp)
+        ok = engine._send_discord(
+            "https://discord.test/webhook",
+            engine._discord_message("T", "body", 65280, [{"name": "a", "value": "b"}]),
+        )
+        assert ok is True
+        # Verify the embed payload shape.
+        payload = post.call_args.kwargs["json"]
+        embed = payload["embeds"][0]
+        assert embed["title"] == "T"
+        assert embed["description"] == "body"
+        assert embed["color"] == 65280
+        assert embed["fields"] == [{"name": "a", "value": "b"}]
+        assert "footer" in embed
+
+    def test_send_discord_non_204_returns_false(self, engine, mocker):
+        mocker.patch("requests.post", return_value=MagicMock(status_code=400, text="bad"))
+        assert engine._send_discord("https://discord.test/wh", engine._discord_message("T", "b", 1)) is False
+
+    def test_send_discord_empty_webhook_returns_false(self, engine):
+        assert engine._send_discord("", engine._discord_message("T", "b", 1)) is False
+
+    def test_send_discord_disabled_returns_false(self, engine, mocker):
+        mocker.patch("config.settings.settings.DISCORD_ENABLED", False)
+        assert engine._send_discord("https://x/wh", engine._discord_message("T", "b", 1)) is False
+
+    def test_critical_routes_to_alerts_webhook_red(self, engine, mocker):
+        mocker.patch("config.settings.settings.DISCORD_WEBHOOK_ALERTS", "https://discord.test/alerts")
+        send = mocker.patch.object(engine, "_send_discord", return_value=True)
+        assert engine.send_discord_critical("Title", "Body") is True
+        url, msg = send.call_args.args
+        assert url == "https://discord.test/alerts"
+        assert msg["color"] == 16711680  # red
+
+    def test_opportunity_routes_green(self, engine, mocker):
+        mocker.patch("config.settings.settings.DISCORD_WEBHOOK_OPPORTUNITIES", "https://discord.test/opps")
+        send = mocker.patch.object(engine, "_send_discord", return_value=True)
+        engine.send_discord_opportunity("Opp", "found")
+        assert send.call_args.args[1]["color"] == 65280  # green
+
+    def test_briefing_routes_blue_no_dedup(self, engine, mocker):
+        mocker.patch("config.settings.settings.DISCORD_WEBHOOK_BRIEFING", "https://discord.test/brief")
+        send = mocker.patch.object(engine, "_send_discord", return_value=True)
+        engine.send_discord_briefing("Brief", "today")
+        engine.send_discord_briefing("Brief", "today")  # no dedup → sends twice
+        assert send.call_count == 2
+        assert send.call_args.args[1]["color"] == 3447003  # blue
+
+
 class TestAlertEngineExceptionHandling:
     def test_critical_exception_sends_sms(self, engine, mocker):
         mock_sms = mocker.patch.object(engine, "send_critical")

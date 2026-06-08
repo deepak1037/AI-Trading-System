@@ -24,6 +24,12 @@ from core.retry import circuit_breaker, retry
 
 logger = get_logger(__name__)
 
+# Discord embed colors (decimal).
+_DISCORD_RED = 16711680     # critical → #alerts
+_DISCORD_YELLOW = 16776960  # high → #signals
+_DISCORD_GREEN = 65280      # opportunity → #opportunities
+_DISCORD_BLUE = 3447003     # daily briefing → #daily-briefing
+
 
 def _dedup_key(channel: str, severity: str, message_hash: str) -> str:
     return f"{channel}:{severity}:{message_hash}"
@@ -156,6 +162,119 @@ class AlertEngine:
         except Exception as exc:
             raise DataError(f"SendGrid email failed: {exc}") from exc
 
+    # ── Discord webhooks ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _discord_message(
+        title: str, body: str, color: int, fields: Optional[list] = None
+    ) -> dict:
+        return {"title": title, "body": body, "color": color, "fields": fields or []}
+
+    @retry(
+        max_attempts=settings.API_MAX_RETRIES,
+        backoff_seconds=settings.API_BACKOFF_SECONDS,
+        exceptions=(DataError,),
+    )
+    def _send_discord(self, webhook_url: str, message: dict) -> bool:
+        """Send rich embed message to Discord webhook."""
+        if not settings.DISCORD_ENABLED:
+            logger.debug("Discord disabled — suppressed: %s", message.get("title"))
+            return False
+        if not webhook_url:
+            logger.debug("Discord webhook not configured — suppressed: %s", message.get("title"))
+            return False
+        try:
+            import requests
+
+            payload = {
+                "embeds": [{
+                    "title": message["title"],
+                    "description": message["body"],
+                    "color": message["color"],
+                    # green=65280, yellow=16776960, red=16711680, blue=3447003
+                    "fields": message.get("fields", []),
+                    "footer": {"text": f"AI Trading System | {datetime.now().strftime('%H:%M ET')}"},
+                }]
+            }
+            resp = requests.post(webhook_url, json=payload, timeout=10)
+            # Discord returns 204 No Content on success (200 with ?wait=true).
+            ok = resp.status_code in (200, 204)
+            if ok:
+                logger.info("Discord message sent: %s", message["title"])
+            else:
+                logger.warning(
+                    "Discord webhook returned %d: %s", resp.status_code, resp.text[:120]
+                )
+            return ok
+        except Exception as exc:
+            raise DataError(f"Discord webhook failed: {exc}") from exc
+
+    def _discord_route(
+        self,
+        webhook_url: str,
+        channel: str,
+        severity: str,
+        title: str,
+        body: str,
+        color: int,
+        fields: Optional[list] = None,
+        signal_id: Optional[int] = None,
+        dedup: bool = True,
+    ) -> bool:
+        """Dedup + send a Discord embed to a channel, then log it."""
+        if not settings.DISCORD_ENABLED:
+            return False
+        key = _dedup_key(
+            channel, severity, hashlib.md5(f"{title}{body}".encode()).hexdigest()[:8]
+        )
+        if dedup and self._is_duplicate(key):
+            logger.debug("Dedup: suppressing %s Discord", channel)
+            return False
+        sent = self._send_discord(webhook_url, self._discord_message(title, body, color, fields))
+        if sent:
+            self._record_sent(key)
+            self._log_to_db(channel, severity, title, signal_id)
+        return sent
+
+    def send_discord_critical(
+        self, title: str, body: str, fields: Optional[list] = None,
+        signal_id: Optional[int] = None,
+    ) -> bool:
+        """CRITICAL → #alerts (red embed)."""
+        return self._discord_route(
+            settings.DISCORD_WEBHOOK_ALERTS, "discord_alerts", "critical",
+            title, body, _DISCORD_RED, fields, signal_id,
+        )
+
+    def send_discord_signal(
+        self, title: str, body: str, fields: Optional[list] = None,
+        signal_id: Optional[int] = None,
+    ) -> bool:
+        """HIGH → #signals (yellow embed)."""
+        return self._discord_route(
+            settings.DISCORD_WEBHOOK_SIGNALS, "discord_signals", "high",
+            title, body, _DISCORD_YELLOW, fields, signal_id,
+        )
+
+    def send_discord_opportunity(
+        self, title: str, body: str, fields: Optional[list] = None,
+        signal_id: Optional[int] = None,
+    ) -> bool:
+        """Opportunity → #opportunities (green embed)."""
+        return self._discord_route(
+            settings.DISCORD_WEBHOOK_OPPORTUNITIES, "discord_opportunities", "opportunity",
+            title, body, _DISCORD_GREEN, fields, signal_id,
+        )
+
+    def send_discord_briefing(
+        self, title: str, body: str, fields: Optional[list] = None,
+    ) -> bool:
+        """Daily briefing → #daily-briefing (blue embed). No dedup — fires once."""
+        return self._discord_route(
+            settings.DISCORD_WEBHOOK_BRIEFING, "discord_briefing", "briefing",
+            title, body, _DISCORD_BLUE, fields, dedup=False,
+        )
+
     # ── Public API ───────────────────────────────────────────────────────────
 
     def send_critical(
@@ -174,6 +293,9 @@ class AlertEngine:
         if sent:
             self._record_sent(key)
             self._log_to_db("sms", "critical", message, signal_id)
+        # Fan out to Discord #alerts (already deduped above).
+        if settings.DISCORD_ENABLED:
+            self.send_discord_critical("🚨 Critical Alert", message, signal_id=signal_id)
         return sent
 
     def send_high(self, message: str, signal_id: Optional[int] = None) -> bool:
@@ -187,6 +309,9 @@ class AlertEngine:
         if sent:
             self._record_sent(key)
             self._log_to_db("slack", "high", message, signal_id)
+        # Fan out to Discord #signals.
+        if settings.DISCORD_ENABLED:
+            self.send_discord_signal("⚠️ Signal", message, signal_id=signal_id)
         return sent
 
     def send_digest(self, subject: str, body: str) -> bool:

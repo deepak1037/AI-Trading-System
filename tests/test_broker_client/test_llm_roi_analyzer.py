@@ -8,7 +8,7 @@ the full analyze path with a mocked Anthropic client + stubbed context.
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -30,8 +30,14 @@ COMMISSION = 0.65  # settings.PAPER_OPTIONS_COMMISSION default
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
+def _utc_today():
+    # Match production _days_to_expiry, which uses the UTC date (avoids an
+    # off-by-one when local and UTC dates straddle midnight).
+    return datetime.now(tz=timezone.utc).date()
+
+
 def _future_expiry(days: int = 40) -> str:
-    return (date.today() + timedelta(days=days)).isoformat()
+    return (_utc_today() + timedelta(days=days)).isoformat()
 
 
 class FakeBroker:
@@ -199,7 +205,7 @@ class TestDaysToExpiry:
 
     def test_past_clamped_to_zero(self):
         a = LLMROIAnalyzer()
-        past = (date.today() - timedelta(days=5)).isoformat()
+        past = (_utc_today() - timedelta(days=5)).isoformat()
         assert a._days_to_expiry(past) == 0
 
 

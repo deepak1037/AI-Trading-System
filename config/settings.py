@@ -156,6 +156,13 @@ class Settings(BaseSettings):
     ALERT_DEDUP_MINUTES: int = 30
     ALERT_DIGEST_INTERVAL_MINUTES: int = 60
 
+    # ── Discord webhooks ──────────────────────────────────────
+    DISCORD_ENABLED: bool = True
+    DISCORD_WEBHOOK_ALERTS: str = ""         # #alerts — critical (red)
+    DISCORD_WEBHOOK_SIGNALS: str = ""        # #signals — high (yellow)
+    DISCORD_WEBHOOK_OPPORTUNITIES: str = ""  # #opportunities — green
+    DISCORD_WEBHOOK_BRIEFING: str = ""       # #daily-briefing — blue
+
     # ── Scanner ───────────────────────────────────────────────
     SCANNER_UNIVERSE_MIN_PRICE: float = 5.0
     SCANNER_UNIVERSE_MIN_VOLUME: int = 500_000

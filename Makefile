@@ -171,6 +171,11 @@ lint: _check_venv
 healthcheck: _check_venv _mklogs
 	@$(PYTHON) scripts/healthcheck.py
 
+# ── test-alerts: send a test embed to each Discord channel ───────────────────
+.PHONY: test-alerts
+test-alerts: _check_venv
+	@$(PYTHON) scripts/test_alerts.py
+
 # ── analyze: LLM-augmented put ROI analysis ──────────────────────────────────
 #   make analyze ticker=HOOD strike=8 expiry=2026-07-18
 .PHONY: analyze
