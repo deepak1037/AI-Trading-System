@@ -12,6 +12,29 @@ from data.db import init_db
 logger = get_logger(__name__)
 
 
+def _macro_alert_msg(signal: object) -> str:
+    """Format a macro-surprise alert for Discord #alerts."""
+    md = getattr(signal, "metadata", {})
+    return (
+        f"MACRO SURPRISE — {md.get('release', '?')} {md.get('period', '')}: "
+        f"actual={md.get('actual_yoy', '?')}% consensus={md.get('consensus_yoy', '?')}% "
+        f"(z={md.get('z_score', '?')}) → {getattr(signal, 'direction', '?')} "
+        f"confidence={getattr(signal, 'confidence', '?')}"
+    )
+
+
+def _geo_alert_msg(signal: object) -> str:
+    """Format a geopolitical-shock alert for Discord #alerts."""
+    md = getattr(signal, "metadata", {})
+    sample = md.get("sample_headlines", []) or []
+    return (
+        f"⚠️ GEOPOLITICAL SHOCK — risk-off. keywords={md.get('keywords', [])} "
+        f"sentiment_avg={md.get('matched_avg', '?')} → {getattr(signal, 'direction', '?')} "
+        f"confidence={getattr(signal, 'confidence', '?')}. "
+        f"Headlines: {' | '.join(sample[:3])}"
+    )
+
+
 def main() -> None:
     logger.info(
         "AI-Trading-System starting | ENV=%s | BROKER=%s | DRY_RUN=%s",
@@ -60,10 +83,40 @@ def main() -> None:
                 "Signal computed | direction=%s | confidence=%d | composite=%d",
                 state.current_regime, state.confidence, state.composite_score,
             )
-            if state.confidence >= settings.CONFIDENCE_HIGH:
+            # Event-driven, high-priority signals (macro release, geopolitical
+            # shock) route straight to Discord #alerts — bypassing the composite
+            # MEAN, which would otherwise dilute a single hot signal below the
+            # alert threshold. send_critical dedups by content for 30 min.
+            event_fired = False
+            for s in state.signals_active:
+                if s.source == "macro" and s.confidence >= settings.CONFIDENCE_HIGH:
+                    alert_engine.send_critical(_macro_alert_msg(s))
+                    event_fired = True
+                elif s.metadata.get("geopolitical_shock"):
+                    alert_engine.send_critical(_geo_alert_msg(s))
+                    event_fired = True
+            if not event_fired and state.confidence >= settings.CONFIDENCE_HIGH:
                 alert_engine.send_signal_alert(state)
         except Exception as exc:  # noqa: BLE001 — a tick must never crash the loop
             logger.error("Signal computation failed: %s", exc)
+
+    def geopolitical_tick() -> None:
+        """Dedicated sub-minute geopolitical poll → Discord #alerts on shock.
+
+        Runs independently of the routine (up-to-5-min) phase tick so a breaking
+        event (e.g. military strikes) is caught within ~1 minute. Reuses the
+        cached FinBERT scorer; RSS is the real-time source (NewsAPI free tier is
+        delayed/rate-limited).
+        """
+        if not settings.GEOPOLITICAL_WATCH:
+            return
+        scorer = fusion.get_sentiment_scorer()
+        if scorer is None:
+            return
+        shock = scorer.check_geopolitical()  # type: ignore[attr-defined]
+        if shock is not None:
+            logger.warning("Geopolitical poll: SHOCK → routing to Discord #alerts")
+            alert_engine.send_critical(_geo_alert_msg(shock))
 
     def eod_report() -> None:
         logger.info("EOD report job fired (16:05 ET)")
@@ -71,6 +124,17 @@ def main() -> None:
     # Register all phase jobs up front; whatever phase the market is already in
     # fires immediately (no waiting for the next scheduled transition).
     scheduler.register_default_jobs(phase_tick, on_eod=eod_report)
+    if settings.GEOPOLITICAL_WATCH:
+        # Cross-phase sub-minute poll: active whenever the market window is
+        # open (overnight through power_hour), idle only when fully closed.
+        scheduler.add_interval_job(
+            "geopolitical",
+            geopolitical_tick,
+            seconds=settings.GEOPOLITICAL_POLL_SECONDS,
+            allowed_phases={
+                "overnight", "premarket", "macro", "open", "session", "power_hour",
+            },
+        )
     scheduler.start()
     logger.info("WatcherScheduler started — running phases per market calendar")
 

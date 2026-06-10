@@ -16,14 +16,51 @@ Supported release codes (FRED series IDs):
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+from zoneinfo import ZoneInfo
 
 from config.settings import settings
-from core.exceptions import DataError, SignalError
+from core.exceptions import DataError, RateLimitError, SignalError
 from core.logger import get_logger
 from core.retry import circuit_breaker, retry
 from signals.signal_schema import Direction, Signal
+
+if TYPE_CHECKING:
+    from signals.bls_connector import BLSConnector, BLSReading
+
+_ET = ZoneInfo("America/New_York")
+
+# Non-seasonally-adjusted FRED series for the YoY-correct fallback path. The
+# reported headline/core YoY are built from NSA indices (matching the BLS NSA
+# series), NOT the SA indices used by the legacy index-level path.
+_FRED_YOY_SERIES: dict[str, str] = {
+    "CPI": "CPIAUCNS",   # CPI-U all items, NSA
+    "CORE": "CPILFENS",  # all items less food & energy, NSA
+}
+
+
+def expected_cpi_period(release_label: str) -> Optional[str]:
+    """Parse a release label → BLS period ``"YYYY-MM"``.
+
+    Accepts both ``"May 2026"`` and the already-normalised ``"2026-05"`` form
+    (the .env may carry either). Used to gate the live signal: BLS serves the
+    prior month until the 8:30 AM print, so we only score once the published
+    period reaches this value. Returns None if unparseable (gate disabled).
+    """
+    label = (release_label or "").strip()
+    for fmt in ("%B %Y", "%Y-%m", "%b %Y"):
+        try:
+            dt = datetime.strptime(label, fmt)
+            return f"{dt.year}-{dt.month:02d}"
+        except ValueError:
+            continue
+    logger.warning(
+        "CPI_RELEASE_LABEL %r not parseable as '<Month> <Year>' or 'YYYY-MM' — "
+        "release gate disabled", release_label,
+    )
+    return None
 
 logger = get_logger(__name__)
 
@@ -68,6 +105,10 @@ class MacroEngine:
 
     def __init__(self, db_path: str | None = None) -> None:
         self._db_path = db_path or settings.DB_PATH
+        # Reused BLS connector + per-series TTL cache so the 30s macro tick polls
+        # BLS at most once per BLS_CACHE_TTL_SECONDS (anonymous limit is 25/day).
+        self._bls: Optional[BLSConnector] = None  # lazily-created
+        self._bls_cache: dict[str, tuple[float, BLSReading]] = {}  # series_id → (ts, reading)
 
     @retry(
         max_attempts=settings.API_MAX_RETRIES,
@@ -248,6 +289,217 @@ class MacroEngine:
             },
         )
 
+    # ── BLS live path (CPI/CORE at release time, no FRED lag) ─────────────────
+
+    # Map our release codes to (settings series-id attr, settings consensus attr).
+    _BLS_RELEASES: dict[str, tuple[str, str]] = {
+        "CPI": ("CPI_SERIES_ID", "CPI_CONSENSUS_YOY"),
+        "CORE": ("CORE_CPI_SERIES_ID", "CORE_CPI_CONSENSUS_YOY"),
+    }
+
+    def score_release_bls(
+        self,
+        release_name: str,
+        consensus: Optional[float] = None,
+        current_year: Optional[int] = None,
+    ) -> Signal:
+        """Score a CPI release LIVE from the BLS API (YoY surprise vs consensus).
+
+        Unlike :meth:`score_release` (FRED, index-level, lagged), this reads the
+        BLS API directly — which reflects the print at 8:30 AM ET — and works in
+        YoY-percent space so it can compare against the reported consensus.
+
+        Args:
+            release_name: ``"CPI"`` or ``"CORE"``.
+            consensus: YoY-percent consensus. Defaults to the configured value.
+            current_year: Release year (defaults to the current ET year). Passed
+                in for deterministic tests.
+
+        Raises:
+            SignalError: unknown release.
+            DataError: BLS fetch/compute failed (caller may fall back to FRED).
+        """
+        release_upper = release_name.upper()
+        mapping = self._BLS_RELEASES.get(release_upper)
+        if mapping is None:
+            raise SignalError(
+                f"BLS path supports CPI/CORE only, got {release_name!r}"
+            )
+        series_attr, consensus_attr = mapping
+        series_id = getattr(settings, series_attr)
+        if consensus is None:
+            consensus = float(getattr(settings, consensus_attr))
+
+        year = current_year or datetime.now(tz=_ET).year
+        reading = self._get_bls_reading(series_id, year)
+
+        z_score = (reading.yoy_pct - consensus) / reading.yoy_std
+        direction, confidence = self._score_to_direction_confidence(
+            z_score, release_upper
+        )
+
+        logger.info(
+            "MacroEngine[BLS]: %s (%s) actual=%.2f%% consensus=%.2f%% "
+            "z=%.3f → direction=%s confidence=%d",
+            release_name, reading.period_label, reading.yoy_pct, consensus,
+            z_score, direction, confidence,
+        )
+
+        return Signal(
+            direction=direction,
+            confidence=confidence,
+            source="macro",
+            timestamp=datetime.now(tz=timezone.utc),
+            metadata={
+                "release": release_name,
+                "release_label": settings.CPI_RELEASE_LABEL,
+                "period": reading.period_label,
+                "actual_yoy": reading.yoy_pct,
+                "consensus_yoy": consensus,
+                "index_value": reading.index_value,
+                "z_score": round(z_score, 4),
+                "historical_std": reading.yoy_std,
+                "series_id": series_id,
+                "source_api": "BLS",
+            },
+        )
+
+    def _get_bls_reading(self, series_id: str, year: int) -> BLSReading:
+        """Return a BLS reading, served from a TTL cache to spare the BLS quota.
+
+        On a rate-limit (RateLimitError) we do NOT retry or hammer BLS — if a
+        cached reading exists (even stale) we serve it and wait for the next
+        tick; otherwise the throttle propagates so the caller can fall back to
+        FRED.
+        """
+        now = time.monotonic()
+        cached = self._bls_cache.get(series_id)
+        if cached is not None and (now - cached[0]) < settings.BLS_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        if self._bls is None:
+            from signals.bls_connector import BLSConnector
+            self._bls = BLSConnector()
+        try:
+            reading = self._bls.latest_yoy(series_id, year)
+        except RateLimitError:
+            if cached is not None:
+                logger.warning(
+                    "BLS rate-limited for %s — serving cached reading (age %.0fs)",
+                    series_id, now - cached[0],
+                )
+                return cached[1]
+            raise
+        self._bls_cache[series_id] = (now, reading)
+        return reading
+
+    def score_cpi_live(
+        self, release_name: str, current_year: Optional[int] = None
+    ) -> Signal:
+        """BLS-first CPI scoring with automatic FRED fallback.
+
+        Tries the live BLS YoY path; on a BLS rate-limit or any other failure,
+        falls back to the YoY-correct FRED path so the tick still produces a
+        macro signal in the SAME units (percent vs consensus), not a raw index.
+        """
+        try:
+            return self.score_release_bls(release_name, current_year=current_year)
+        except RateLimitError as exc:
+            logger.warning(
+                "MacroEngine: BLS rate-limited for %s (%s) — FRED YoY fallback",
+                release_name, exc,
+            )
+            return self._score_release_fred_yoy(release_name)
+        except (DataError, SignalError) as exc:
+            logger.warning(
+                "MacroEngine: BLS path failed for %s (%s) — FRED YoY fallback",
+                release_name, exc,
+            )
+            return self._score_release_fred_yoy(release_name)
+
+    def _score_release_fred_yoy(
+        self, release_name: str, consensus: Optional[float] = None
+    ) -> Signal:
+        """FRED fallback that computes YoY% (not a raw index level).
+
+        Bug fix: the legacy index-level path compared an index value (and a
+        get_series(limit=1) call that returns the OLDEST observation, e.g. the
+        1947 CPI of ~21.5) against a percent consensus. This path fetches the
+        NSA series, computes ``yoy = (current/year_ago - 1) * 100`` from the
+        latest 13 months, and compares to the percent consensus — identical
+        units to the BLS path.
+        """
+        release_upper = release_name.upper()
+        series_id = _FRED_YOY_SERIES.get(release_upper)
+        if series_id is None:
+            # Non-CPI release: no YoY consensus defined — use the legacy path.
+            return self.score_release(release_name)
+
+        consensus_attr = self._BLS_RELEASES[release_upper][1]
+        if consensus is None:
+            consensus = float(getattr(settings, consensus_attr))
+
+        fred = _get_fred_client()
+        try:
+            data = fred.get_series(series_id).dropna()
+        except Exception as exc:  # network/parse
+            raise DataError(f"FRED YoY fetch failed for {series_id!r}: {exc}") from exc
+        if len(data) < 13:
+            raise DataError(
+                f"FRED {series_id!r}: only {len(data)} obs — need 13 for YoY"
+            )
+
+        current = float(data.iloc[-1])
+        year_ago = float(data.iloc[-13])
+        if year_ago == 0:
+            raise DataError(f"FRED {series_id!r}: zero year-ago value")
+        yoy_pct = (current / year_ago - 1.0) * 100.0
+        period_label = data.index[-1].strftime("%Y-%m")
+
+        # Surprise sigma = std of MoM changes in the YoY rate over history.
+        yoy_hist = [
+            (float(data.iloc[i]) / float(data.iloc[i - 12]) - 1.0) * 100.0
+            for i in range(12, len(data))
+            if float(data.iloc[i - 12]) != 0
+        ]
+        std = settings.CPI_YOY_FALLBACK_STD
+        if len(yoy_hist) >= 4:
+            changes = [yoy_hist[i] - yoy_hist[i - 1] for i in range(1, len(yoy_hist))]
+            mean = sum(changes) / len(changes)
+            var = sum((c - mean) ** 2 for c in changes) / (len(changes) - 1)
+            computed = var**0.5
+            if computed > 0:
+                std = computed
+
+        z_score = (yoy_pct - consensus) / std
+        direction, confidence = self._score_to_direction_confidence(
+            z_score, release_upper
+        )
+        logger.info(
+            "MacroEngine[FRED-YoY]: %s (%s) actual=%.2f%% consensus=%.2f%% "
+            "z=%.3f → direction=%s confidence=%d",
+            release_name, period_label, yoy_pct, consensus,
+            z_score, direction, confidence,
+        )
+        return Signal(
+            direction=direction,
+            confidence=confidence,
+            source="macro",
+            timestamp=datetime.now(tz=timezone.utc),
+            metadata={
+                "release": release_name,
+                "release_label": settings.CPI_RELEASE_LABEL,
+                "period": period_label,
+                "actual_yoy": round(yoy_pct, 3),
+                "consensus_yoy": consensus,
+                "index_value": round(current, 4),
+                "z_score": round(z_score, 4),
+                "historical_std": round(std, 4),
+                "series_id": series_id,
+                "source_api": "FRED",
+            },
+        )
+
     def log_signal_to_db(self, signal: Signal) -> int:
         """Persist signal to SQLite signals table. Returns the new row id."""
         with sqlite3.connect(self._db_path) as conn:
@@ -265,4 +517,4 @@ class MacroEngine:
             return cur.lastrowid or 0
 
 
-__all__ = ["MacroEngine"]
+__all__ = ["MacroEngine", "expected_cpi_period"]

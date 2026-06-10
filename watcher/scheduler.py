@@ -106,6 +106,43 @@ class WatcherScheduler:
     def add_power_hour_job(self, fn: Callable, fire_now: bool = False) -> None:
         self._add_phase_job("power_hour", fn, fire_now)
 
+    def add_interval_job(
+        self,
+        name: str,
+        fn: Callable,
+        seconds: int,
+        allowed_phases: Optional[set[str]] = None,
+    ) -> None:
+        """Register a fixed-interval job that is NOT gated to a single phase.
+
+        Used for cross-phase monitors (e.g. the sub-minute geopolitical poll)
+        that must run continuously while the market is active rather than only
+        during one watcher window. Still skipped on non-trading days, and
+        optionally restricted to ``allowed_phases`` (e.g. everything but
+        ``closed``).
+        """
+        def wrapper() -> None:
+            if not self._calendar.is_trading_day():
+                return
+            if allowed_phases is not None:
+                if self._calendar.current_phase() not in allowed_phases:
+                    return
+            try:
+                fn()
+            except Exception as exc:
+                logger.error("Scheduler[%s]: job failed: %s", name, exc)
+        wrapper.__name__ = f"interval_{name}"
+
+        job = self._scheduler.add_job(
+            wrapper,
+            IntervalTrigger(seconds=seconds),
+            id=name,
+            replace_existing=True,
+            next_run_time=datetime.now(tz=timezone.utc),
+        )
+        self._jobs[name] = job
+        logger.info("Scheduler: %s interval job added (every %ds)", name, seconds)
+
     def add_eod_job(self, fn: Callable, hour: int = 16, minute: int = 5) -> None:
         """EOD report: once daily at 4:05 PM ET (cron — not phase-gated)."""
         from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]

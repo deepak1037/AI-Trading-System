@@ -52,6 +52,31 @@ class Settings(BaseSettings):
     MACRO_SURPRISE_MODERATE: float = 1.0
     YIELD_DELTA_THRESHOLD: float = 0.05  # 5 bps
     SENTIMENT_THRESHOLD: float = 0.3  # FinBERT score
+
+    # ── Sentiment freshness + geopolitical shock detection ────────────────────
+    # Re-fetch headlines from NewsAPI/RSS at most once per TTL; within the TTL
+    # the cached batch is re-scored (so sentiment reflects CURRENT news without
+    # hammering the API every 30s tick). 900s = 15 min.
+    SENTIMENT_CACHE_TTL_SECONDS: int = 900
+    # NewsAPI "everything" lookback window (hours) — keeps headlines current.
+    SENTIMENT_NEWS_LOOKBACK_HOURS: int = 24
+    # Geopolitical / event-shock detector. If any keyword appears in current
+    # headlines AND their sentiment is sharply negative, fire a risk-off shock.
+    GEOPOLITICAL_KEYWORDS: list[str] = Field(
+        default_factory=lambda: [
+            "war", "strikes", "strike", "military", "geopolitical", "attack",
+            "sanctions", "invasion", "missile", "airstrike", "nuclear",
+            "Iran", "China", "Taiwan", "Russia", "Ukraine", "NATO", "Israel",
+        ]
+    )
+    GEOPOLITICAL_SENTIMENT_DROP: float = -0.3  # avg score below this = sharp drop
+    # Require a CLUSTER of geopolitical headlines, not one passing mention —
+    # guards against false shocks on normal days where "China"/"war"/"strike"
+    # appear in routine economic/markets headlines.
+    GEOPOLITICAL_MIN_HEADLINES: int = 2
+    GEOPOLITICAL_SHOCK_CONFIDENCE: int = 70    # above CONFIDENCE_HIGH → alerts
+    GEOPOLITICAL_POLL_SECONDS: int = 60        # dedicated sub-minute poll cadence
+    GEOPOLITICAL_WATCH: bool = True            # master switch for the detector
     PREMARKET_FUTURES_THRESHOLD: float = -0.008  # -0.8% NQ futures
     CONFIDENCE_CRITICAL: int = 80
     CONFIDENCE_HIGH: int = 65
@@ -119,6 +144,29 @@ class Settings(BaseSettings):
     API_CIRCUIT_BREAKER_TIMEOUT: int = 300  # seconds
     POLYGON_API_KEY: str = ""
     FRED_API_KEY: str = ""
+
+    # ── BLS (Bureau of Labor Statistics) — live CPI at release time ───────────
+    # FRED lags the BLS release by 15-30 min; BLS's own API reflects the print
+    # at 8:30 AM ET. We poll it directly during the macro phase and fall back to
+    # FRED only if BLS fails. No key needed for basic access (25 queries/day
+    # unregistered); a free registration key raises the limit to 500/day.
+    BLS_API_URL: str = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+    BLS_API_KEY: str = ""  # optional registration key (higher rate limit)
+    # Headline CPI reported YoY is computed from the NON-seasonally-adjusted
+    # index (CUUR0000SA0), NOT the SA index (CUSR0000SA0). Core = ...SA0L1E.
+    CPI_SERIES_ID: str = "CUUR0000SA0"          # CPI-U, all items, NSA (YoY base)
+    CORE_CPI_SERIES_ID: str = "CUUR0000SA0L1E"  # all items less food & energy, NSA
+    # Today's analyst consensus, in YoY percent. Update each release.
+    CPI_CONSENSUS_YOY: float = 4.2
+    CORE_CPI_CONSENSUS_YOY: float = 2.9
+    CPI_RELEASE_LABEL: str = "May 2026"  # which month this consensus is for (metadata/logs)
+    # Master switch: poll BLS CPI live during the 08:15-09:30 ET macro phase.
+    MACRO_CPI_WATCH: bool = True
+    # Fallback surprise sigma (YoY percentage points) when too little BLS history.
+    CPI_YOY_FALLBACK_STD: float = 0.2
+    # Cache a BLS reading this long so the 30s macro tick polls BLS at most once
+    # per window — the anonymous BLS limit is only 25 queries/day. 300s = 5 min.
+    BLS_CACHE_TTL_SECONDS: int = 300
     NEWS_API_KEY: str = ""
     FMP_API_KEY: str = ""  # Financial Modeling Prep — Stage 3 fundamentals
     # Moomoo OpenD (local gateway) — primary Stage 3 fundamentals source.

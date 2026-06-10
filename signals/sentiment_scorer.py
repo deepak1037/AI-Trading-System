@@ -15,7 +15,9 @@ TODO: Install transformers + torch to enable FinBERT:
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from config.settings import settings
 from core.exceptions import DataError
@@ -51,7 +53,20 @@ class SentimentScorer:
 
     def __init__(self) -> None:
         self._pipeline = None
-        self._seen_hashes: set[str] = set()
+        # TTL fetch caches. This is the fix for "stale headlines": the OLD code
+        # kept a session-lifetime set of seen hashes and filtered every headline
+        # it had EVER seen, so after the first tick sentiment went permanently
+        # neutral. We now cache by TIME, not identity-forever.
+        #
+        # Two sources, two cadences:
+        #   • NewsAPI — quota-limited (free tier ~100 req/day, articles delayed),
+        #     so it is refreshed only once per SENTIMENT_CACHE_TTL_SECONDS.
+        #   • RSS (Yahoo/MarketWatch) — free + real-time, refreshed every poll so
+        #     the sub-minute geopolitical detector sees breaking news at once.
+        self._newsapi_cache: list[str] = []
+        self._newsapi_ts: Optional[float] = None
+        self._rss_cache: list[str] = []
+        self._rss_ts: Optional[float] = None
 
     def ensure_loaded(self) -> None:
         """Pre-load FinBERT now (e.g. at startup) so the first score() is fast."""
@@ -92,7 +107,13 @@ class SentimentScorer:
         recovery_timeout=settings.API_CIRCUIT_BREAKER_TIMEOUT,
     )
     def _fetch_newsapi_headlines(self, query: str = "stock market economy", n: int = 20) -> list[str]:
-        """Fetch headlines from NewsAPI."""
+        """Fetch the FRESHEST headlines from NewsAPI.
+
+        Uses ``get_everything`` sorted by ``publishedAt`` within a recent
+        lookback window so we get CURRENT news (the old ``get_top_headlines``
+        business feed updates slowly and lagged behind breaking events). Falls
+        back to top-headlines if ``get_everything`` returns nothing.
+        """
         if not settings.NEWS_API_KEY:
             # TODO: NEWS_API_KEY not configured — add to .env
             logger.warning("NEWS_API_KEY not set — skipping NewsAPI fetch")
@@ -101,9 +122,27 @@ class SentimentScorer:
             from newsapi import NewsApiClient  # type: ignore[import-untyped]
 
             client = NewsApiClient(api_key=settings.NEWS_API_KEY)
-            resp = client.get_top_headlines(language="en", category="business", page_size=n)
+            from_ts = (
+                datetime.now(tz=timezone.utc)
+                - timedelta(hours=settings.SENTIMENT_NEWS_LOOKBACK_HOURS)
+            ).strftime("%Y-%m-%dT%H:%M:%S")
+            resp = client.get_everything(
+                q=query,
+                language="en",
+                sort_by="publishedAt",  # newest first — current news
+                from_param=from_ts,
+                page_size=n,
+            )
             articles = resp.get("articles", [])
-            return [a["title"] for a in articles if a.get("title")]
+            titles = [a["title"] for a in articles if a.get("title")]
+            if not titles:
+                resp = client.get_top_headlines(
+                    language="en", category="business", page_size=n
+                )
+                titles = [
+                    a["title"] for a in resp.get("articles", []) if a.get("title")
+                ]
+            return titles
         except Exception as exc:
             raise DataError(f"NewsAPI fetch failed: {exc}") from exc
 
@@ -127,15 +166,63 @@ class SentimentScorer:
                 logger.warning("RSS fetch failed for %s: %s", url, exc)
         return headlines
 
-    def _deduplicate(self, headlines: list[str]) -> list[str]:
-        """Return only headlines not seen in this session."""
-        fresh: list[str] = []
+    def _dedup_batch(self, headlines: list[str]) -> list[str]:
+        """Drop exact duplicates WITHIN the current batch, preserving order.
+
+        Unlike the old cross-tick dedup, this does NOT remember headlines across
+        ticks — so a headline still present in the news on the next refresh is
+        re-scored, keeping sentiment aligned with the CURRENT news set.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
         for h in headlines:
-            h_hash = hashlib.md5(h.encode()).hexdigest()
-            if h_hash not in self._seen_hashes:
-                self._seen_hashes.add(h_hash)
-                fresh.append(h)
-        return fresh
+            key = hashlib.md5(h.encode()).hexdigest()
+            if key not in seen:
+                seen.add(key)
+                out.append(h)
+        return out
+
+    @staticmethod
+    def _stale(ts: Optional[float], ttl: float) -> bool:
+        """True if ``ts`` is unset or older than ``ttl`` seconds (monotonic)."""
+        return ts is None or (time.monotonic() - ts) >= ttl
+
+    def fetch_headlines(
+        self, query: str = "stock market economy", force: bool = False
+    ) -> list[str]:
+        """Return current headlines (NewsAPI TTL-gated + fresh RSS), deduped.
+
+        Args:
+            query: NewsAPI query string.
+            force: Refresh the real-time RSS source immediately (used by the
+                sub-minute geopolitical poll). NewsAPI stays TTL-gated regardless
+                — its free tier is rate-limited and delayed, so polling it every
+                minute would both exhaust the quota and add no fresh signal.
+        """
+        # NewsAPI: refresh only once per TTL (quota protection).
+        if self._stale(self._newsapi_ts, settings.SENTIMENT_CACHE_TTL_SECONDS):
+            try:
+                titles = self._fetch_newsapi_headlines(query=query)
+                if titles:
+                    self._newsapi_cache = titles
+                self._newsapi_ts = time.monotonic()
+            except DataError as exc:
+                logger.warning("NewsAPI unavailable: %s", exc)
+
+        # RSS: free + real-time. Refresh on force, else at a 60s floor so the
+        # routine tick doesn't re-parse feeds every few seconds during macro.
+        if force or self._stale(self._rss_ts, min(60, settings.SENTIMENT_CACHE_TTL_SECONDS)):
+            rss = self._fetch_rss_headlines()
+            if rss:
+                self._rss_cache = rss
+            self._rss_ts = time.monotonic()
+
+        batch = self._dedup_batch(self._newsapi_cache + self._rss_cache)
+        logger.debug(
+            "SentimentScorer: %d headlines (newsapi=%d rss=%d)",
+            len(batch), len(self._newsapi_cache), len(self._rss_cache),
+        )
+        return batch
 
     def _classify(self, headlines: list[str]) -> list[dict]:
         """Run headlines through FinBERT. Returns list of {label, score} dicts."""
@@ -156,6 +243,8 @@ class SentimentScorer:
         """Produce a Signal from a list of already-fetched headlines.
 
         Useful in tests and backtests where headlines are provided directly.
+        A geopolitical shock (keyword + sharp negative sentiment) overrides the
+        routine score with an immediate risk-off signal.
         """
         if not headlines:
             return Signal(
@@ -176,6 +265,15 @@ class SentimentScorer:
                 metadata={"headline_count": len(headlines), "reason": "classification_failed"},
             )
 
+        if settings.GEOPOLITICAL_WATCH:
+            shock = self._detect_geopolitical_shock(classified)
+            if shock is not None:
+                return self._build_shock_signal(shock, len(classified))
+
+        return self._signal_from_classified(classified)
+
+    def _signal_from_classified(self, classified: list[dict]) -> Signal:
+        """Build the routine aggregate sentiment Signal from classified headlines."""
         scores = [_sentiment_to_score(r["label"], r["score"]) for r in classified]
         avg_score = sum(scores) / len(scores)
         abs_score = abs(avg_score)
@@ -219,31 +317,111 @@ class SentimentScorer:
         )
 
     def score(self, query: str = "stock market economy") -> Signal:
-        """Fetch headlines and score them. Full live pipeline."""
-        headlines: list[str] = []
-
-        try:
-            news = self._fetch_newsapi_headlines(query=query)
-            headlines.extend(news)
-        except DataError as exc:
-            logger.warning("NewsAPI unavailable: %s", exc)
-
-        rss = self._fetch_rss_headlines()
-        headlines.extend(rss)
-
-        fresh = self._deduplicate(headlines)
-        logger.debug("SentimentScorer: %d total, %d fresh headlines", len(headlines), len(fresh))
-
-        if not fresh:
+        """Fetch current headlines (TTL-cached) and score them. Full live pipeline."""
+        headlines = self.fetch_headlines(query=query)
+        if not headlines:
             return Signal(
                 direction="neutral",
                 confidence=20,
                 source="sentiment",
                 timestamp=datetime.now(tz=timezone.utc),
-                metadata={"reason": "no_fresh_headlines"},
+                metadata={"reason": "no_headlines"},
             )
+        return self.score_headlines(headlines)
 
-        return self.score_headlines(fresh)
+    # ── Geopolitical / event-shock detection ──────────────────────────────────
+
+    def _matched_keywords(self, text: str) -> list[str]:
+        """Return configured geopolitical keywords present in ``text`` (case-insensitive)."""
+        lower = text.lower()
+        return [kw for kw in settings.GEOPOLITICAL_KEYWORDS if kw.lower() in lower]
+
+    def _detect_geopolitical_shock(self, classified: list[dict]) -> Optional[dict]:
+        """Detect a geopolitical risk-off shock from classified headlines.
+
+        Fires when one or more headlines contain a geopolitical keyword AND the
+        sentiment of those matched headlines is sharply negative
+        (avg < GEOPOLITICAL_SENTIMENT_DROP). Returns a dict of evidence, or None.
+        """
+        matched: list[dict] = []
+        keywords: set[str] = set()
+        for r in classified:
+            hits = self._matched_keywords(r["text"])
+            if hits:
+                matched.append(r)
+                keywords.update(hits)
+        if not matched:
+            return None
+
+        # Require a cluster of geopolitical headlines — a single passing mention
+        # of "China"/"war"/"strike" in routine economic news is not a shock.
+        if len(matched) < settings.GEOPOLITICAL_MIN_HEADLINES:
+            return None
+
+        matched_scores = [_sentiment_to_score(r["label"], r["score"]) for r in matched]
+        matched_avg = sum(matched_scores) / len(matched_scores)
+        # Fire only when the geopolitical coverage is, ON BALANCE, sharply
+        # negative. Averaging (not worst-case) is deliberate: it rejects normal
+        # days where one negative headline sits among mostly neutral/positive
+        # geo mentions (which previously caused false shocks).
+        if matched_avg >= settings.GEOPOLITICAL_SENTIMENT_DROP:
+            return None
+
+        return {
+            "matched_avg": round(matched_avg, 4),
+            "worst_score": round(min(matched_scores), 4),
+            "keywords": sorted(keywords),
+            "headlines": [r["text"] for r in matched[:5]],
+            "matched_count": len(matched),
+        }
+
+    def _build_shock_signal(self, shock: dict, headline_count: int) -> Signal:
+        """Build the GEOPOLITICAL_SHOCK risk-off Signal (direction=short)."""
+        logger.warning(
+            "GEOPOLITICAL_SHOCK detected — keywords=%s matched_avg=%.3f "
+            "(%d/%d headlines): %s",
+            shock["keywords"], shock["matched_avg"], shock["matched_count"],
+            headline_count, shock["headlines"][:2],
+        )
+        return Signal(
+            direction="short",
+            confidence=settings.GEOPOLITICAL_SHOCK_CONFIDENCE,
+            source="sentiment",
+            timestamp=datetime.now(tz=timezone.utc),
+            metadata={
+                "event": "GEOPOLITICAL_SHOCK",
+                "geopolitical_shock": True,
+                "keywords": shock["keywords"],
+                "matched_avg": shock["matched_avg"],
+                "matched_count": shock["matched_count"],
+                "headline_count": headline_count,
+                "sample_headlines": shock["headlines"],
+            },
+        )
+
+    def check_geopolitical(self, query: str = "stock market economy") -> Optional[Signal]:
+        """Force-fetch current headlines and return a shock Signal, or None.
+
+        Used by the dedicated sub-minute poll: ``force=True`` bypasses the TTL so
+        breaking news isn't masked by a still-warm cache. Never raises — returns
+        None on any failure so the poll loop is safe.
+        """
+        if not settings.GEOPOLITICAL_WATCH:
+            return None
+        try:
+            headlines = self.fetch_headlines(query=query, force=True)
+            if not headlines:
+                return None
+            classified = self._classify(headlines)
+            if not classified:
+                return None
+            shock = self._detect_geopolitical_shock(classified)
+            if shock is None:
+                return None
+            return self._build_shock_signal(shock, len(classified))
+        except Exception as exc:  # poll must never crash the scheduler
+            logger.warning("check_geopolitical failed: %s", exc)
+            return None
 
 
 class MockSentimentScorer(SentimentScorer):

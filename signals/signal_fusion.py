@@ -58,6 +58,8 @@ class SignalFusion:
     # 7:00–8:15 (premarket) + 8:15–9:30 (macro) = pre-open. Skipped once the
     # market opens (session/power_hour) since intraday prices supersede futures.
     _PREMARKET_PHASES = frozenset({"premarket", "macro"})
+    # CPI/NFP prints land at 8:30 AM ET — inside the macro phase (08:15-09:30).
+    _MACRO_PHASES = frozenset({"macro"})
 
     def _ensure_sentiment(self) -> Optional[object]:
         """Return a cached SentimentScorer, or None when sentiment is unavailable.
@@ -200,7 +202,8 @@ class SignalFusion:
           loaded once and cached.
         - Pre-market futures/crypto: polled only in the pre-open phases
           (``premarket``/``macro``); skipped during the session (stale).
-        - Macro (NFP/CPI): event-driven, fired on release — not polled here.
+        - Macro (CPI): polled LIVE via BLS during the macro phase only
+          (08:15-09:30 ET), so the 8:30 print is caught without FRED's lag.
         """
         signals: list[Signal] = []
 
@@ -248,8 +251,59 @@ class SignalFusion:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("collect_signals: premarket failed: %s", exc)
 
+        # ── Macro CPI (LIVE via BLS, only during the 08:15-09:30 macro phase) ──
+        # FRED lags the print 15-30 min; the BLS API reflects it at 8:30 AM ET.
+        # We score CPI + Core each macro tick and feed the STRONGER (by
+        # confidence) into fusion as the single "macro" source — appending both
+        # would double-count WEIGHT_MACRO. Fully guarded: a BLS/FRED failure
+        # never aborts the tick.
+        if phase in self._MACRO_PHASES and settings.MACRO_CPI_WATCH:
+            macro_sig = self._collect_macro_cpi()
+            if macro_sig is not None:
+                signals.append(macro_sig)
+
         logger.debug("collect_signals: gathered %d signal(s)", len(signals))
         return signals
+
+    def _collect_macro_cpi(self) -> Optional[Signal]:
+        """Score CPI + Core live (BLS→FRED fallback); return the stronger signal.
+
+        Release gate: the configured consensus is for ONE specific month
+        (``CPI_RELEASE_LABEL``). Before the 8:30 print, BLS still serves the
+        *prior* month, so scoring it against this month's consensus would emit a
+        bogus signal. We therefore drop any candidate whose published period is
+        older than the expected release month — no macro signal fires until the
+        new number is actually out.
+        """
+        try:
+            from signals.macro_engine import MacroEngine, expected_cpi_period
+            engine = self._sources.get("macro")
+            if engine is None:
+                engine = MacroEngine()
+                self._sources["macro"] = engine
+            expected = expected_cpi_period(settings.CPI_RELEASE_LABEL)
+            candidates: list[Signal] = []
+            for release in ("CPI", "CORE"):
+                try:
+                    sig = engine.score_cpi_live(release)  # type: ignore[attr-defined]
+                except Exception as exc:  # noqa: BLE001 — one release failing isn't fatal
+                    logger.debug("collect_signals: macro %s failed: %s", release, exc)
+                    continue
+                period = sig.metadata.get("period")
+                if expected and period and period < expected:
+                    logger.debug(
+                        "collect_signals: macro %s — %s not yet published "
+                        "(latest=%s); skipping until release",
+                        release, expected, period,
+                    )
+                    continue
+                candidates.append(sig)
+            if not candidates:
+                return None
+            return max(candidates, key=lambda s: s.confidence)
+        except Exception as exc:  # noqa: BLE001 — macro must never crash the tick
+            logger.debug("collect_signals: macro failed: %s", exc)
+            return None
 
     def compute(self, benchmark: str = "SPY", phase: Optional[str] = None) -> MarketState:
         """Collect signals from available sources and fuse them into a MarketState.
@@ -258,6 +312,15 @@ class SignalFusion:
         ``SignalFusion().compute(phase=phase)``.
         """
         return self.fuse(self.collect_signals(benchmark, phase=phase))
+
+    def get_sentiment_scorer(self) -> Optional[object]:
+        """Return the cached SentimentScorer (loading FinBERT once), or None.
+
+        Lets the dedicated geopolitical poll reuse the SAME scorer instance the
+        routine tick uses — so FinBERT is loaded once and the NewsAPI TTL cache
+        is shared, rather than spinning up a second heavyweight model.
+        """
+        return self._ensure_sentiment()
 
     @property
     def current_state(self) -> Optional[MarketState]:

@@ -100,6 +100,18 @@ class SignalError(TradingSystemError):
     default_severity: Severity = "MEDIUM"
 
 
+class RateLimitError(TradingSystemError):
+    """Raised when an external API throttles us (e.g. BLS HTTP 429).
+
+    Deliberately NOT a ``DataError`` subclass: the BLS fetch wraps ``@retry`` and
+    ``@circuit_breaker`` on ``DataError``, and a throttle must neither be retried
+    (that just digs the hole deeper) nor trip the breaker. The caller waits for
+    the next tick and serves the cached reading instead.
+    """
+
+    default_severity: Severity = "LOW"
+
+
 class RiskError(TradingSystemError):
     """Raised when a risk limit is breached.
 
@@ -118,5 +130,6 @@ __all__ = [
     "OrderRejected",
     "DataError",
     "SignalError",
+    "RateLimitError",
     "RiskError",
 ]

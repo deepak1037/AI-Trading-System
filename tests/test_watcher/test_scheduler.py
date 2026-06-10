@@ -31,6 +31,40 @@ class TestWatcherScheduler:
         scheduler.add_overnight_job(fn)
         assert "overnight" in scheduler.get_jobs()
 
+    def test_add_interval_job_registers(self, scheduler):
+        scheduler.add_interval_job("geopolitical", MagicMock(), seconds=60)
+        assert "geopolitical" in scheduler.get_jobs()
+
+    def test_interval_job_runs_when_phase_allowed(self):
+        cal = MagicMock()
+        cal.is_trading_day.return_value = True
+        cal.current_phase.return_value = "session"
+        sched = WatcherScheduler(calendar=cal)
+        fn = MagicMock()
+        sched.add_interval_job("geo", fn, seconds=60, allowed_phases={"session"})
+        # Invoke the registered wrapper directly (no need to wait for the trigger).
+        sched._jobs["geo"].func()
+        fn.assert_called_once()
+
+    def test_interval_job_skips_disallowed_phase(self):
+        cal = MagicMock()
+        cal.is_trading_day.return_value = True
+        cal.current_phase.return_value = "closed"
+        sched = WatcherScheduler(calendar=cal)
+        fn = MagicMock()
+        sched.add_interval_job("geo", fn, seconds=60, allowed_phases={"session"})
+        sched._jobs["geo"].func()
+        fn.assert_not_called()
+
+    def test_interval_job_skips_non_trading_day(self):
+        cal = MagicMock()
+        cal.is_trading_day.return_value = False
+        sched = WatcherScheduler(calendar=cal)
+        fn = MagicMock()
+        sched.add_interval_job("geo", fn, seconds=60)
+        sched._jobs["geo"].func()
+        fn.assert_not_called()
+
     def test_add_all_phases(self, scheduler):
         for method in [
             scheduler.add_overnight_job,
