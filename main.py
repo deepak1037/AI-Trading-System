@@ -71,6 +71,20 @@ def main() -> None:
     alert_engine = AlertEngine()
     fusion.warmup()  # pre-load FinBERT once at startup (if NEWS_API_KEY set)
 
+    # Phase 2b: real-time presidential monitor (Truth Social). Runs in its own
+    # daemon thread on the fastest available source (WebSocket/REST/RSS), 24/7
+    # incl. weekends. Replaces the RSS presidential poll in event_tick below.
+    presidential_monitor = None
+    if settings.PRESIDENTIAL_WATCH:
+        from signals.presidential_monitor import RealTimePresidentialMonitor
+
+        presidential_monitor = RealTimePresidentialMonitor(alert_engine)
+        presidential_monitor.start()
+        logger.info(
+            "Presidential monitor active | source=%s",
+            presidential_monitor.active_source,
+        )
+
     def phase_tick(phase: str) -> None:
         """Run one watcher tick for the active market phase: compute + route."""
         logger.info(
@@ -100,23 +114,22 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 — a tick must never crash the loop
             logger.error("Signal computation failed: %s", exc)
 
-    def geopolitical_tick() -> None:
-        """Dedicated sub-minute geopolitical poll → Discord #alerts on shock.
+    def event_tick() -> None:
+        """Dedicated sub-minute poll → Discord #alerts on breaking events.
 
         Runs independently of the routine (up-to-5-min) phase tick so a breaking
-        event (e.g. military strikes) is caught within ~1 minute. Reuses the
-        cached FinBERT scorer; RSS is the real-time source (NewsAPI free tier is
-        delayed/rate-limited).
+        event is caught within ~1 minute. Detects a geopolitical shock (RSS
+        headlines + FinBERT). Presidential posts are handled separately by the
+        real-time RealTimePresidentialMonitor thread (Phase 2b), not here.
         """
-        if not settings.GEOPOLITICAL_WATCH:
-            return
-        scorer = fusion.get_sentiment_scorer()
-        if scorer is None:
-            return
-        shock = scorer.check_geopolitical()  # type: ignore[attr-defined]
-        if shock is not None:
-            logger.warning("Geopolitical poll: SHOCK → routing to Discord #alerts")
-            alert_engine.send_critical(_geo_alert_msg(shock))
+        # Geopolitical (needs FinBERT-loaded scorer).
+        if settings.GEOPOLITICAL_WATCH:
+            scorer = fusion.get_sentiment_scorer()
+            if scorer is not None:
+                shock = scorer.check_geopolitical()  # type: ignore[attr-defined]
+                if shock is not None:
+                    logger.warning("Event poll: GEOPOLITICAL SHOCK → Discord #alerts")
+                    alert_engine.send_critical(_geo_alert_msg(shock))
 
     def eod_report() -> None:
         logger.info("EOD report job fired (16:05 ET)")
@@ -128,8 +141,8 @@ def main() -> None:
         # Cross-phase sub-minute poll: active whenever the market window is
         # open (overnight through power_hour), idle only when fully closed.
         scheduler.add_interval_job(
-            "geopolitical",
-            geopolitical_tick,
+            "event_poll",
+            event_tick,
             seconds=settings.GEOPOLITICAL_POLL_SECONDS,
             allowed_phases={
                 "overnight", "premarket", "macro", "open", "session", "power_hour",
@@ -147,6 +160,8 @@ def main() -> None:
         logger.info("Shutdown requested — stopping scheduler and watcher.")
         scheduler.stop()
         watcher.stop()
+        if presidential_monitor is not None:
+            presidential_monitor.stop()
         logger.info("Clean shutdown complete.")
 
 

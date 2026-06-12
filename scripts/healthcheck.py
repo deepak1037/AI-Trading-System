@@ -345,6 +345,16 @@ def _check_alerts():
     from config.settings import settings
     AlertEngine()  # must not raise
     channels = []
+    # Discord — primary channel. Matches AlertEngine gating: DISCORD_ENABLED
+    # plus at least one configured webhook (any of alerts/signals/opps/briefing).
+    discord_webhooks = [
+        settings.DISCORD_WEBHOOK_ALERTS,
+        settings.DISCORD_WEBHOOK_SIGNALS,
+        settings.DISCORD_WEBHOOK_OPPORTUNITIES,
+        getattr(settings, "DISCORD_WEBHOOK_BRIEFING", ""),
+    ]
+    if settings.DISCORD_ENABLED and any(discord_webhooks):
+        channels.append("discord ✅")
     if all([settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN,
             settings.TWILIO_FROM_NUMBER, settings.TWILIO_TO_NUMBER]):
         channels.append("twilio")
@@ -397,6 +407,24 @@ def _check_trading_engine():
     n = len(engine._strategies)
     names = [s.strategy_name for s in engine._strategies]
     return f"{n} strategies: {', '.join(names) or settings.ENABLED_STRATEGIES}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 25. Presidential monitor (Phase 2b)
+# ─────────────────────────────────────────────────────────────────────────────
+@check("Presidential monitor — real-time source")
+def _check_presidential_monitor():
+    from config.settings import settings
+    from signals.presidential_monitor import RealTimePresidentialMonitor
+    monitor = RealTimePresidentialMonitor(alert_engine=None)
+    source = monitor.detect_active_source()
+    if source == "tweetstream":
+        return f"source={source} (WebSocket ⚡)"
+    if source == "scrapecreators":
+        return f"source={source} (polling {settings.SCRAPECREATORS_POLL_SECONDS}s)"
+    if source == "apify":
+        return f"source={source} (polling {settings.SCRAPECREATORS_POLL_SECONDS}s)"
+    return f"source={source} (RSS fallback — consider an API key)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

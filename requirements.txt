@@ -36,6 +36,9 @@ transformers==4.46.3   # 4.x supports torch>=2.0; transformers 5.x requires torc
 # and Apple-Silicon; on Intel Mac it degrades gracefully (logged, non-fatal).
 torch==2.5.1; sys_platform != "darwin" or platform_machine != "x86_64"
 torch==2.2.2; sys_platform == "darwin" and platform_machine == "x86_64"
+feedparser==6.0.12     # RSS: geopolitical headlines + Truth Social (trumpstruth.org)
+websocket-client==1.8.0  # Phase 2b: TweetStream WebSocket (real-time presidential)
+httpx==0.28.1            # Phase 2b: ScrapeCreators / Apify REST polling
 
 # ── LLM (Claude) — options ROI analysis ───────────────────
 # >=0.40 required: 0.39 passes the removed `proxies` kwarg to httpx>=0.28.

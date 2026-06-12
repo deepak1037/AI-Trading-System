@@ -187,6 +187,24 @@ CREATE TABLE IF NOT EXISTS exit_reviews (
     executed      INTEGER DEFAULT 0,
     created_at    TEXT    DEFAULT (datetime('now'))
 );
+
+-- Phase 2b: real-time presidential (Truth Social) post detections.
+CREATE TABLE IF NOT EXISTS presidential_signals (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id               TEXT    UNIQUE NOT NULL,
+    post_text             TEXT    NOT NULL,
+    post_url              TEXT,
+    source                TEXT    NOT NULL,
+    -- tweetstream | scrapecreators | apify | rss
+    direction             TEXT    NOT NULL,
+    -- long | short
+    confidence            INTEGER,
+    keywords              TEXT,   -- JSON list
+    suggested_instruments TEXT,   -- JSON list
+    alerted               INTEGER DEFAULT 1,
+    market_reaction_pct   REAL,   -- backfilled later: how far did the market move?
+    created_at            TEXT    DEFAULT (datetime('now'))
+);
 """
 
 # Phase 2 columns added to an already-existing positions table. Applied by
@@ -219,6 +237,7 @@ _EXPECTED_TABLES = frozenset(
         "bucket_performance",
         "wheel_cycles",
         "exit_reviews",
+        "presidential_signals",
     }
 )
 

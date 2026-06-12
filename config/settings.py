@@ -115,6 +115,52 @@ class Settings(BaseSettings):
             "pulled back",
         ]
     )
+
+    # ── Phase 2b: real-time presidential monitoring (multi-source) ────────────
+    # Upgrade Truth Social detection from 60s RSS polling to near-real-time. The
+    # monitor tries sources in PRESIDENTIAL_SOURCE_PRIORITY order and uses the
+    # first that connects; with no API key it degrades gracefully to RSS.
+    PRESIDENTIAL_TRUMP_USER_ID: str = "107780257626128497"  # Truth Social user id
+
+    # Source A: ScrapeCreators REST API (fast polling). Free tier: 100 credits;
+    # each poll = 1 credit (10s polling ≈ 8,640/day → needs a paid plan to run
+    # sustained). Leave blank to skip.
+    SCRAPECREATORS_API_KEY: str = ""
+    SCRAPECREATORS_POLL_SECONDS: int = 10
+
+    # Source B: TweetStream WebSocket (true real-time push).
+    TWEETSTREAM_API_KEY: str = ""
+    TWEETSTREAM_WS_URL: str = "wss://api.tweetstream.io/v1/stream"
+
+    # Source C: Apify actor (REST with webhook support).
+    APIFY_API_KEY: str = ""
+    APIFY_ACTOR_ID: str = "muhammetakkurtt/truth-social-scraper"
+
+    # Source priority — the monitor tries these in order, first to connect wins.
+    PRESIDENTIAL_SOURCE_PRIORITY: list[str] = Field(
+        default_factory=lambda: ["scrapecreators", "tweetstream", "apify", "rss"]
+    )
+    # Don't re-alert the same post within this window.
+    PRESIDENTIAL_DEDUP_MINUTES: int = 60
+    # Market-direction keyword sets for the real-time monitor's classifier.
+    # Longest match wins (so "tariff reduction"/"cancelled strikes" read LONG).
+    PRESIDENTIAL_MARKET_KEYWORDS_LONG: list[str] = Field(
+        default_factory=lambda: [
+            "deal", "agreement", "peace", "cancelled strikes",
+            "ceasefire", "tariff reduction", "trade deal",
+            "signing", "lifted sanctions", "no tariff",
+            "extension", "pause tariffs", "market open",
+        ]
+    )
+    PRESIDENTIAL_MARKET_KEYWORDS_SHORT: list[str] = Field(
+        default_factory=lambda: [
+            "tariff", "sanction", "strike", "attack",
+            "invasion", "blockade", "no deal", "terminated",
+            "maximum pressure", "military action",
+            "deploying troops", "war", "bombs",
+        ]
+    )
+
     PREMARKET_FUTURES_THRESHOLD: float = -0.008  # -0.8% NQ futures
     CONFIDENCE_CRITICAL: int = 80
     CONFIDENCE_HIGH: int = 65

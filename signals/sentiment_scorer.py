@@ -15,6 +15,7 @@ TODO: Install transformers + torch to enable FinBERT:
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -32,6 +33,21 @@ _RSS_FEEDS = [
     "https://feeds.finance.yahoo.com/rss/2.0/headline",
     "https://www.marketwatch.com/rss/topstories",
 ]
+# Browser UA — several feeds (Yahoo, Cloudflare-fronted trumpstruth) return 429
+# or block feedparser's default agent.
+_FEED_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
+def _strip_html(raw: str) -> str:
+    """Reduce an RSS HTML body to plain text (tags removed, entities decoded)."""
+    import html as _html
+
+    text = re.sub(r"<[^>]+>", " ", raw or "")
+    text = _html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _sentiment_to_score(label: str, prob: float) -> float:
@@ -67,6 +83,9 @@ class SentimentScorer:
         self._newsapi_ts: Optional[float] = None
         self._rss_cache: list[str] = []
         self._rss_ts: Optional[float] = None
+        # Presidential (Truth Social) post cache, refreshed on the 60s poll.
+        self._pres_cache: list[dict] = []
+        self._pres_ts: Optional[float] = None
 
     def ensure_loaded(self) -> None:
         """Pre-load FinBERT now (e.g. at startup) so the first score() is fast."""
@@ -157,7 +176,7 @@ class SentimentScorer:
 
         for url in _RSS_FEEDS:
             try:
-                feed = feedparser.parse(url)
+                feed = feedparser.parse(url, agent=_FEED_UA)
                 for entry in feed.entries[:n_per_feed]:
                     title = getattr(entry, "title", None)
                     if title:
@@ -422,6 +441,147 @@ class SentimentScorer:
         except Exception as exc:  # poll must never crash the scheduler
             logger.warning("check_geopolitical failed: %s", exc)
             return None
+
+    # ── Presidential / Truth Social monitoring ────────────────────────────────
+
+    def _fetch_presidential_posts(self, force: bool = False) -> list[dict]:
+        """Fetch recent presidential posts (text, link, published) from the feeds.
+
+        TTL-cached on the same cadence as RSS. Truth Social's own .rss is dead
+        (serves the SPA), so PRESIDENTIAL_RSS_URLS points at trumpstruth.org,
+        which republishes his posts as valid RSS.
+        """
+        if not force and not self._stale(
+            self._pres_ts, min(60, settings.SENTIMENT_CACHE_TTL_SECONDS)
+        ):
+            return self._pres_cache
+        try:
+            import feedparser
+        except ImportError:
+            logger.warning("feedparser not installed — presidential feed disabled")
+            return self._pres_cache
+
+        posts: list[dict] = []
+        for url in settings.PRESIDENTIAL_RSS_URLS:
+            try:
+                feed = feedparser.parse(url, agent=_FEED_UA)
+                for entry in feed.entries:
+                    raw = entry.get("summary") or entry.get("title") or ""
+                    text = _strip_html(raw)
+                    if not text:
+                        continue
+                    published = None
+                    pp = entry.get("published_parsed")
+                    if pp is not None:
+                        # struct_time is UTC for RSS pubDate.
+                        published = datetime(
+                            pp.tm_year, pp.tm_mon, pp.tm_mday,
+                            pp.tm_hour, pp.tm_min, pp.tm_sec,
+                            tzinfo=timezone.utc,
+                        )
+                    posts.append(
+                        {"text": text, "link": entry.get("link"), "published": published}
+                    )
+            except Exception as exc:
+                logger.warning("Presidential feed fetch failed for %s: %s", url, exc)
+        if posts:
+            self._pres_cache = posts
+            self._pres_ts = time.monotonic()
+        return self._pres_cache
+
+    def _classify_presidential(self, text: str) -> tuple[Direction, dict]:
+        """Direction from market keywords, handling de-escalation negation.
+
+        Multi-word phrases win over substrings (so "no deal" beats "deal" and
+        "tariff reduction" beats "tariffs"); a negative keyword preceded by a
+        negation word ("cancelled strikes") flips bullish. Returns the direction
+        and the matched-keyword evidence.
+        """
+        t = text.lower()
+        matches: list[tuple[int, int, str, str]] = []  # (start, end, polarity, kw)
+        for kw in settings.PRESIDENTIAL_POSITIVE_KEYWORDS:
+            for m in re.finditer(r"\b" + re.escape(kw.lower()) + r"\b", t):
+                matches.append((m.start(), m.end(), "pos", kw))
+        for kw in settings.PRESIDENTIAL_NEGATIVE_KEYWORDS:
+            for m in re.finditer(r"\b" + re.escape(kw.lower()) + r"\b", t):
+                matches.append((m.start(), m.end(), "neg", kw))
+
+        # Greedy longest-first, non-overlapping (resolves "no deal" vs "deal").
+        matches.sort(key=lambda c: c[1] - c[0], reverse=True)
+        used: list[tuple[int, int]] = []
+        negators = [w.lower() for w in settings.PRESIDENTIAL_NEGATION_WORDS]
+        positive: list[str] = []
+        negative: list[str] = []
+        for start, end, pol, kw in matches:
+            if any(not (end <= us or start >= ue) for us, ue in used):
+                continue
+            used.append((start, end))
+            if pol == "neg":
+                window = t[max(0, start - 30):start]
+                if any(n in window for n in negators):
+                    positive.append(f"(de-escalation) {kw}")  # bullish
+                else:
+                    negative.append(kw)
+            else:
+                positive.append(kw)
+
+        if len(positive) > len(negative):
+            direction: Direction = "long"
+        elif len(negative) > len(positive):
+            direction = "short"
+        else:
+            direction = "neutral"  # tie or no signal — still a heads-up if matched
+        return direction, {"positive": positive, "negative": negative}
+
+    def check_presidential(self, now: Optional[datetime] = None) -> list[Signal]:
+        """Return PRESIDENTIAL_STATEMENT signals for FRESH market-relevant posts.
+
+        Fires on a market-keyword match REGARDLESS of FinBERT sentiment (a
+        presidential post is itself the event). Only posts published within
+        PRESIDENTIAL_FRESH_MINUTES are considered, so a backlog isn't replayed.
+        Never raises — returns [] on any failure (poll-safe).
+        """
+        if not settings.PRESIDENTIAL_WATCH:
+            return []
+        try:
+            posts = self._fetch_presidential_posts(force=True)
+        except Exception as exc:  # poll must never crash the scheduler
+            logger.warning("check_presidential failed: %s", exc)
+            return []
+
+        now = now or datetime.now(tz=timezone.utc)
+        cutoff = now - timedelta(minutes=settings.PRESIDENTIAL_FRESH_MINUTES)
+        signals: list[Signal] = []
+        for post in posts:
+            published = post.get("published")
+            if published is not None and published < cutoff:
+                continue  # stale — react to breaking posts only
+            direction, evidence = self._classify_presidential(post["text"])
+            if not evidence["positive"] and not evidence["negative"]:
+                continue  # no market keywords — ignore
+            logger.warning(
+                "PRESIDENTIAL_STATEMENT — %s (pos=%s neg=%s): %s",
+                direction, evidence["positive"], evidence["negative"],
+                post["text"][:120],
+            )
+            signals.append(
+                Signal(
+                    direction=direction,
+                    confidence=settings.PRESIDENTIAL_SHOCK_CONFIDENCE,
+                    source="sentiment",
+                    timestamp=now,
+                    metadata={
+                        "event": "PRESIDENTIAL_STATEMENT",
+                        "presidential": True,
+                        "post_text": post["text"][:500],
+                        "link": post.get("link"),
+                        "published": published.isoformat() if published else None,
+                        "positive_keywords": evidence["positive"],
+                        "negative_keywords": evidence["negative"],
+                    },
+                )
+            )
+        return signals
 
 
 class MockSentimentScorer(SentimentScorer):
