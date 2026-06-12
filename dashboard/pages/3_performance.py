@@ -17,7 +17,7 @@ st.set_page_config(page_title="Performance", layout="wide")
 st.title("Performance")
 
 
-def _load_account_state(account_id: str) -> "dict | None":
+def _load_account_state(account_id: str) -> dict | None:
     import json
 
     path = Path(settings.PAPER_ACCOUNTS_DIR) / f"{account_id}.json"

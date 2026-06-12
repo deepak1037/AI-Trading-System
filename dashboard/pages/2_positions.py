@@ -7,10 +7,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from datetime import UTC
+
 import pandas as pd
 import streamlit as st
 
 from config.settings import settings
+from dashboard.bucket_badges import (
+    bucket_badge,
+    dte_progress_bar,
+    recoverable_badge,
+    thesis_label,
+)
 
 st.set_page_config(page_title="Positions", layout="wide")
 st.title("Open Positions")
@@ -19,7 +27,7 @@ st.title("Open Positions")
 # ── Source selector ───────────────────────────────────────────────────────────
 
 live_label = f"{settings.BROKER}_live"
-sources = [live_label] + list(settings.PAPER_ACCOUNTS)
+sources = [live_label, *settings.PAPER_ACCOUNTS]
 
 source = st.selectbox("Account", sources)
 
@@ -38,17 +46,17 @@ def _load_paper_positions(account_id: str) -> list[dict]:
 
 
 def _db_meta_from_db() -> dict[str, dict]:
-    """Return {ticker: {strategy, stop_loss, take_profit}} for open positions in SQLite."""
+    """Return {ticker: {strategy, stop_loss, take_profit, bucket, ...}} for open positions."""
     import sqlite3
     try:
         with sqlite3.connect(settings.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT ticker, strategy, stop_loss, take_profit FROM positions WHERE is_open=1"
+                "SELECT ticker, strategy, stop_loss, take_profit, bucket, sub_type, "
+                "recoverable, thesis_status, thesis_completion_pct, exit_recommendation "
+                "FROM positions WHERE is_open=1"
             ).fetchall()
-        return {
-            row[0]: {"strategy": row[1], "stop_loss": row[2], "take_profit": row[3]}
-            for row in rows
-        }
+        return {row["ticker"]: dict(row) for row in rows}
     except Exception:
         return {}
 
@@ -110,6 +118,7 @@ if not positions:
 
 # ── Build display table ───────────────────────────────────────────────────────
 
+_db_meta = _db_meta_from_db()
 rows = []
 for pos in positions:
     ticker = pos.get("ticker", "")
@@ -117,6 +126,7 @@ for pos in positions:
     entry = pos.get("entry_price", 0)
     pos_type = pos.get("position_type", "")
     multiplier = 100 if "option" in pos_type else 1
+    meta = _db_meta.get(ticker, {})
 
     if source == live_label:
         # Broker supplies current_price (per-share) and unrealized_pnl directly.
@@ -132,8 +142,11 @@ for pos in positions:
     cost_basis = abs(entry * qty * multiplier)
     pnl_pct = unrealized_pnl / cost_basis * 100 if cost_basis else 0.0
 
+    bucket = meta.get("bucket")
     rows.append({
         "Ticker": ticker,
+        "Bucket": bucket_badge(bucket, meta.get("sub_type")) if bucket else "—",
+        "Risk": recoverable_badge(meta.get("recoverable")) if bucket else "—",
         "Strategy": pos.get("strategy", "—"),
         "Type": pos.get("position_type", "—"),
         "Qty": qty,
@@ -141,6 +154,11 @@ for pos in positions:
         "Live Price": f"${live_price:.2f}",
         "Unrealized P&L": f"${unrealized_pnl:+,.2f}",
         "P&L %": f"{pnl_pct:+.2f}%",
+        "DTE": dte_progress_bar(pos.get("dte_remaining"), pos.get("original_dte"))
+        if pos.get("dte_remaining") is not None else "—",
+        "Thesis": thesis_label(meta.get("thesis_status"), meta.get("thesis_completion_pct"))
+        if bucket else "—",
+        "Exit Rec": meta.get("exit_recommendation") or "—",
         "Stop Loss": f"${pos['stop_loss']:.2f}" if pos.get("stop_loss") else "—",
         "Take Profit": f"${pos['take_profit']:.2f}" if pos.get("take_profit") else "—",
         "Entry Date": pos.get("entry_date", ""),
@@ -229,7 +247,7 @@ if tickers:
                     )
                 else:
                     # Broker position not yet tracked in SQLite — create stub row
-                    from datetime import datetime, timezone
+                    from datetime import datetime
                     conn.execute(
                         """INSERT INTO positions
                            (account_id, ticker, strategy, position_type, qty,
@@ -244,7 +262,7 @@ if tickers:
                             current_pos.get("entry_price", 0.0),
                             sl_val,
                             tp_val,
-                            datetime.now(tz=timezone.utc).isoformat(),
+                            datetime.now(tz=UTC).isoformat(),
                         ),
                     )
             sl_str = f"${sl_val:.2f}" if sl_val else "cleared"

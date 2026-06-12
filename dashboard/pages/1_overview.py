@@ -17,7 +17,7 @@ st.set_page_config(page_title="Overview", layout="wide")
 st.title("Overview")
 
 
-def _load_account_state(account_id: str) -> "dict | None":
+def _load_account_state(account_id: str) -> dict | None:
     import json
     from pathlib import Path
 
@@ -78,12 +78,12 @@ if state and state.get("daily_equity_history"):
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=df_eq.index, y=df_eq["equity"],
-            mode="lines", name=account_id, line=dict(color="blue"),
+            mode="lines", name=account_id, line={"color": "blue"},
         ))
         fig.add_trace(go.Scatter(
             x=spy_norm.index, y=spy_norm.values,
             mode="lines", name=settings.DASHBOARD_BENCHMARK_TICKER,
-            line=dict(color="orange", dash="dash"),
+            line={"color": "orange", "dash": "dash"},
         ))
         fig.update_layout(
             title="Portfolio Equity vs SPY",
@@ -97,6 +97,44 @@ if state and state.get("daily_equity_history"):
         st.line_chart(df_eq["equity"])
 else:
     st.info("No equity history yet. Start paper trading to see the equity curve.")
+
+
+# ── Three-bucket summary (Phase 2) ────────────────────────────────────────────
+st.divider()
+st.subheader("Bucket Summary")
+try:
+    from broker_client.buckets.bucket_manager import BucketManager
+
+    _bm = BucketManager()
+    _summary = _bm.get_bucket_summary()
+    _names = {
+        1: "Bucket 1 — Income Engine (MSP/Wheel)",
+        2: "Bucket 2 — Earnings Plays",
+        3: "Bucket 3 — Event/LEAP",
+    }
+    _allocs = {
+        1: settings.BUCKET1_ALLOCATION_PCT,
+        2: settings.BUCKET2_ALLOCATION_PCT,
+        3: settings.BUCKET3_ALLOCATION_PCT,
+    }
+    bcols = st.columns(3)
+    for _i, _b in enumerate((1, 2, 3)):
+        _pnl = _summary[_b]
+        with bcols[_i]:
+            st.markdown(f"**{_names[_b]}**")
+            st.metric(
+                f"Positions ({_allocs[_b]}% alloc)",
+                _pnl.open_positions,
+                f"{_pnl.mtd_return:+.2f}% MTD",
+            )
+            st.caption(
+                f"Premium: ${_pnl.premium_collected:,.0f} | "
+                f"Realized: ${_pnl.realized_pnl:+,.0f} | "
+                f"Win rate: {_pnl.win_rate:.0f}%"
+            )
+    st.caption(f"Cash buffer target: {settings.cash_buffer_pct}%")
+except Exception as exc:
+    st.info(f"Bucket summary unavailable: {exc}")
 
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────

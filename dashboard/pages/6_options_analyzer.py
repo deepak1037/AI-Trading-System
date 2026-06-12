@@ -44,7 +44,7 @@ def _get_broker():
     try:
         from broker_core.factory import get_broker
         return get_broker()
-    except Exception as exc:  # noqa: BLE001 — analyzer falls back to yfinance
+    except Exception as exc:
         st.warning(f"Broker unavailable, using yfinance for prices: {exc}")
         return None
 
@@ -121,7 +121,7 @@ if run:
             results = analyzer.build_roi_table(
                 ticker, float(strike), use_broker_margin=real_margin
             )
-        except Exception as exc:  # noqa: BLE001 — fall back below
+        except Exception as exc:
             st.caption(f"Chain fetch note: {exc}")
 
         if results:
@@ -130,7 +130,7 @@ if run:
             # Fallback (no broker): list expiries + per-expiry compute via yfinance.
             expiries = analyzer.list_expiries(ticker)
             if expiry and expiry not in expiries:
-                expiries = [expiry] + expiries
+                expiries = [expiry, *expiries]
             if not expiries:
                 st.warning(
                     f"Could not list expiries for {ticker} (broker unavailable and "
@@ -140,7 +140,7 @@ if run:
             for exp in expiries:
                 try:
                     rows.append(_roi_row(analyzer.build_put_roi(ticker, float(strike), exp)))
-                except Exception as exc:  # noqa: BLE001 — skip bad expiries
+                except Exception as exc:
                     rows.append({"Expiry": exp, "DTE": "—", "Net premium": f"err: {exc}"})
 
     if rows:
@@ -186,7 +186,7 @@ if run:
         except DataError as exc:
             st.error(f"Analysis failed: {exc}")
             st.stop()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             st.error(f"Unexpected error: {exc}")
             st.stop()
 
