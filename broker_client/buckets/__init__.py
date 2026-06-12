@@ -19,6 +19,7 @@ from broker_client.buckets.bucket_manager import (
     BucketManager,
     BucketPnL,
 )
+from broker_client.buckets.exit_rules import ExitRecommendation, ExitRulesEngine
 from broker_client.buckets.models import BucketPosition
 
 __all__ = [
@@ -26,4 +27,6 @@ __all__ = [
     "BucketClassification",
     "BucketManager",
     "BucketPnL",
+    "ExitRecommendation",
+    "ExitRulesEngine",
 ]

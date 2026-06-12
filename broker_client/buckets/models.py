@@ -55,6 +55,7 @@ class BucketPosition(BaseModel):
 
     position_id: int | None = None
     earnings_date: str | None = None    # YYYY-MM-DD if known
+    days_to_earnings: int | None = None  # signed days until earnings (negative = past)
 
     # ── derived ──────────────────────────────────────────────────────────────
     @property
