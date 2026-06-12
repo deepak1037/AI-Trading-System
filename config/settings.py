@@ -167,6 +167,12 @@ class Settings(BaseSettings):
     DTE_SHORT_MAX: int = 14                      # short-DTE tier upper bound
     DTE_MEDIUM_MAX: int = 44                     # medium-DTE tier upper bound
     DTE_USED_PCT_REVIEW: float = 50.0            # B3: half the bought time used
+    # Scale-out (ladder) execution — close in tranches (must sum to 1.0).
+    LADDER_DEFAULT_TRANCHES: list[float] = Field(
+        default_factory=lambda: [0.3, 0.4, 0.3]
+    )
+    LADDER_SECOND_TARGET_PROFIT_PCT: float = 70.0  # 2nd tranche defers to this profit
+    LADDER_TRAILING_STOP_PCT: float = 0.0          # final tranche rides to breakeven
 
     # ── Position watcher ──────────────────────────────────────
     POSITION_SCAN_INTERVAL_SECONDS: int = 60
