@@ -105,3 +105,46 @@ def test_wrong_type_at_startup_raises_config_error(monkeypatch) -> None:
     monkeypatch.setenv("KELLY_FRACTION", "not_a_number")
     with pytest.raises(ConfigError, match="Failed to load settings"):
         settings_module._load_settings()
+
+
+# ── Three-bucket framework (Phase 2) ─────────────────────────────────────────
+def test_bucket_allocations_default_sum_to_100() -> None:
+    s = Settings()
+    total = (
+        s.BUCKET1_ALLOCATION_PCT
+        + s.BUCKET2_ALLOCATION_PCT
+        + s.BUCKET3_ALLOCATION_PCT
+    )
+    assert total <= 100
+    assert s.TRADING_PROFILE == "moderate"
+
+
+def test_cash_buffer_pct_property() -> None:
+    s = Settings(
+        BUCKET1_ALLOCATION_PCT=60,
+        BUCKET2_ALLOCATION_PCT=20,
+        BUCKET3_ALLOCATION_PCT=15,
+    )
+    assert s.cash_buffer_pct == 5
+
+
+def test_bucket_allocations_over_100_raises() -> None:
+    with pytest.raises(ConfigError, match="sum to <= 100"):
+        Settings(
+            BUCKET1_ALLOCATION_PCT=70,
+            BUCKET2_ALLOCATION_PCT=20,
+            BUCKET3_ALLOCATION_PCT=20,
+        )
+
+
+def test_invalid_trading_profile_raises() -> None:
+    with pytest.raises(ConfigError, match="Invalid TRADING_PROFILE"):
+        Settings(TRADING_PROFILE="yolo")
+
+
+def test_bucket_exit_thresholds_present() -> None:
+    s = Settings()
+    assert s.DTE_EXIT_THRESHOLD == 21
+    assert s.BUCKET1_PROFIT_TARGET_PCT == 50.0
+    assert s.BUCKET2B_STOP_LOSS_PCT == 200.0
+    assert s.BUCKET3_LLM_REVIEW_PROFIT_PCT == 40.0

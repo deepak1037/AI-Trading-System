@@ -77,6 +77,44 @@ class Settings(BaseSettings):
     GEOPOLITICAL_SHOCK_CONFIDENCE: int = 70    # above CONFIDENCE_HIGH → alerts
     GEOPOLITICAL_POLL_SECONDS: int = 60        # dedicated sub-minute poll cadence
     GEOPOLITICAL_WATCH: bool = True            # master switch for the detector
+
+    # ── Presidential / Truth Social monitoring ────────────────────────────────
+    # Presidential posts move markets instantly. Truth Social disables the
+    # Mastodon .rss route (serves the SPA shell), so we use trumpstruth.org,
+    # which mirrors his posts as a working RSS feed. Polled on the geopolitical
+    # 60s cadence. A market-keyword match fires regardless of FinBERT sentiment.
+    PRESIDENTIAL_WATCH: bool = True
+    PRESIDENTIAL_RSS_URLS: list[str] = Field(
+        default_factory=lambda: ["https://trumpstruth.org/feed"]
+    )
+    # Only alert on posts published within this window — react to breaking posts,
+    # not the whole 100-post backlog on the first poll after startup.
+    PRESIDENTIAL_FRESH_MINUTES: int = 15
+    PRESIDENTIAL_SHOCK_CONFIDENCE: int = 80  # critical — routes to #alerts
+    PRESIDENTIAL_POSITIVE_KEYWORDS: list[str] = Field(
+        default_factory=lambda: [
+            "deal", "trade deal", "agreement", "peace", "ceasefire", "truce",
+            "tariff reduction", "signing", "signed",
+        ]
+    )
+    PRESIDENTIAL_NEGATIVE_KEYWORDS: list[str] = Field(
+        default_factory=lambda: [
+            "strikes", "strike", "attack", "tariffs", "tariff", "sanctions",
+            "blockade", "no deal", "terminated", "terminate",
+        ]
+    )
+    # De-escalation words that FLIP a negative keyword bullish — so "cancelled
+    # strikes" / "lifted sanctions" read as LONG, not SHORT (the live miss).
+    PRESIDENTIAL_NEGATION_WORDS: list[str] = Field(
+        default_factory=lambda: [
+            "cancel", "cancelled", "canceled", "cancelling", "canceling",
+            "call off", "called off", "calling off", "lifted", "lift", "lifting",
+            "ended", "ending", "suspend", "suspended", "halt", "halted",
+            "no longer", "reversed", "reversing", "removed", "removing",
+            "averted", "avoided", "scrapped", "stand down", "stood down",
+            "pulled back",
+        ]
+    )
     PREMARKET_FUTURES_THRESHOLD: float = -0.008  # -0.8% NQ futures
     CONFIDENCE_CRITICAL: int = 80
     CONFIDENCE_HIGH: int = 65
@@ -105,6 +143,30 @@ class Settings(BaseSettings):
     KELLY_FRACTION: float = 0.25  # use 25% of full Kelly criterion
     STOP_LOSS_ATR_MULTIPLIER: float = 2.0
     TAKE_PROFIT_ATR_MULTIPLIER: float = 3.0
+
+    # ── Three-bucket framework (Phase 2) ──────────────────────
+    # Capital is split across three risk buckets. Allocations must sum to <= 100;
+    # any remainder is the cash buffer kept for rolls/assignments.
+    TRADING_PROFILE: str = "moderate"  # conservative | moderate | aggressive | custom
+    BUCKET1_ALLOCATION_PCT: int = 70   # Margin Secured Put + Wheel (income engine)
+    BUCKET2_ALLOCATION_PCT: int = 20   # Earnings plays
+    BUCKET3_ALLOCATION_PCT: int = 10   # Event + LEAP (lotto) plays
+    # Per-trade limits.
+    BUCKET3_MAX_SINGLE_TRADE_PCT: float = 2.0   # max % of portfolio on one B3 play
+    BUCKET2_DEFINED_RISK_MAX_LOSS_MULTIPLE: float = 2.0  # close B2B at 2x premium
+    # Exit-rule profit/loss thresholds (percent), never hardcoded in the engine.
+    BUCKET1_PROFIT_TARGET_PCT: float = 50.0      # take profit at 50%
+    BUCKET1_FAST_PROFIT_PCT: float = 70.0        # 70-80% near expiry → exit
+    BUCKET1_EARLY_PROFIT_PCT: float = 25.0       # 25% in week 1 on long DTE → exit
+    BUCKET2B_PROFIT_TARGET_PCT: float = 50.0     # defined-risk take profit
+    BUCKET2B_STOP_LOSS_PCT: float = 200.0        # lost 2x premium → stop loss
+    BUCKET3_LLM_REVIEW_PROFIT_PCT: float = 40.0  # trigger LLM review at 40%
+    BUCKET3_STOP_LOSS_PCT: float = 100.0         # full premium lost
+    DTE_EXIT_THRESHOLD: int = 21                 # the 21-DTE rule
+    DTE_URGENT_THRESHOLD: int = 7                # 7-DTE urgent alert
+    DTE_SHORT_MAX: int = 14                      # short-DTE tier upper bound
+    DTE_MEDIUM_MAX: int = 44                     # medium-DTE tier upper bound
+    DTE_USED_PCT_REVIEW: float = 50.0            # B3: half the bought time used
 
     # ── Position watcher ──────────────────────────────────────
     POSITION_SCAN_INTERVAL_SECONDS: int = 60
@@ -242,6 +304,21 @@ class Settings(BaseSettings):
     _VALID_FILL_METHODS: ClassVar[set[str]] = {"next_open", "vwap", "worst_case"}
     _VALID_BROKERS: ClassVar[set[str]] = {"alpaca", "schwab", "ibkr"}
     _VALID_MARGIN_BASES: ClassVar[set[str]] = {"reg_t", "cash_secured"}
+    _VALID_PROFILES: ClassVar[set[str]] = {
+        "conservative",
+        "moderate",
+        "aggressive",
+        "custom",
+    }
+
+    @property
+    def cash_buffer_pct(self) -> int:
+        """Portfolio % held as cash buffer (100 − sum of bucket allocations)."""
+        return 100 - (
+            self.BUCKET1_ALLOCATION_PCT
+            + self.BUCKET2_ALLOCATION_PCT
+            + self.BUCKET3_ALLOCATION_PCT
+        )
 
     @model_validator(mode="after")
     def _validate(self) -> Settings:
@@ -299,6 +376,24 @@ class Settings(BaseSettings):
         if scanner_weight_sum != 100:
             raise ConfigError(
                 "Scanner scoring weights must sum to 100", actual_sum=scanner_weight_sum
+            )
+
+        # Three-bucket framework (Phase 2): valid profile + allocations sum <= 100.
+        if self.TRADING_PROFILE not in self._VALID_PROFILES:
+            raise ConfigError(
+                "Invalid TRADING_PROFILE",
+                value=self.TRADING_PROFILE,
+                allowed=sorted(self._VALID_PROFILES),
+            )
+        bucket_sum = (
+            self.BUCKET1_ALLOCATION_PCT
+            + self.BUCKET2_ALLOCATION_PCT
+            + self.BUCKET3_ALLOCATION_PCT
+        )
+        if bucket_sum > 100:
+            raise ConfigError(
+                "Bucket allocations must sum to <= 100 (remainder = cash buffer)",
+                actual_sum=bucket_sum,
             )
 
         # The live triple-gate must be internally consistent (Section 2).
