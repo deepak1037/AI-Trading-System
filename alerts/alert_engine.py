@@ -14,8 +14,8 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import time
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
+from typing import ClassVar
 
 from config.settings import settings
 from core.exceptions import DataError, TradingSystemError
@@ -41,7 +41,7 @@ class AlertEngine:
     Deduplication is in-memory (reset on restart) + SQLite for persistence.
     """
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
         self._db_path = db_path or settings.DB_PATH
         self._dedup: dict[str, float] = {}  # key → last_sent_epoch
 
@@ -60,14 +60,14 @@ class AlertEngine:
         channel: str,
         severity: str,
         message: str,
-        signal_id: Optional[int] = None,
+        signal_id: int | None = None,
     ) -> None:
         try:
             with sqlite3.connect(self._db_path) as conn:
                 conn.execute(
                     """INSERT INTO alerts_log (signal_id, channel, severity, message, sent_at)
                        VALUES (?, ?, ?, ?, ?)""",
-                    (signal_id, channel, severity, message, datetime.now(tz=timezone.utc).isoformat()),
+                    (signal_id, channel, severity, message, datetime.now(tz=UTC).isoformat()),
                 )
         except Exception as exc:
             logger.warning("Failed to log alert to DB: %s", exc)
@@ -90,7 +90,7 @@ class AlertEngine:
             logger.warning("Twilio not configured — SMS alert suppressed: %s", message[:80])
             return False
         try:
-            from twilio.rest import Client  # type: ignore[import-untyped]
+            from twilio.rest import Client
 
             client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
             client.messages.create(
@@ -143,8 +143,8 @@ class AlertEngine:
             logger.warning("SendGrid not configured — email suppressed: %s", subject)
             return False
         try:
-            from sendgrid import SendGridAPIClient  # type: ignore[import-untyped]
-            from sendgrid.helpers.mail import Mail  # type: ignore[import-untyped]
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail
 
             msg = Mail(
                 from_email=settings.SENDGRID_FROM_EMAIL,
@@ -166,7 +166,7 @@ class AlertEngine:
 
     @staticmethod
     def _discord_message(
-        title: str, body: str, color: int, fields: Optional[list] = None
+        title: str, body: str, color: int, fields: list | None = None
     ) -> dict:
         return {"title": title, "body": body, "color": color, "fields": fields or []}
 
@@ -217,8 +217,8 @@ class AlertEngine:
         title: str,
         body: str,
         color: int,
-        fields: Optional[list] = None,
-        signal_id: Optional[int] = None,
+        fields: list | None = None,
+        signal_id: int | None = None,
         dedup: bool = True,
     ) -> bool:
         """Dedup + send a Discord embed to a channel, then log it."""
@@ -237,8 +237,8 @@ class AlertEngine:
         return sent
 
     def send_discord_critical(
-        self, title: str, body: str, fields: Optional[list] = None,
-        signal_id: Optional[int] = None,
+        self, title: str, body: str, fields: list | None = None,
+        signal_id: int | None = None,
     ) -> bool:
         """CRITICAL → #alerts (red embed)."""
         return self._discord_route(
@@ -247,8 +247,8 @@ class AlertEngine:
         )
 
     def send_discord_signal(
-        self, title: str, body: str, fields: Optional[list] = None,
-        signal_id: Optional[int] = None,
+        self, title: str, body: str, fields: list | None = None,
+        signal_id: int | None = None,
     ) -> bool:
         """HIGH → #signals (yellow embed)."""
         return self._discord_route(
@@ -257,8 +257,8 @@ class AlertEngine:
         )
 
     def send_discord_opportunity(
-        self, title: str, body: str, fields: Optional[list] = None,
-        signal_id: Optional[int] = None,
+        self, title: str, body: str, fields: list | None = None,
+        signal_id: int | None = None,
     ) -> bool:
         """Opportunity → #opportunities (green embed)."""
         return self._discord_route(
@@ -267,7 +267,7 @@ class AlertEngine:
         )
 
     def send_discord_briefing(
-        self, title: str, body: str, fields: Optional[list] = None,
+        self, title: str, body: str, fields: list | None = None,
     ) -> bool:
         """Daily briefing → #daily-briefing (blue embed). No dedup — fires once."""
         return self._discord_route(
@@ -277,10 +277,53 @@ class AlertEngine:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
+    # Channel name → (webhook, severity tag) and color name → embed int.
+    _CHANNEL_MAP: ClassVar[dict[str, str]] = {
+        "alerts": "discord_alerts",
+        "signals": "discord_signals",
+        "opportunities": "discord_opportunities",
+        "briefing": "discord_briefing",
+    }
+    _COLOR_MAP: ClassVar[dict[str, int]] = {
+        "red": _DISCORD_RED,
+        "yellow": _DISCORD_YELLOW,
+        "green": _DISCORD_GREEN,
+        "blue": _DISCORD_BLUE,
+    }
+
+    def send_alert(
+        self,
+        title: str,
+        body: str,
+        channel: str = "signals",
+        color: str = "yellow",
+        fields: list | None = None,
+        signal_id: int | None = None,
+        dedup: bool = True,
+    ) -> bool:
+        """Generic Discord alert — used by Phase 2 (DTE alerts, exit signals).
+
+        ``channel`` ∈ {alerts, signals, opportunities, briefing}; ``color`` ∈
+        {red, yellow, green, blue}. Every Phase 2 alert routes through here so
+        Discord is never called directly (CLAUDE_PHASE2 note 9).
+        """
+        webhook = {
+            "alerts": settings.DISCORD_WEBHOOK_ALERTS,
+            "signals": settings.DISCORD_WEBHOOK_SIGNALS,
+            "opportunities": settings.DISCORD_WEBHOOK_OPPORTUNITIES,
+            "briefing": settings.DISCORD_WEBHOOK_BRIEFING,
+        }.get(channel, settings.DISCORD_WEBHOOK_SIGNALS)
+        channel_tag = self._CHANNEL_MAP.get(channel, "discord_signals")
+        color_int = self._COLOR_MAP.get(color, _DISCORD_YELLOW)
+        return self._discord_route(
+            webhook, channel_tag, channel, title, body, color_int,
+            fields=fields, signal_id=signal_id, dedup=dedup,
+        )
+
     def send_critical(
         self,
         message: str,
-        signal_id: Optional[int] = None,
+        signal_id: int | None = None,
         bypass_dedup: bool = False,
     ) -> bool:
         """Send critical alert via SMS. Bypasses dedup for RiskError."""
@@ -298,7 +341,7 @@ class AlertEngine:
             self.send_discord_critical("🚨 Critical Alert", message, signal_id=signal_id)
         return sent
 
-    def send_high(self, message: str, signal_id: Optional[int] = None) -> bool:
+    def send_high(self, message: str, signal_id: int | None = None) -> bool:
         """Send high-severity alert via Slack."""
         key = _dedup_key("slack", "high", hashlib.md5(message.encode()).hexdigest()[:8])
         if self._is_duplicate(key):
@@ -329,13 +372,13 @@ class AlertEngine:
 
     def send_eod_report(self, body: str) -> bool:
         """Send EOD report via email (no dedup — fires once daily)."""
-        subject = f"EOD Trading Report — {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d')}"
+        subject = f"EOD Trading Report — {datetime.now(tz=UTC).strftime('%Y-%m-%d')}"
         sent = self._send_email(subject, body)
         if sent:
             self._log_to_db("email", "eod", body[:500])
         return sent
 
-    def send_signal_alert(self, state: object, signal_id: Optional[int] = None) -> bool:
+    def send_signal_alert(self, state: object, signal_id: int | None = None) -> bool:
         """Send a signal alert from a MarketState (Slack/SMS + Discord #signals).
 
         Routes by composite score: ≥CONFIDENCE_CRITICAL → critical, else high.

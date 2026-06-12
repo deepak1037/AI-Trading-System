@@ -11,19 +11,36 @@ Key behaviours:
 from __future__ import annotations
 
 import time
+from datetime import UTC, date, datetime
 from threading import Thread
-from typing import Optional
+from typing import Any
 
-from config.settings import settings
-from core.logger import get_logger
+from broker_client.buckets.bucket_manager import BucketManager
+from broker_client.buckets.exit_rules import (
+    IMMEDIATE,
+    ExitRecommendation,
+    ExitRulesEngine,
+)
+from broker_client.buckets.models import BucketPosition
 from broker_client.order_router import OrderRouter
 from broker_client.position_manager import PositionManager
 from broker_client.strategies import STRATEGY_REGISTRY
 from broker_client.strategies.base_strategy import BaseStrategy
 from broker_core.base_broker import BaseBroker, Order, OrderResult, Position
+from config.settings import settings
+from core.logger import get_logger
 from signals.signal_schema import MarketSnapshot
 
 logger = get_logger(__name__)
+
+
+def _days_to_expiry(expiry: str) -> int:
+    """Calendar days from today (UTC) to an ISO ``YYYY-MM-DD`` expiry (>= 0)."""
+    try:
+        exp = date.fromisoformat(expiry)
+    except (ValueError, TypeError):
+        return 0
+    return max((exp - datetime.now(tz=UTC).date()).days, 0)
 
 
 class PositionWatcher:
@@ -34,16 +51,24 @@ class PositionWatcher:
 
     def __init__(
         self,
-        broker: Optional[BaseBroker],
+        broker: BaseBroker | None,
         router: OrderRouter,
         position_manager: PositionManager,
+        alert_engine: Any = None,
+        exit_rules: ExitRulesEngine | None = None,
+        bucket_manager: BucketManager | None = None,
     ) -> None:
         self._broker = broker
         self._router = router
         self._pm = position_manager
         self._positions: dict[str, dict] = {}  # ticker → position dict
         self._running = False
-        self._thread: Optional[Thread] = None
+        self._thread: Thread | None = None
+        # Phase 2: bucket-aware exit alerts (lazily defaulted so existing
+        # callers that don't pass these keep working).
+        self._alerts = alert_engine
+        self._exit_rules = exit_rules or ExitRulesEngine()
+        self._buckets = bucket_manager or BucketManager()
 
     # ── Startup reconciliation ───────────────────────────────────────────────
 
@@ -169,7 +194,7 @@ class PositionWatcher:
                 )
                 self._close_generic(position, f"regime_{new_regime}")
 
-    def _close(self, position: Position, strategy: "BaseStrategy", reason: str) -> None:
+    def _close(self, position: Position, strategy: BaseStrategy, reason: str) -> None:
         from broker_core.base_broker import Order as _Order
         exit_order = strategy.build_exit_order(position)
         if isinstance(exit_order, _Order):
@@ -199,6 +224,124 @@ class PositionWatcher:
             position.ticker, reason, result.fill_price,
         )
 
+    # ── 21 DTE alert system (Phase 2 Step 5) ─────────────────────────────────
+
+    def _to_bucket_position(self, d: dict) -> BucketPosition:
+        """Build a bucket-aware position from a watched position dict.
+
+        Reads option metadata when present (expiry/strike/option_type) and
+        classifies the position so the exit-rules engine can evaluate it.
+        """
+        strategy = d.get("strategy_name") or d.get("strategy") or ""
+        expiry = d.get("expiry")
+        dte = d.get("dte_remaining")
+        if dte is None and expiry:
+            dte = _days_to_expiry(expiry)
+        dte = int(dte or 0)
+
+        cls = self._buckets.classify_position(
+            {"strategy": strategy, "dte_remaining": dte, "option_type": d.get("option_type")}
+        )
+        entry = float(d.get("entry_price") or 0.0)
+        current = float(d.get("current_price") or 0.0)
+        profit_pct = d.get("profit_pct")
+        if profit_pct is None and entry > 0:
+            # Short premium: profit as premium decays (entry − current)/entry.
+            sign = -1.0 if str(d.get("position_type", "")).endswith("short") else 1.0
+            profit_pct = sign * (current - entry) / entry * 100.0
+        return BucketPosition(
+            ticker=d["ticker"],
+            strategy=strategy,
+            bucket=int(d.get("bucket") or cls.bucket),
+            sub_type=d.get("sub_type") or cls.sub_type,
+            recoverable=bool(d.get("recoverable", cls.recoverable)),
+            position_type=d.get("position_type", "equity_long"),
+            option_type=d.get("option_type"),
+            strike=d.get("strike"),
+            expiry=expiry,
+            qty=int(d.get("qty") or 1),
+            entry_price=entry,
+            current_price=current,
+            underlying_price=d.get("underlying_price"),
+            profit_pct=float(profit_pct or 0.0),
+            dte_remaining=dte,
+            original_dte=int(d.get("original_dte") or 0),
+            days_held=int(d.get("days_held") or 0),
+            days_to_earnings=d.get("days_to_earnings"),
+            thesis_status=d.get("thesis_status", "active"),
+        )
+
+    def check_dte_alerts(self) -> list[ExitRecommendation]:
+        """Fire 21-DTE / 7-DTE / immediate-exit alerts for option positions.
+
+        Idempotent per position via ``alerted_21dte``/``alerted_7dte`` flags so
+        each threshold alerts once. Returns the exit recommendations evaluated
+        (useful for tests and the daily briefing). No-op without an AlertEngine.
+        """
+        fired: list[ExitRecommendation] = []
+        for _ticker, d in list(self._positions.items()):
+            # Only option positions have a DTE clock.
+            if not (d.get("expiry") or d.get("dte_remaining") is not None):
+                continue
+            bp = self._to_bucket_position(d)
+            dte = bp.dte_remaining
+            rec = self._exit_rules.check_exit(bp)
+            if rec is not None:
+                fired.append(rec)
+
+            if dte <= settings.DTE_EXIT_THRESHOLD and not d.get("alerted_21dte"):
+                self._send(
+                    f"⏰ 21 DTE ALERT: {bp.ticker}",
+                    self._dte_body(bp, rec),
+                    channel="signals",
+                    color="yellow",
+                )
+                d["alerted_21dte"] = True
+
+            if dte <= settings.DTE_URGENT_THRESHOLD and not d.get("alerted_7dte"):
+                self._send(
+                    f"🚨 URGENT {dte} DTE: {bp.ticker}",
+                    f"Only {dte} days left — action required today",
+                    channel="alerts",
+                    color="red",
+                )
+                d["alerted_7dte"] = True
+
+            if rec is not None and rec.urgency == IMMEDIATE:
+                self._send(
+                    f"💰 EXIT SIGNAL: {bp.ticker}",
+                    f"{rec.reason}\nP&L: {bp.profit_pct:+.1f}%",
+                    channel="opportunities",
+                    color="green",
+                )
+        return fired
+
+    @staticmethod
+    def _dte_body(bp: BucketPosition, rec: ExitRecommendation | None) -> str:
+        action = rec.action if rec else "HOLD"
+        reason = rec.reason if rec else "n/a"
+        contract = ""
+        if bp.option_type and bp.strike:
+            contract = f"{bp.strike:g}{bp.option_type[0].upper()} {bp.expiry or ''}".strip()
+        return (
+            f"Position: {bp.ticker} {contract}\n"
+            f"Bucket: {bp.bucket} — {bp.sub_type}\n"
+            f"Current P&L: {bp.profit_pct:+.1f}%\n"
+            f"DTE remaining: {bp.dte_remaining}\n"
+            f"Recommendation: {action}\n"
+            f"Reason: {reason}"
+        )
+
+    def _send(self, title: str, body: str, channel: str, color: str) -> None:
+        """Route through AlertEngine.send_alert when an engine is wired up."""
+        if self._alerts is None:
+            logger.debug("PositionWatcher: no AlertEngine — would alert: %s", title)
+            return
+        try:
+            self._alerts.send_alert(title=title, body=body, channel=channel, color=color)
+        except Exception as exc:
+            logger.error("PositionWatcher: alert failed (%s): %s", title, exc)
+
     # ── Background scan loop ─────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -226,13 +369,13 @@ class PositionWatcher:
         """Fetch current prices and fire tick handlers for each position."""
         if not self._positions or self._broker is None:
             return
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         for ticker in list(self._positions.keys()):
             try:
                 quote = self._broker.get_quote(ticker)
                 snapshot = MarketSnapshot(
-                    timestamp=datetime.now(tz=timezone.utc),
+                    timestamp=datetime.now(tz=UTC),
                     ticker=ticker,
                     price=quote.last or quote.ask or 0.0,
                     volume=quote.volume,
