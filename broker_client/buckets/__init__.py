@@ -22,6 +22,7 @@ from broker_client.buckets.bucket_manager import (
 from broker_client.buckets.exit_rules import ExitRecommendation, ExitRulesEngine
 from broker_client.buckets.llm_exit_engine import ExitReview, LLMExitEngine
 from broker_client.buckets.models import BucketPosition
+from broker_client.buckets.wheel_tracker import WheelCycle, WheelSummary, WheelTracker
 
 __all__ = [
     "BucketPosition",
@@ -32,4 +33,7 @@ __all__ = [
     "ExitRulesEngine",
     "ExitReview",
     "LLMExitEngine",
+    "WheelCycle",
+    "WheelSummary",
+    "WheelTracker",
 ]
