@@ -87,6 +87,15 @@ class TestWatcherScheduler:
         scheduler.add_eod_job(MagicMock())
         assert "eod" in scheduler.get_jobs()
 
+    def test_add_briefing_job(self, scheduler):
+        scheduler.add_briefing_job(MagicMock())
+        assert "briefing" in scheduler.get_jobs()
+
+    def test_register_default_jobs_includes_briefing(self, scheduler):
+        scheduler._calendar.current_phase.return_value = "session"
+        scheduler.register_default_jobs(MagicMock(), on_briefing=MagicMock())
+        assert "briefing" in scheduler.get_jobs()
+
     def test_not_running_initially(self, scheduler):
         assert not scheduler.is_running()
 

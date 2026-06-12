@@ -7,11 +7,11 @@ Phase intervals are always read from settings — never hardcoded.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
-from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
-from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-untyped]
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 from config.settings import settings
 from core.logger import get_logger
@@ -37,7 +37,7 @@ class WatcherScheduler:
     CalendarGuard before running any job — no work on holidays or weekends.
     """
 
-    def __init__(self, calendar: Optional[CalendarGuard] = None) -> None:
+    def __init__(self, calendar: CalendarGuard | None = None) -> None:
         self._scheduler = BackgroundScheduler(timezone="UTC")
         self._calendar = calendar or CalendarGuard()
         self._jobs: dict[str, Any] = {}
@@ -50,7 +50,7 @@ class WatcherScheduler:
                 current market phase (so the every-N-minutes session job doesn't
                 fire overnight). Off for the bare guard and for the EOD cron.
         """
-        def wrapper():
+        def wrapper() -> None:
             if not self._calendar.is_trading_day():
                 logger.debug("Scheduler[%s]: not a trading day — skipping", phase)
                 return
@@ -77,7 +77,7 @@ class WatcherScheduler:
         """
         kwargs: dict[str, Any] = {}
         if fire_now:
-            kwargs["next_run_time"] = datetime.now(tz=timezone.utc)
+            kwargs["next_run_time"] = datetime.now(tz=UTC)
         job = self._scheduler.add_job(
             self._guarded(phase, fn, phase_gated=True),
             _PHASE_TRIGGERS[phase](),
@@ -111,7 +111,7 @@ class WatcherScheduler:
         name: str,
         fn: Callable,
         seconds: int,
-        allowed_phases: Optional[set[str]] = None,
+        allowed_phases: set[str] | None = None,
     ) -> None:
         """Register a fixed-interval job that is NOT gated to a single phase.
 
@@ -124,9 +124,8 @@ class WatcherScheduler:
         def wrapper() -> None:
             if not self._calendar.is_trading_day():
                 return
-            if allowed_phases is not None:
-                if self._calendar.current_phase() not in allowed_phases:
-                    return
+            if allowed_phases is not None and self._calendar.current_phase() not in allowed_phases:
+                return
             try:
                 fn()
             except Exception as exc:
@@ -138,14 +137,14 @@ class WatcherScheduler:
             IntervalTrigger(seconds=seconds),
             id=name,
             replace_existing=True,
-            next_run_time=datetime.now(tz=timezone.utc),
+            next_run_time=datetime.now(tz=UTC),
         )
         self._jobs[name] = job
         logger.info("Scheduler: %s interval job added (every %ds)", name, seconds)
 
     def add_eod_job(self, fn: Callable, hour: int = 16, minute: int = 5) -> None:
         """EOD report: once daily at 4:05 PM ET (cron — not phase-gated)."""
-        from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
+        from apscheduler.triggers.cron import CronTrigger
 
         job = self._scheduler.add_job(
             self._guarded("eod", fn, phase_gated=False),
@@ -156,8 +155,24 @@ class WatcherScheduler:
         self._jobs["eod"] = job
         logger.info("Scheduler: eod job added (daily %02d:%02d ET)", hour, minute)
 
+    def add_briefing_job(self, fn: Callable, hour: int = 8, minute: int = 5) -> None:
+        """Daily morning briefing: 8:05 AM ET on trading days (cron, guarded)."""
+        from apscheduler.triggers.cron import CronTrigger
+
+        job = self._scheduler.add_job(
+            self._guarded("briefing", fn, phase_gated=False),
+            CronTrigger(hour=hour, minute=minute, timezone="America/New_York"),
+            id="briefing",
+            replace_existing=True,
+        )
+        self._jobs["briefing"] = job
+        logger.info("Scheduler: briefing job added (daily %02d:%02d ET)", hour, minute)
+
     def register_default_jobs(
-        self, tick: Callable[[str], None], on_eod: Optional[Callable] = None
+        self,
+        tick: Callable[[str], None],
+        on_eod: Callable | None = None,
+        on_briefing: Callable | None = None,
     ) -> None:
         """Register every phase job up front; the CURRENT phase fires immediately.
 
@@ -179,6 +194,8 @@ class WatcherScheduler:
             adder(lambda p=phase: tick(p), fire_now=(phase == current))
         if on_eod is not None:
             self.add_eod_job(on_eod)
+        if on_briefing is not None:
+            self.add_briefing_job(on_briefing)
         logger.info(
             "Registered %d phase job(s); current phase=%s (fires immediately)",
             len(self._jobs), current,
