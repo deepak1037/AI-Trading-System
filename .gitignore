@@ -45,3 +45,4 @@ paper_trading/backups/*.json
 .env.bak*
 .env.*.bak
 *.bak
+broker_client/earnings/data/*.csv
