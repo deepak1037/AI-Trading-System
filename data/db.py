@@ -205,6 +205,40 @@ CREATE TABLE IF NOT EXISTS presidential_signals (
     market_reaction_pct   REAL,   -- backfilled later: how far did the market move?
     created_at            TEXT    DEFAULT (datetime('now'))
 );
+
+-- Phase 3: earnings analyzer opportunities (IV crush / IV spike plays).
+CREATE TABLE IF NOT EXISTS earnings_opportunities (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT    NOT NULL,
+    earnings_date   TEXT    NOT NULL,
+    earnings_time   TEXT,   -- BMO | AMC
+    strategy        TEXT    NOT NULL,  -- IV_CRUSH | IV_SPIKE | SKIP
+    iv_rank         INTEGER,
+    expected_move   REAL,
+    avg_iv_crush    REAL,
+    breach_rate     REAL,
+    overall_score   INTEGER,
+    priority        TEXT,   -- HIGH | MEDIUM | LOW | SKIP
+    trade_json      TEXT,   -- serialized trade recommendation
+    llm_json        TEXT,   -- serialized LLM assessment
+    created_at      TEXT    DEFAULT (datetime('now'))
+);
+
+-- Phase 3: classified stock drops + bounce candidates (event plays).
+CREATE TABLE IF NOT EXISTS drop_signals (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker            TEXT    NOT NULL,
+    drop_pct          REAL    NOT NULL,
+    classification    TEXT    NOT NULL,  -- PURE_SENTIMENT | HYBRID | FUNDAMENTAL | EARNINGS_MISS
+    confidence        INTEGER,
+    cause_summary     TEXT,
+    bounce_confidence INTEGER,
+    bounce_score      INTEGER,
+    trade_recommendation TEXT,
+    trade_json        TEXT,
+    alerted           INTEGER DEFAULT 0,
+    created_at        TEXT    DEFAULT (datetime('now'))
+);
 """
 
 # Phase 2 columns added to an already-existing positions table. Applied by
@@ -238,6 +272,8 @@ _EXPECTED_TABLES = frozenset(
         "wheel_cycles",
         "exit_reviews",
         "presidential_signals",
+        "earnings_opportunities",
+        "drop_signals",
     }
 )
 

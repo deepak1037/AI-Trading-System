@@ -344,6 +344,36 @@ class Settings(BaseSettings):
     # large universes, so the later stages aren't starved of data.
     SCANNER_YF_PACE_SECONDS: float = 0.0
 
+    # ── Earnings analyzer (Phase 3, Module A) ─────────────────
+    EARNINGS_DAYS_AHEAD: int = 14
+    EARNINGS_IV_RANK_SELL_THRESHOLD: int = 50  # IV elevated → sell premium (crush)
+    EARNINGS_IV_RANK_BUY_THRESHOLD: int = 35   # IV low → buy premium (spike)
+    EARNINGS_IV_PERCENTILE_SELL_THRESHOLD: int = 60
+    EARNINGS_IV_PERCENTILE_BUY_THRESHOLD: int = 40
+    EARNINGS_MIN_IV_CRUSH_HISTORY: int = 6     # min quarters of data to trust pattern
+    EARNINGS_MIN_IV_CRUSH_PCT: float = 15.0    # avg crush to be a "reliable crusher"
+    EARNINGS_IV_CRUSH_MEANINGFUL_PCT: float = 10.0  # per-quarter crush counted as real
+    EARNINGS_IV_CRUSH_CONSISTENCY: float = 0.6      # frac of quarters that must crush
+    EARNINGS_MAX_BREACH_RATE: float = 0.25     # max breach for a crush (sell) trade
+    EARNINGS_MIN_BREACH_RATE: float = 0.40     # min breach for a spike (buy) trade
+    EARNINGS_MIN_ACTUAL_MOVE_FOR_SPIKE: float = 8.0  # avg move % needed for a spike buy
+    EARNINGS_SAFETY_BUFFER: float = 1.1        # 10% extra OTM buffer on put strike
+    EARNINGS_SAFE_PERCENTILE: float = 0.85     # percentile of moves the strike must clear
+    EARNINGS_STRIKE_ROUND: float = 5.0         # round selected strikes to nearest $
+    EARNINGS_MIN_STOCK_PRICE: float = 20.0     # avoid penny stocks
+    EARNINGS_MIN_OPTIONS_VOLUME: int = 1000
+    EARNINGS_MIN_OPEN_INTEREST: int = 5000
+    EARNINGS_SPIKE_TARGET_PROFIT_PCT: float = 30.0  # IV-spike exit target before earnings
+    EARNINGS_CSV_PATH: str = "broker_client/earnings/data/upcoming_earnings.csv"
+
+    # ── Drop / bounce detector (Phase 3, Module B) ────────────
+    DROP_ALERT_THRESHOLD_PCT: float = 4.0      # alert on drops > 4%
+    DROP_LOOKBACK_DAYS: int = 2                # check last 2 days
+    DROP_FUNDAMENTAL_MIN_SIGNALS: int = 2      # 2+ fundamental signals = FUNDAMENTAL
+    DROP_BOUNCE_MIN_SCORE: int = 55            # min bounce score to suggest a trade
+    DROP_SECTOR_WIDE_PCT: float = -2.0         # sector ETF move = macro/sector issue
+    DROP_PARTIAL_SECTOR_PCT: float = -0.5      # some sympathy selling
+
     # ── Validators ────────────────────────────────────────────
     _VALID_ENVS: ClassVar[set[str]] = {"development", "backtest", "paper", "live"}
     _VALID_LOG_LEVELS: ClassVar[set[str]] = {
