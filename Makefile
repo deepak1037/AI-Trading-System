@@ -185,6 +185,21 @@ analyze: _check_venv _mklogs
 	@test -n "$(expiry)" || (echo "Usage: make analyze ticker=HOOD strike=8 expiry=2026-07-18" && exit 1)
 	@$(PYTHON) scripts/analyze_put.py --ticker $(ticker) --strike $(strike) --expiry $(expiry)
 
+# ── earnings: IV crush / spike opportunity scanner ───────────────────────────
+#   make earnings                  (next 14 days)
+#   make earnings-week             (next 7 days)
+#   make earnings-ticker ticker=NVDA
+.PHONY: earnings earnings-week earnings-ticker
+earnings: _check_venv _mklogs
+	@$(PYTHON) -m broker_client.earnings.cli
+
+earnings-week: _check_venv _mklogs
+	@$(PYTHON) -m broker_client.earnings.cli --days 7
+
+earnings-ticker: _check_venv _mklogs
+	@test -n "$(ticker)" || (echo "Usage: make earnings-ticker ticker=NVDA" && exit 1)
+	@$(PYTHON) -m broker_client.earnings.cli --ticker $(ticker)
+
 # ── paper-balance: paper account summary ─────────────────────────────────────
 .PHONY: paper-balance
 paper-balance: _check_venv
