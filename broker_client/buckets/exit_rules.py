@@ -54,6 +54,19 @@ class ExitRulesEngine:
         Returns ``None`` only for an unrecognised bucket; healthy positions
         return an explicit HOLD so callers can render a recommendation.
         """
+        # Phase 3 override: an IV-spike (long-premium) trade must NEVER be held
+        # into the earnings print — it profits from IV expansion, not the move.
+        # Force the exit at/under the configured DTE regardless of P&L
+        # (CLAUDE_PHASE3 note 7), taking priority over any bucket rule.
+        if self._is_iv_spike(position) and (
+            position.dte_remaining <= settings.EARNINGS_IV_SPIKE_FORCE_EXIT_DTE
+        ):
+            return self._rec(
+                position, FULL_EXIT, IMMEDIATE,
+                "IV spike — never hold through earnings, force exit",
+                "iv_spike_force_exit",
+            )
+
         if position.bucket == 1:
             rec = self._check_bucket1(position)
         elif position.bucket == 2:
@@ -76,6 +89,12 @@ class ExitRulesEngine:
         return rec
 
     # ── helpers ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _is_iv_spike(position: BucketPosition) -> bool:
+        """True for an IV-spike long-premium earnings trade (strategy/sub_type)."""
+        tag = f"{position.strategy} {position.sub_type}".lower()
+        return "iv_spike" in tag or "iv spike" in tag
+
     def _rec(
         self,
         position: BucketPosition,

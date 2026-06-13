@@ -394,6 +394,107 @@ class AlertEngine:
             return self.send_critical(msg, signal_id=signal_id)
         return self.send_high(msg, signal_id=signal_id)
 
+    # ── Phase 3: earnings + event-play opportunity alerts ─────────────────────
+
+    def send_earnings_alert(self, opportunity: object) -> bool:
+        """Fire an earnings opportunity to #opportunities (green).
+
+        Duck-typed against ``EarningsOpportunity`` so alerts has no import
+        dependency on the earnings package.
+        """
+        ticker = getattr(opportunity, "ticker", "?")
+        strategy = getattr(opportunity, "strategy", "?")
+        score = getattr(opportunity, "overall_score", 0)
+        priority = getattr(opportunity, "priority", "?")
+        iv = getattr(opportunity, "iv_analysis", None)
+        trade = getattr(opportunity, "trade", None)
+        llm = getattr(opportunity, "llm_assessment", None)
+
+        lines = [
+            f"**Earnings:** {getattr(opportunity, 'earnings_date', '?')} "
+            f"{getattr(opportunity, 'earnings_time', '')}".strip(),
+            f"**Strategy:** {strategy}",
+        ]
+        if iv is not None:
+            lines += [
+                f"**IV Rank:** {iv.iv_rank_current}/100",
+                f"**Expected Move:** ±{iv.expected_move_current:.1f}%",
+                f"**Avg IV Crush:** {iv.avg_iv_crush:.1f}%",
+                f"**Breach Rate:** {iv.breach_rate:.0%}",
+            ]
+        lines += self._earnings_trade_lines(strategy, trade)
+        if llm is not None:
+            lines.append(
+                f"\n**{getattr(llm, 'model', 'LLM')}:** {llm.recommendation} "
+                f"({llm.confidence}% confidence)"
+            )
+            if getattr(llm, "reasoning", ""):
+                lines.append(f"_{llm.reasoning}_")
+        lines.append(f"\n**Score:** {score}/100 | **Priority:** {priority}")
+
+        return self.send_alert(
+            title=f"🎯 EARNINGS OPPORTUNITY: {ticker}",
+            body="\n".join(lines),
+            channel="opportunities",
+            color="green",
+        )
+
+    @staticmethod
+    def _earnings_trade_lines(strategy: str, trade: object) -> list[str]:
+        if trade is None:
+            return []
+        out = ["\n**SUGGESTED TRADE:**"]
+        if strategy == "IV_CRUSH":
+            out += [
+                f"  Sell {getattr(trade, 'put_strike', '?'):g}P @ "
+                f"${getattr(trade, 'put_premium', 0):.2f}",
+                f"  Margin: ${getattr(trade, 'margin_required', 0):,.0f}",
+                f"  ROI: {getattr(trade, 'roi_margin', 0):.1%}",
+                f"  Break-even: {getattr(trade, 'break_even_pct', 0):.1f}% drop needed",
+            ]
+        elif strategy == "IV_SPIKE":
+            out += [
+                f"  Buy {getattr(trade, 'instrument', 'straddle')}: "
+                f"{getattr(trade, 'call_strike', '?'):g}C/"
+                f"{getattr(trade, 'put_strike', '?'):g}P",
+                f"  Cost: ${getattr(trade, 'total_premium_paid', 0):,.0f}",
+                f"  ⚠️ EXIT {getattr(trade, 'exit_date', '?')} (1 day BEFORE earnings)",
+            ]
+        return out
+
+    def send_bounce_alert(
+        self,
+        classification: object,
+        bounce_score: object,
+        trade_setup: object | None = None,
+    ) -> bool:
+        """Fire a bounce (event-play) opportunity to #opportunities (green)."""
+        ticker = getattr(classification, "ticker", "?")
+        body = [
+            f"**Drop:** {getattr(classification, 'drop_pct', 0):.1f}% in "
+            f"{settings.DROP_LOOKBACK_DAYS} days",
+            f"**Cause:** {getattr(classification, 'classification', '?')} — "
+            f"{getattr(classification, 'cause_summary', '')}",
+            f"**Institutional:** {getattr(classification, 'institutional_action', 'neutral')}",
+            f"**Bounce confidence:** {getattr(classification, 'bounce_confidence', 0)}%",
+            f"**Overall score:** {getattr(bounce_score, 'overall_score', 0)}/100",
+        ]
+        if trade_setup is not None:
+            body += [
+                "\n**SUGGESTED TRADE (Bucket 3):**",
+                f"  {getattr(trade_setup, 'instrument', '?')} — "
+                f"target {getattr(trade_setup, 'profit_target_pct', 0):.0f}%",
+                f"  Max capital: ${getattr(trade_setup, 'max_capital', 0):,.0f}",
+                f"  Exit when: {getattr(trade_setup, 'thesis_complete_signal', '')}",
+                f"\n⚡ Urgency: {getattr(trade_setup, 'entry_urgency', '?')}",
+            ]
+        return self.send_alert(
+            title=f"📉 BOUNCE PLAY DETECTED: {ticker}",
+            body="\n".join(body),
+            channel="opportunities",
+            color="green",
+        )
+
     def handle_exception(self, exc: TradingSystemError) -> None:
         """Route exceptions to appropriate channel based on severity."""
         msg = f"{type(exc).__name__}: {exc}"

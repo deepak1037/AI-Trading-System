@@ -364,6 +364,7 @@ class Settings(BaseSettings):
     EARNINGS_MIN_OPTIONS_VOLUME: int = 1000
     EARNINGS_MIN_OPEN_INTEREST: int = 5000
     EARNINGS_SPIKE_TARGET_PROFIT_PCT: float = 30.0  # IV-spike exit target before earnings
+    EARNINGS_IV_SPIKE_FORCE_EXIT_DTE: int = 1   # force-exit IV spike at/under this DTE
     EARNINGS_CSV_PATH: str = "broker_client/earnings/data/upcoming_earnings.csv"
 
     # ── Drop / bounce detector (Phase 3, Module B) ────────────
