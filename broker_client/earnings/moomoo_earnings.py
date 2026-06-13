@@ -48,6 +48,24 @@ class MoomooEarningsConnector:
         self._ctx: Any = None
 
     # ── connection lifecycle ──────────────────────────────────────────────────
+    @staticmethod
+    def _opend_reachable(timeout: float = 1.0) -> bool:
+        """Fast TCP probe of the OpenD gateway.
+
+        The moomoo SDK's ``OpenQuoteContext`` retries a refused connection
+        forever in a background thread, so constructing it when OpenD is down
+        hangs the caller. Probe the socket first and bail cleanly instead.
+        """
+        import socket
+
+        try:
+            with socket.create_connection(
+                (settings.MOOMOO_HOST, settings.MOOMOO_PORT), timeout=timeout
+            ):
+                return True
+        except OSError:
+            return False
+
     def _ensure_ctx(self) -> Any:
         if self._ctx is None:
             import moomoo as ft  # type: ignore[import-untyped]
@@ -65,6 +83,8 @@ class MoomooEarningsConnector:
 
     def available(self) -> bool:
         """True if the OpenD gateway is reachable for a snapshot call."""
+        if not self._opend_reachable():
+            return False
         try:
             import moomoo as ft  # type: ignore[import-untyped]
 
@@ -84,6 +104,9 @@ class MoomooEarningsConnector:
         window. Pacing respects the 30 req/30s OpenD cap.
         """
         try:
+            if not self._opend_reachable():
+                logger.debug("Moomoo OpenD not reachable — skipping to next source")
+                return []
             tickers = self._watchlist_tickers()
             if not tickers:
                 return []
@@ -131,6 +154,8 @@ class MoomooEarningsConnector:
         history rather than raising so the analyzer can fall back to the summary
         fields on the ``EarningsEvent`` instead.
         """
+        if not self._opend_reachable():
+            return EarningsIVHistory(ticker=ticker, quarters=[])
         try:
             import moomoo as ft  # type: ignore[import-untyped]
 
