@@ -373,6 +373,21 @@ class Settings(BaseSettings):
     DROP_BOUNCE_MIN_SCORE: int = 55            # min bounce score to suggest a trade
     DROP_SECTOR_WIDE_PCT: float = -2.0         # sector ETF move = macro/sector issue
     DROP_PARTIAL_SECTOR_PCT: float = -0.5      # some sympathy selling
+    # Bounce score component weights (must sum to 1.0).
+    BOUNCE_WEIGHT_CAUSE: float = 0.30          # most important — what caused it?
+    BOUNCE_WEIGHT_FUNDAMENTAL: float = 0.25    # fundamentals still intact?
+    BOUNCE_WEIGHT_INSTITUTIONAL: float = 0.20  # smart money buying the dip?
+    BOUNCE_WEIGHT_TECHNICAL: float = 0.15      # oversold?
+    BOUNCE_WEIGHT_TIMING: float = 0.10         # good entry timing?
+    BOUNCE_STRONG_BUY_SCORE: int = 75          # >= → STRONG_BUY / immediate
+    # Bounce instrument selection (Bucket 3).
+    BOUNCE_CALL_DELTA: float = 0.6             # slightly OTM call for sentiment bounce
+    BOUNCE_LEAP_DELTA: float = 0.8             # deep ITM LEAP for macro-crash bounce
+    BOUNCE_CALL_EXPIRY_WEEKS: int = 2          # sentiment bounce horizon
+    BOUNCE_LEAP_EXPIRY_MONTHS: int = 18        # macro-crash LEAP horizon
+    BOUNCE_CALL_PROFIT_TARGET_PCT: float = 50.0
+    BOUNCE_LEAP_PROFIT_TARGET_PCT: float = 40.0
+    BOUNCE_SPREAD_PROFIT_TARGET_PCT: float = 40.0
 
     # ── Validators ────────────────────────────────────────────
     _VALID_ENVS: ClassVar[set[str]] = {"development", "backtest", "paper", "live"}
@@ -476,6 +491,19 @@ class Settings(BaseSettings):
             raise ConfigError(
                 "Bucket allocations must sum to <= 100 (remainder = cash buffer)",
                 actual_sum=bucket_sum,
+            )
+
+        # Bounce score component weights must sum to ~1.0 (Phase 3, Module B).
+        bounce_weight_sum = (
+            self.BOUNCE_WEIGHT_CAUSE
+            + self.BOUNCE_WEIGHT_FUNDAMENTAL
+            + self.BOUNCE_WEIGHT_INSTITUTIONAL
+            + self.BOUNCE_WEIGHT_TECHNICAL
+            + self.BOUNCE_WEIGHT_TIMING
+        )
+        if abs(bounce_weight_sum - 1.0) > 1e-6:
+            raise ConfigError(
+                "Bounce score weights must sum to 1.0", actual_sum=bounce_weight_sum
             )
 
         # The live triple-gate must be internally consistent (Section 2).
