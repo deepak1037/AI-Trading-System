@@ -293,7 +293,7 @@ class EarningsDataProvider:
 
 
 # ── module-level parsing helpers ───────────────────────────────────────────────
-def _num(value: object) -> float | None:
+def _num(value: Any) -> float | None:
     if value is None:
         return None
     try:
@@ -304,16 +304,19 @@ def _num(value: object) -> float | None:
     return None if f != f or abs(f) >= 1e12 else f  # f != f catches NaN
 
 
-def _parse_any_date(value: object) -> date | None:
+def _parse_any_date(value: Any) -> date | None:
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
-    if hasattr(value, "date") and callable(value.date):
+    date_attr = getattr(value, "date", None)
+    if callable(date_attr):
         try:
-            return value.date()
+            result = date_attr()
+            if isinstance(result, date):
+                return result
         except Exception:
             pass
     s = str(value)[:10]
@@ -349,7 +352,7 @@ def _has_rows(data: Any) -> bool:
 
 def _rows(data: Any) -> list[dict[str, Any]]:  # pragma: no cover - perms-gated path
     if hasattr(data, "to_dict"):
-        return data.to_dict("records")
+        return list(data.to_dict("records"))
     if isinstance(data, list):
         return [r if isinstance(r, dict) else dict(r) for r in data]
     return []

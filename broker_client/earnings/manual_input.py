@@ -19,6 +19,7 @@ degrade to 0/None rather than raising, so one bad row never sinks the load.
 from __future__ import annotations
 
 import csv
+from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,7 @@ class ManualEarningsInput:
 
     # ── parsing helpers ───────────────────────────────────────────────────────
     @staticmethod
-    def _build_colmap(fieldnames: list[str]) -> dict[str, str]:
+    def _build_colmap(fieldnames: Sequence[str]) -> dict[str, str]:
         """Map canonical field → the actual CSV column header present."""
         normalized = {name.strip().lower(): name for name in fieldnames if name}
         colmap: dict[str, str] = {}

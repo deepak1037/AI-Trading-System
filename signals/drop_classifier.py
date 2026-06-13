@@ -412,7 +412,8 @@ class DropClassifier:
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
             raise ValueError("LLM response contained no JSON object")
-        return json.loads(raw[start : end + 1])
+        data = json.loads(raw[start : end + 1])
+        return data if isinstance(data, dict) else {}
 
 
 _CLASSIFICATION_PROMPT = """A stock dropped {drop_pct:.1f}% in the last {days} days.

@@ -127,41 +127,49 @@ class IVHistoryAnalyzer:
         Uses ``actual_move_close`` (signed) as the reference, matching Moomoo's
         "Actual Move from Close" column.
         """
-        quarters = [
-            q for q in history
+        # Concrete (signed actual move, expected move) pairs — no Optionals,
+        # so downstream arithmetic is unambiguous.
+        pairs: list[tuple[float, float]] = [
+            (q.actual_move_close, q.expected_move)
+            for q in history
             if q.actual_move_close is not None and q.expected_move is not None
         ]
-        if not quarters:
+        if not pairs:
             return {
                 "avg_expected_move": 0.0, "avg_actual_move": 0.0, "breach_rate": 0.0,
                 "breach_rate_upper": 0.0, "breach_rate_lower": 0.0, "safe_move_level": 0.0,
             }
 
-        n = len(quarters)
-        breaches = [q for q in quarters if abs(q.actual_move_close) > q.expected_move]
-        upper = [b for b in breaches if b.actual_move_close > 0]
-        lower = [b for b in breaches if b.actual_move_close < 0]
+        n = len(pairs)
+        breaches = [(actual, exp) for actual, exp in pairs if abs(actual) > exp]
+        upper = [a for a, _ in breaches if a > 0]
+        lower = [a for a, _ in breaches if a < 0]
+        actual_moves = [abs(a) for a, _ in pairs]
 
         return {
-            "avg_expected_move": float(np.mean([q.expected_move for q in quarters])),
-            "avg_actual_move": float(np.mean([abs(q.actual_move_close) for q in quarters])),
+            "avg_expected_move": float(np.mean([exp for _, exp in pairs])),
+            "avg_actual_move": float(np.mean(actual_moves)),
             "breach_rate": len(breaches) / n,
             "breach_rate_upper": len(upper) / n,
             "breach_rate_lower": len(lower) / n,
-            "safe_move_level": self._calculate_safe_put_strike(quarters),
+            "safe_move_level": self._safe_move_from(actual_moves),
         }
 
-    @staticmethod
+    @classmethod
     def _calculate_safe_put_strike(
-        quarters: list[QuarterlyData], safety_pct: float | None = None
+        cls, quarters: list[QuarterlyData], safety_pct: float | None = None
     ) -> float:
         """The move magnitude (%) that contained ``safety_pct`` of actual moves.
 
         Example: moves of 8/5/12/3/7/15/4% → 85th percentile ≈ 13.2%, so a put
         placed ~13% OTM would have survived 85% of these quarters.
         """
-        pct = safety_pct if safety_pct is not None else settings.EARNINGS_SAFE_PERCENTILE
         moves = [abs(q.actual_move_close) for q in quarters if q.actual_move_close is not None]
+        return cls._safe_move_from(moves, safety_pct)
+
+    @staticmethod
+    def _safe_move_from(moves: list[float], safety_pct: float | None = None) -> float:
+        pct = safety_pct if safety_pct is not None else settings.EARNINGS_SAFE_PERCENTILE
         if not moves:
             return 0.0
         return float(np.percentile(moves, pct * 100))
