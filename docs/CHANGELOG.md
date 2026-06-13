@@ -9,6 +9,44 @@ Keep newest first. Reference the git commit where relevant.
 
 ---
 
+## Phase 3: Earnings Analyzer + Sentiment/Event Drop Detector
+
+Built per `CLAUDE_PHASE3.md` (12 steps, two modules).
+
+**Module A — Earnings Analyzer** (`broker_client/earnings/`):
+- `models.py` — `EarningsEvent`, `EarningsIVHistory`/`QuarterlyData`, `IVAnalysis`,
+  `IVCrushTrade`, `IVSpikeTrade` (with a validator that **refuses** any setup not
+  exiting before earnings), `EarningsAssessment`, `EarningsOpportunity`.
+- `moomoo_earnings.py` — `MoomooEarningsConnector` + `EarningsDataProvider` with the
+  Moomoo OpenD → manual CSV → FMP → yfinance priority chain (best-effort, never raises).
+- `manual_input.py` — tolerant Moomoo "Upcoming Earnings" CSV loader.
+- `iv_analyzer.py` — IV-crush, breach-rate, and 85th-pct safe-put-strike analysis,
+  with a per-quarter path and a summary-only fallback.
+- `strategy_builder.py` — IV-crush (sell OTM put) and IV-spike (buy ATM straddle)
+  builders; reuses `LLMROIAnalyzer.build_put_roi` for real Schwab preview margin.
+- `llm_assessor.py` — Claude assessment with a deterministic rule-based fallback.
+- `earnings_scanner.py` + `cli.py` — full scan/score/rank pipeline; `make earnings`,
+  `make earnings-week`, `make earnings-ticker ticker=NVDA`.
+
+**Module B — Drop / Bounce Detector** (`signals/`):
+- `drop_classifier.py` — classifies drops PURE_SENTIMENT / HYBRID / FUNDAMENTAL /
+  EARNINGS_MISS (deterministic keyword + peer + analyst signals, optional LLM refine
+  with rule fallback). Reusable for open-position context (Phase 3 note 6).
+- `bounce_scorer.py` — 5-component weighted 0–100 bounce score (cause / fundamental /
+  institutional / technical / timing).
+- `bounce_instrument_selector.py` — Bucket-3 instrument choice (sentiment→call,
+  crash-hybrid→LEAP, medium→call_spread), sized by `BUCKET3_MAX_SINGLE_TRADE_PCT`.
+
+**Cross-cutting:**
+- `exit_rules.py` — IV-spike force-exit guard at ≤1 DTE, overriding any bucket rule
+  (Phase 3 note 7: never hold an IV-spike long through earnings).
+- `alert_engine.py` — `send_earnings_alert` / `send_bounce_alert` → #opportunities.
+- `data/db.py` — new `earnings_opportunities` and `drop_signals` tables.
+- Dashboard pages `8_earnings.py` and `9_event_plays.py`.
+- Settings: `EARNINGS_*`, `DROP_*`, `BOUNCE_*` (bounce weights validated to sum to 1.0).
+
+---
+
 ## Fix: NFP backtest scores neutral-on-neutral as correct (62.2% → 78.4%)
 
 The backtest counted *every* neutral prediction as wrong, even on days SPY barely
