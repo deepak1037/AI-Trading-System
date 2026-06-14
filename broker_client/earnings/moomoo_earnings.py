@@ -411,21 +411,34 @@ class MoomooEarningsConnector:
                 logger.debug("Moomoo earnings F10 unavailable for %s: %s", ticker, df)
                 return None
             rows = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+            # The F10 returns ~30 rows PER earnings period (one per day around the
+            # print). Group by period_text — the period-level fields (date, pub_type,
+            # predict_vola, option_iv_crush) are constant within a group.
+            groups: dict[str, list[dict[str, Any]]] = {}
+            order: list[str] = []
+            for r in rows:
+                period = str(r.get("period_text", ""))
+                if period not in groups:
+                    groups[period] = []
+                    order.append(period)
+                groups[period].append(r)
+
             upcoming = None
             quarters: list[QuarterlyData] = []
-            for r in rows:
-                if _truthy(r.get("is_current")):
-                    upcoming = self._moomoo_upcoming(r)
+            for period in order:
+                grp = groups[period]
+                if _truthy(grp[0].get("is_current")):
+                    upcoming = self._moomoo_upcoming(grp[0])
                 else:
-                    q = self._moomoo_quarter(r)
+                    q = self._moomoo_quarter(grp)
                     if q is not None:
                         quarters.append(q)
-            history = EarningsIVHistory(ticker=ticker, quarters=quarters)
+            quarters.sort(key=lambda q: q.earnings_date or date.min, reverse=True)
             logger.info(
                 "Moomoo F10 earnings %s: upcoming=%s, %d historical quarters",
                 ticker, bool(upcoming), len(quarters),
             )
-            return {"upcoming": upcoming, "history": history}
+            return {"upcoming": upcoming, "history": EarningsIVHistory(ticker=ticker, quarters=quarters)}
         except Exception as exc:  # noqa: BLE001
             logger.debug("Moomoo earnings F10 failed for %s: %s", ticker, exc)
             return None
@@ -442,19 +455,37 @@ class MoomooEarningsConnector:
         }
 
     @staticmethod
-    def _moomoo_quarter(row: dict[str, Any]) -> QuarterlyData | None:
-        ed = _parse_any_date(row.get("pub_trading_day_str"))
-        iv_crush = _pct(row.get("option_iv_crush"))
+    def _moomoo_quarter(grp: list[dict[str, Any]]) -> QuarterlyData | None:
+        """One historical quarter from its group of per-day F10 rows."""
+        head = grp[0]
+        ed = _parse_any_date(head.get("pub_trading_day_str"))
+        iv_crush = _pct(head.get("option_iv_crush"))
         if ed is None and iv_crush is None:
             return None
-        close = _num(row.get("close_price"))
-        last = _num(row.get("last_close_price"))
-        actual = round((close - last) / last * 100.0, 2) if close and last else None
+        # Actual move: the earnings-day close vs prior close. Prefer the row whose
+        # trading day IS the earnings day; else any row carrying both closes.
+        ed_str = str(head.get("pub_trading_day_str"))
+        cand = next(
+            (r for r in grp
+             if str(r.get("trading_day_str")) == ed_str
+             and _num(r.get("close_price")) and _num(r.get("last_close_price"))),
+            None,
+        ) or next(
+            (r for r in grp
+             if _num(r.get("close_price")) and _num(r.get("last_close_price"))),
+            None,
+        )
+        actual = None
+        if cand is not None:
+            close = _num(cand.get("close_price"))
+            last = _num(cand.get("last_close_price"))
+            if close and last:
+                actual = round((close - last) / last * 100.0, 2)
         return QuarterlyData(
-            quarter=str(row.get("period_text", "")),
+            quarter=str(head.get("period_text", "")),
             earnings_date=ed,
             iv_crush=iv_crush,
-            expected_move=_pct(row.get("predict_vola_ratio_newest")),
+            expected_move=_pct(head.get("predict_vola_ratio_newest")),
             actual_move_close=actual,
         )
 
