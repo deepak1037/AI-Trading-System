@@ -49,6 +49,17 @@ class EarningsScanner:
         self.builder = builder or EarningsStrategyBuilder(broker=broker)
         self.assessor = assessor or LLMEarningsAssessor()
 
+    def close(self) -> None:
+        """Close the underlying Moomoo OpenD connection (frees non-daemon threads).
+
+        The moomoo ``OpenQuoteContext`` spawns non-daemon threads, so a CLI that
+        never closes it hangs at exit. Always call this when done.
+        """
+        try:
+            self.provider.connector.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Scanner close failed: %s", exc)
+
     # ── public API ─────────────────────────────────────────────────────────────
     def scan(self, days_ahead: int | None = None) -> list[EarningsOpportunity]:
         days = days_ahead if days_ahead is not None else settings.EARNINGS_DAYS_AHEAD

@@ -112,16 +112,20 @@ def main(argv: list[str] | None = None) -> int:
 
     days = args.days if args.days is not None else settings.EARNINGS_DAYS_AHEAD
 
-    if args.ticker:
-        opp = scanner.scan_ticker(args.ticker, days_ahead=days)
-        opportunities = [opp] if opp is not None else []
-    else:
-        opportunities = scanner.scan(days_ahead=days)
+    try:
+        if args.ticker:
+            opp = scanner.scan_ticker(args.ticker, days_ahead=days)
+            opportunities = [opp] if opp is not None else []
+        else:
+            opportunities = scanner.scan(days_ahead=days)
 
-    if args.save and opportunities:
-        scanner.save(opportunities)
+        if args.save and opportunities:
+            scanner.save(opportunities)
 
-    print(render(opportunities, days))
+        print(render(opportunities, days), flush=True)
+    finally:
+        # Moomoo OpenD spawns non-daemon threads — close or the CLI hangs at exit.
+        scanner.close()
     return 0
 
 
