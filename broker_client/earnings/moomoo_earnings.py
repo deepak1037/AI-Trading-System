@@ -372,25 +372,33 @@ class MoomooEarningsConnector:
     def get_earnings_iv_history(self, ticker: str) -> EarningsIVHistory:
         """Per-quarter IV-crush history, *computed* from Moomoo's IV series.
 
-        Moomoo OpenD has no "Historical Earnings Data" table, but it does serve a
-        daily implied-vol series (``get_option_volatility``). We pair that with
-        past earnings dates (FMP) and the realized close-to-close move (yfinance)
-        to reconstruct, per quarter:
+        ``get_option_volatility`` only accepts an *option* code, but on an ATM
+        option it returns the underlying's ~1-year DAILY IV series (the IV/HV
+        chart on Moomoo's earnings screen). We pair that with past earnings dates
+        (FMP per-symbol → yfinance) and realized moves (yfinance) to reconstruct,
+        per quarter:
 
-          * ``iv_before`` / ``iv_after`` / ``iv_crush`` — IV the trading day before
-            the print vs a few days after, and the % collapse between them.
-          * ``expected_move`` — the IV-implied 1-sigma move over that same window.
-          * ``actual_move_close`` — what the stock actually did (for breach rate).
+          * ``iv_before`` / ``iv_after`` / ``iv_crush`` — peak IV in the week
+            BEFORE the print vs the trough in the week AFTER, and the % collapse.
+          * ``expected_move`` — the IV-implied move over that window.
+          * ``actual_move_close`` — the realized close-to-close move (breach rate).
 
-        Best-effort: returns an empty history (→ analyzer's summary path) if OpenD
-        is down or any source is missing. Never raises.
+        Best-effort: returns an empty history (→ analyzer's lite path) if OpenD is
+        down or any source is missing. Never raises.
         """
         if not self._opend_reachable():
             return EarningsIVHistory(ticker=ticker, quarters=[])
         try:
-            series = self._iv_series(ticker)
-            past = _past_earnings_dates(ticker)
+            call_code = self._atm_call_code(ticker)  # option-vol needs an option code
+            if call_code is None:
+                return EarningsIVHistory(ticker=ticker, quarters=[])
+            series = self._iv_series(call_code)
+            past = _past_earnings_dates(ticker) or _yfinance_past_earnings(ticker)
             if not series or not past:
+                logger.debug(
+                    "IV history %s: series=%d past_earnings=%d → empty",
+                    ticker, len(series), len(past),
+                )
                 return EarningsIVHistory(ticker=ticker, quarters=[])
             moves = _earnings_moves(ticker, past)
             quarters: list[QuarterlyData] = []
@@ -398,21 +406,45 @@ class MoomooEarningsConnector:
                 q = self._quarter_from_series(ed, series, moves.get(ed))
                 if q is not None:
                     quarters.append(q)
-            logger.debug("Computed %d IV-crush quarters for %s", len(quarters), ticker)
+            logger.info(
+                "Computed %d IV-crush quarters for %s from a %d-day IV series",
+                len(quarters), ticker, len(series),
+            )
             return EarningsIVHistory(ticker=ticker, quarters=quarters)
         except Exception as exc:
             logger.debug("Moomoo IV history failed for %s: %s", ticker, exc)
             return EarningsIVHistory(ticker=ticker, quarters=[])
 
-    def _iv_series(self, ticker: str) -> list[tuple[date, float]]:
+    def _atm_call_code(
+        self, ticker: str, spot: float | None = None, floor: date | None = None
+    ) -> str | None:
+        """The ATM call option code for the nearest live expiry (None on gap).
+
+        Used to query the underlying's IV series (option-vol rejects stock codes).
+        """
+        import moomoo as ft  # type: ignore[import-untyped]
+
+        ctx = self._ensure_ctx()
+        code = f"US.{ticker}"
+        spot = spot or self.get_spot(ticker)
+        if not spot or spot <= 0:
+            return None
+        expiry = self._nearest_expiry(ctx, code, floor or date.today())
+        if expiry is None:
+            return None
+        ret, chain = ctx.get_option_chain(code, start=expiry, end=expiry)
+        if ret != ft.RET_OK or not _has_rows(chain):
+            return None
+        call_code, _ = self._atm_codes(chain, spot)
+        return call_code
+
+    def _iv_series(self, option_code: str) -> list[tuple[date, float]]:
         """Daily (date, IV%) series for the underlying, oldest-first.
 
-        Note: ``get_option_volatility`` needs an *option* code and historical ATM
-        contracts don't persist a full year, so against live OpenD this yields
-        nothing and crush history is left to the manual CSV. Kept for the CSV /
-        future-source path and exercised via mocks.
+        ``option_code`` MUST be an option code — ``get_option_volatility`` on an
+        ATM option returns the underlying's ~1-year daily IV history.
         """
-        df = self._option_volatility_df(f"US.{ticker}")
+        df = self._option_volatility_df(option_code)
         if df is None:
             return []
         out: list[tuple[date, float]] = []
@@ -430,20 +462,25 @@ class MoomooEarningsConnector:
         series: list[tuple[date, float]],
         actual_move: float | None,
     ) -> QuarterlyData | None:
-        """One quarter's crush from IV just-before vs just-after the print."""
+        """One quarter's crush: peak IV the week before vs trough the week after.
+
+        IV ramps into earnings (peak just before the print) and collapses right
+        after (the crush). Taking the max over the prior week and the min over the
+        following week is robust to daily gaps and matches the visible pattern.
+        """
         import math
 
-        before = [iv for d, iv in series if 0 <= (earnings_date - d).days <= 3]
-        after = [iv for d, iv in series if 1 <= (d - earnings_date).days <= 4]
+        before = [iv for d, iv in series if 0 <= (earnings_date - d).days <= 7]
+        after = [iv for d, iv in series if 1 <= (d - earnings_date).days <= 7]
         if not before or not after:
             return None
-        iv_before = before[-1]        # closest trading day at/just-before earnings
-        iv_after = after[0]           # first sample after the print
+        iv_before = max(before)       # IV peaks right before earnings
+        iv_after = min(after)         # IV troughs right after (the crush)
         if iv_before <= 0:
             return None
         crush = (iv_before - iv_after) / iv_before * 100.0
-        window_days = 3               # ~before→after holding window
-        expected_move = iv_before * math.sqrt(window_days / 365.0)
+        # Expected move implied by the pre-earnings IV over a ~1-week horizon.
+        expected_move = iv_before * math.sqrt(7 / 365.0)
         return QuarterlyData(
             quarter=earnings_date.isoformat(),
             earnings_date=earnings_date,
@@ -797,6 +834,27 @@ def _next_earnings_fmp(ticker: str) -> date | None:
     except Exception as exc:  # noqa: BLE001 - best-effort
         logger.debug("FMP next earnings failed for %s: %s", ticker, exc)
         return None
+
+
+def _yfinance_past_earnings(ticker: str, limit: int = 12) -> list[date]:
+    """Past earnings dates (most-recent first) from yfinance — FMP-key-free fallback."""
+    try:
+        import yfinance as yf
+
+        t = yf.Ticker(ticker)
+        df = t.get_earnings_dates(limit=limit) if hasattr(t, "get_earnings_dates") else None
+        if df is None or getattr(df, "empty", True):
+            return []
+        today = date.today()
+        out: list[date] = []
+        for idx in df.index:
+            d = _parse_any_date(idx)
+            if d is not None and d < today:
+                out.append(d)
+        return sorted(set(out), reverse=True)[:8]
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.debug("yfinance past earnings failed for %s: %s", ticker, exc)
+        return []
 
 
 def _yfinance_next_date(ticker: str) -> date | None:

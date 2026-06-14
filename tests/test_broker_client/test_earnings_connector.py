@@ -296,10 +296,11 @@ def test_get_earnings_iv_history_orchestration(monkeypatch) -> None:
 
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    monkeypatch.setattr(conn, "_atm_call_code", lambda t: "US.NVDA260618C170000")
     ed = date.today() - timedelta(days=90)
     monkeypatch.setattr(
         conn, "_iv_series",
-        lambda t: [(ed - timedelta(days=1), 60.0), (ed + timedelta(days=2), 35.0)],
+        lambda code: [(ed - timedelta(days=1), 60.0), (ed + timedelta(days=2), 35.0)],
     )
     monkeypatch.setattr(mod, "_past_earnings_dates", lambda t, **kw: [ed])
     monkeypatch.setattr(mod, "_earnings_moves", lambda t, dates: {ed: -8.0})
@@ -309,6 +310,41 @@ def test_get_earnings_iv_history_orchestration(monkeypatch) -> None:
     q = hist.quarters[0]
     assert q.iv_crush == pytest.approx(41.67, abs=0.1)
     assert q.actual_move_close == -8.0
+
+
+def test_get_earnings_iv_history_multi_quarter(monkeypatch) -> None:
+    # Realistic: a daily IV series spanning several past earnings → per-quarter crush.
+    import broker_client.earnings.moomoo_earnings as mod
+
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    monkeypatch.setattr(conn, "_atm_call_code", lambda t: "US.ACN260618C170000")
+
+    today = date.today()
+    quarters_ago = [today - timedelta(days=d) for d in (270, 180, 90)]
+    # Build a daily series: baseline 28%, ramping to ~50% before each print, 30% after.
+    series: list[tuple[date, float]] = []
+    cur = today - timedelta(days=300)
+    while cur <= today:
+        iv = 28.0
+        for ed in quarters_ago:
+            days_to = (ed - cur).days
+            if 0 <= days_to <= 5:      # ramping up before earnings
+                iv = max(iv, 50.0 - days_to * 2)
+            elif -5 <= days_to < 0:    # collapsed after
+                iv = 30.0
+        series.append((cur, iv))
+        cur += timedelta(days=1)
+
+    monkeypatch.setattr(conn, "_iv_series", lambda code: series)
+    monkeypatch.setattr(mod, "_past_earnings_dates", lambda t, **kw: quarters_ago)
+    monkeypatch.setattr(mod, "_earnings_moves", lambda t, dates: {d: -4.0 for d in dates})
+
+    hist = conn.get_earnings_iv_history("ACN")
+    assert hist.count == 3                       # one per past earnings in the series
+    crushes = [q.iv_crush for q in hist.quarters]
+    assert all(c > 15 for c in crushes)          # ~ (50-30)/50 = 40%
+    assert all(q.actual_move_close == -4.0 for q in hist.quarters)
 
 
 def test_get_earnings_iv_history_empty_when_opend_down(monkeypatch) -> None:
