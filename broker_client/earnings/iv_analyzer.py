@@ -249,12 +249,16 @@ class IVHistoryAnalyzer:
 
     @staticmethod
     def _should_sell_iv_crush(a: IVAnalysis) -> bool:
+        # The IV-crush trade sells an OTM PUT, so only a DOWNSIDE breach threatens
+        # it — an upside rip leaves the put worthless (you keep the premium). Judge
+        # on breach_rate_lower (the total breach_rate would unfairly penalize a
+        # stock that only ever breaks to the upside).
         return all([
             a.iv_rank_current >= settings.EARNINGS_IV_RANK_SELL_THRESHOLD,
             a.iv_percentile_current >= settings.EARNINGS_IV_PERCENTILE_SELL_THRESHOLD,
             a.avg_iv_crush >= settings.EARNINGS_MIN_IV_CRUSH_PCT,
             a.iv_crush_consistency >= settings.EARNINGS_IV_CRUSH_CONSISTENCY,
-            a.breach_rate <= settings.EARNINGS_MAX_BREACH_RATE,
+            a.breach_rate_lower <= settings.EARNINGS_MAX_BREACH_RATE,
         ])
 
     @staticmethod
