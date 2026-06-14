@@ -68,6 +68,7 @@ class MoomooEarningsConnector:
 
     def __init__(self) -> None:
         self._ctx: Any = None
+        self._moomoo_earnings_cache: dict[str, dict[str, Any] | None] = {}
 
     # ── connection lifecycle ──────────────────────────────────────────────────
     @staticmethod
@@ -272,6 +273,14 @@ class MoomooEarningsConnector:
             if atm is None:
                 return None
             atm.update(self._iv_rank_from_option(call_code))  # add rank (best-effort)
+            # Expected move ≈ ATM IV × √(DTE/365) — the 1-sigma move, matching
+            # Moomoo's figure; the straddle price is only ~0.8σ and understates it.
+            exp_date = _parse_any_date(expiry)
+            if exp_date is not None and atm.get("iv_current"):
+                import math
+
+                dte = max((exp_date - date.today()).days, 1)
+                atm["expected_move"] = round(atm["iv_current"] * math.sqrt(dte / 365.0), 2)
             return atm
         except Exception as exc:  # noqa: BLE001
             logger.warning("Moomoo ATM IV failed for %s: %s", ticker, exc)
@@ -369,25 +378,111 @@ class MoomooEarningsConnector:
         dte = max((earnings_date - date.today()).days, 0) + 2
         return round(iv_pct * math.sqrt(dte / 365.0), 2)
 
+    def get_moomoo_earnings(self, ticker: str) -> dict[str, Any] | None:
+        """Authoritative earnings data via ``get_financials_earnings_price_history``.
+
+        This is Moomoo's own "Historical Earnings Data" (the screenshot table):
+        per-quarter earnings date + BMO/AMC, ``option_iv_crush``, expected move
+        (``predict_vola_ratio``), and the realized move — plus the *upcoming*
+        event flagged by ``is_current``. Returns::
+
+            {"upcoming": {date, earnings_time, expected_move} | None,
+             "history": EarningsIVHistory}
+
+        or None when OpenD/the F10 feed is unavailable. Cached per ticker so the
+        date lookup and the IV-history lookup share one call. Never raises.
+        """
+        key = ticker.upper()
+        if key in self._moomoo_earnings_cache:
+            return self._moomoo_earnings_cache[key]
+        result = self._fetch_moomoo_earnings(key)
+        self._moomoo_earnings_cache[key] = result
+        return result
+
+    def _fetch_moomoo_earnings(self, ticker: str) -> dict[str, Any] | None:
+        if not self._opend_reachable():
+            return None
+        try:
+            import moomoo as ft  # type: ignore[import-untyped]
+
+            ctx = self._ensure_ctx()
+            ret, df = ctx.get_financials_earnings_price_history(f"US.{ticker}")
+            if ret != ft.RET_OK or not _has_rows(df):
+                logger.debug("Moomoo earnings F10 unavailable for %s: %s", ticker, df)
+                return None
+            rows = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+            upcoming = None
+            quarters: list[QuarterlyData] = []
+            for r in rows:
+                if _truthy(r.get("is_current")):
+                    upcoming = self._moomoo_upcoming(r)
+                else:
+                    q = self._moomoo_quarter(r)
+                    if q is not None:
+                        quarters.append(q)
+            history = EarningsIVHistory(ticker=ticker, quarters=quarters)
+            logger.info(
+                "Moomoo F10 earnings %s: upcoming=%s, %d historical quarters",
+                ticker, bool(upcoming), len(quarters),
+            )
+            return {"upcoming": upcoming, "history": history}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Moomoo earnings F10 failed for %s: %s", ticker, exc)
+            return None
+
+    @staticmethod
+    def _moomoo_upcoming(row: dict[str, Any]) -> dict[str, Any] | None:
+        ed = _parse_any_date(row.get("pub_trading_day_str"))
+        if ed is None:
+            return None
+        return {
+            "earnings_date": ed,
+            "earnings_time": _earnings_pub_time(row.get("pub_type")),
+            "expected_move": _pct(row.get("predict_vola_ratio_newest")),
+        }
+
+    @staticmethod
+    def _moomoo_quarter(row: dict[str, Any]) -> QuarterlyData | None:
+        ed = _parse_any_date(row.get("pub_trading_day_str"))
+        iv_crush = _pct(row.get("option_iv_crush"))
+        if ed is None and iv_crush is None:
+            return None
+        close = _num(row.get("close_price"))
+        last = _num(row.get("last_close_price"))
+        actual = round((close - last) / last * 100.0, 2) if close and last else None
+        return QuarterlyData(
+            quarter=str(row.get("period_text", "")),
+            earnings_date=ed,
+            iv_crush=iv_crush,
+            expected_move=_pct(row.get("predict_vola_ratio_newest")),
+            actual_move_close=actual,
+        )
+
     def get_earnings_iv_history(self, ticker: str) -> EarningsIVHistory:
-        """Per-quarter IV-crush history, *computed* from Moomoo's IV series.
+        """Per-quarter IV-crush history.
 
-        ``get_option_volatility`` only accepts an *option* code, but on an ATM
-        option it returns the underlying's ~1-year DAILY IV series (the IV/HV
-        chart on Moomoo's earnings screen). We pair that with past earnings dates
-        (FMP per-symbol → yfinance) and realized moves (yfinance) to reconstruct,
-        per quarter:
+        Prefers Moomoo's authoritative F10 ``option_iv_crush`` table
+        (``get_moomoo_earnings``); if that's unavailable, *reconstructs* it from
+        the ATM-option IV series cross-referenced with past earnings dates (FMP
+        per-symbol → yfinance) and realized moves (yfinance):
 
-          * ``iv_before`` / ``iv_after`` / ``iv_crush`` — peak IV in the week
-            BEFORE the print vs the trough in the week AFTER, and the % collapse.
+          * ``iv_before`` / ``iv_after`` / ``iv_crush`` — peak IV the week before
+            the print vs the trough the week after, and the % collapse.
           * ``expected_move`` — the IV-implied move over that window.
           * ``actual_move_close`` — the realized close-to-close move (breach rate).
 
-        Best-effort: returns an empty history (→ analyzer's lite path) if OpenD is
-        down or any source is missing. Never raises.
+        Best-effort: empty history (→ analyzer's lite path) if nothing is available.
+        Never raises.
         """
         if not self._opend_reachable():
             return EarningsIVHistory(ticker=ticker, quarters=[])
+        # 1. Authoritative F10 table (matches Moomoo's "Historical Earnings Data").
+        me = self.get_moomoo_earnings(ticker)
+        if me is not None:
+            hist = me.get("history")
+            if isinstance(hist, EarningsIVHistory) and hist.count > 0:
+                return hist
+        # 2. Reconstruct from the IV series.
         try:
             call_code = self._atm_call_code(ticker)  # option-vol needs an option code
             if call_code is None:
@@ -600,24 +695,49 @@ class EarningsDataProvider:
     def get_ticker_earnings(
         self, ticker: str, days_ahead: int | None = None
     ) -> EarningsEvent | None:
-        """Earnings date for ONE ticker (any symbol) + Moomoo IV enrichment.
+        """Upcoming earnings for ONE ticker (any symbol), authoritative-first.
 
-        The market-wide FMP calendar is tiny on the free tier (it returned only a
-        couple of demo names), so a single-ticker scan resolves the date directly:
-        FMP per-symbol → yfinance. Then the event is Moomoo-IV enriched in place.
+        Source priority for the date / BMO-AMC time / expected move:
+          1. Moomoo F10 (``get_moomoo_earnings`` → the screenshot's own data —
+             authoritative for the date, PRE/AMC, and expected move).
+          2. FMP per-symbol → yfinance (date only; time defaults to AMC).
+        Current IV rank is always layered on from the ATM option snapshot.
         Returns None when the ticker has no earnings in the window.
         """
         days = days_ahead if days_ahead is not None else settings.EARNINGS_DAYS_AHEAD
-        ed, source = self._next_earnings_date(ticker, days)
+        start = date.today()
+        end = start + timedelta(days=days)
+
+        ed: date | None = None
+        source = "none"
+        earnings_time = "AMC"
+        expected_move = 0.0
+
+        me = self.connector.get_moomoo_earnings(ticker)
+        up = me.get("upcoming") if me else None
+        if up and up.get("earnings_date") and start <= up["earnings_date"] <= end:
+            ed = up["earnings_date"]
+            earnings_time = up.get("earnings_time") or "AMC"
+            expected_move = up.get("expected_move") or 0.0
+            source = "moomoo"
+        else:
+            ed, source = self._next_earnings_date(ticker, days)
         if ed is None:
-            logger.info("No upcoming earnings date for %s in %d days (FMP/yfinance)", ticker, days)
+            logger.info("No upcoming earnings date for %s in %d days", ticker, days)
             return None
-        event = EarningsEvent(ticker=ticker.upper(), earnings_date=ed, source=source)
+
+        event = EarningsEvent(
+            ticker=ticker.upper(), earnings_date=ed,
+            earnings_time=earnings_time, expected_move=expected_move, source=source,
+        )
         enriched = self._enrich_iv([event])
+        # Moomoo's authoritative expected move wins over the ATM-straddle estimate.
+        if expected_move:
+            event.expected_move = expected_move
         logger.info(
-            "Ticker earnings %s: %s (%s)%s",
-            ticker.upper(), ed, source,
-            " + Moomoo IV" if enriched else " (dates only — Moomoo IV unavailable)",
+            "Ticker earnings %s: %s %s (%s)%s | expected_move ±%.1f%%",
+            ticker.upper(), ed, earnings_time, source,
+            " + Moomoo IV" if enriched else " (no IV)", event.expected_move,
         )
         return event
 
@@ -727,6 +847,40 @@ def _option_price(row: dict[str, Any]) -> float | None:
         return (bid + ask) / 2.0
     last = _num(row.get("last_price"))
     return last if last and last > 0 else None
+
+
+def _truthy(value: Any) -> bool:
+    """Robust truthiness for Moomoo bool/int/str flags (is_current, etc.)."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y")
+    return bool(value)
+
+
+def _earnings_pub_time(pub_type: Any) -> str:
+    """Moomoo EarningsPubTimeType → BMO/AMC.
+
+    1 = PreMarket (BMO), 2 = AfterMarket (AMC), 3 = DuringMarket (treated AMC).
+    """
+    try:
+        v = int(pub_type)
+    except (TypeError, ValueError):
+        return "AMC"
+    return {1: "BMO", 2: "AMC", 3: "AMC"}.get(v, "AMC")
+
+
+def _pct(value: Any) -> float | None:
+    """Normalize a Moomoo ratio/crush to a percent.
+
+    ``predict_vola_ratio`` / ``option_iv_crush`` come as a fraction (0.1001 =
+    10.01%) on most builds; a value < 1 is scaled ×100, otherwise it is already a
+    percent. Sentinels/None degrade to None.
+    """
+    v = _num(value)
+    if v is None:
+        return None
+    if v == 0:
+        return 0.0
+    return round(v * 100.0, 2) if abs(v) < 1.0 else round(v, 2)
 
 
 def _normalize_iv(value: Any) -> float | None:

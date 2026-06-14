@@ -25,6 +25,22 @@ def _clean_logging() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _no_live_opend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite hermetic: never connect to a live Moomoo OpenD gateway.
+
+    OpenD may be running on the dev machine (port 11111), in which case a real
+    ``MoomooEarningsConnector`` would make slow/blocking API calls. Force the
+    reachability probe to False by default; tests that exercise the Moomoo path
+    set a fake ``_ctx`` and override ``_opend_reachable`` on their instance.
+    """
+    from broker_client.earnings.moomoo_earnings import MoomooEarningsConnector
+
+    monkeypatch.setattr(
+        MoomooEarningsConnector, "_opend_reachable", staticmethod(lambda timeout=1.0: False)
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_llm(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the test suite hermetic: never call the real Anthropic API.
 

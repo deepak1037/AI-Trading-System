@@ -77,7 +77,10 @@ def _render_trade(opp: EarningsOpportunity) -> list[str]:
     out = ["", "  TRADE:"]
     if opp.strategy == IV_CRUSH and isinstance(trade, IVCrushTrade):
         out.append(f"    Sell {trade.put_strike:g}P @ ${trade.put_premium:.2f} "
-                   f"(exp {trade.put_expiry})")
+                   f"(exp {trade.put_expiry})  [primary — conservative]")
+        if trade.aggressive_put_strike:
+            out.append(f"    Aggressive alt: {trade.aggressive_put_strike:g}P "
+                       "(tighter strike, higher premium/ROI)")
         out.append(f"    Margin: ${trade.margin_required:,.0f} ({trade.margin_basis})")
         out.append(f"    ROI (margin): {trade.roi_margin:.1%}")
         out.append(f"    Break-even: {trade.break_even_pct:.1f}% drop needed to lose")

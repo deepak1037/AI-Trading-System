@@ -73,20 +73,22 @@ class _FakeCtxFull:
                 rows.append({"last_price": self._spot})
         return ft.RET_OK, pd.DataFrame(rows)
 
+    LIVE_DTE = 4  # the live expiry sits this many days out (deterministic)
+
     def get_option_expiration_date(self, code, index_option_type="NORMAL"):
         import moomoo as ft  # type: ignore[import-untyped]
         import pandas as pd
 
         # An EXPIRED date first, then a live one — exercises the skip-expired logic.
-        return ft.RET_OK, pd.DataFrame({"strike_time": ["2020-01-17", "2026-06-15"]})
+        live = (date.today() + timedelta(days=self.LIVE_DTE)).isoformat()
+        return ft.RET_OK, pd.DataFrame({"strike_time": ["2020-01-17", live]})
 
     def get_option_chain(self, code, start=None, end=None, **kw):
         import moomoo as ft  # type: ignore[import-untyped]
         import pandas as pd
 
         return ft.RET_OK, pd.DataFrame({
-            "code": ["US.AAPL260615C291000", "US.AAPL260615P291000",
-                     "US.AAPL260615C300000"],
+            "code": ["US.AAPL_C291000", "US.AAPL_P291000", "US.AAPL_C300000"],
             "option_type": ["CALL", "PUT", "CALL"],
             "strike_price": [291.0, 291.0, 300.0],
         })
@@ -296,6 +298,7 @@ def test_get_earnings_iv_history_orchestration(monkeypatch) -> None:
 
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    monkeypatch.setattr(conn, "get_moomoo_earnings", lambda t: None)
     monkeypatch.setattr(conn, "_atm_call_code", lambda t: "US.NVDA260618C170000")
     ed = date.today() - timedelta(days=90)
     monkeypatch.setattr(
@@ -318,6 +321,7 @@ def test_get_earnings_iv_history_multi_quarter(monkeypatch) -> None:
 
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    monkeypatch.setattr(conn, "get_moomoo_earnings", lambda t: None)
     monkeypatch.setattr(conn, "_atm_call_code", lambda t: "US.ACN260618C170000")
 
     today = date.today()
@@ -461,18 +465,21 @@ class _FakeCtxATM:
                 rows.append({"last_price": 150.0})
         return ft.RET_OK, pd.DataFrame(rows)
 
+    LIVE_DTE = 4
+
     def get_option_expiration_date(self, code, index_option_type="NORMAL"):
         import moomoo as ft  # type: ignore[import-untyped]
         import pandas as pd
 
-        return ft.RET_OK, pd.DataFrame({"strike_time": ["2026-07-17"]})
+        live = (date.today() + timedelta(days=self.LIVE_DTE)).isoformat()
+        return ft.RET_OK, pd.DataFrame({"strike_time": [live]})
 
     def get_option_chain(self, code, start=None, end=None, **kw):
         import moomoo as ft  # type: ignore[import-untyped]
         import pandas as pd
 
         return ft.RET_OK, pd.DataFrame({
-            "code": ["US.AAPL260717C150", "US.AAPL260717P150", "US.AAPL260717C200"],
+            "code": ["US.AAPL_C150", "US.AAPL_P150", "US.AAPL_C200"],
             "option_type": ["CALL", "PUT", "CALL"],
             "strike_price": [150.0, 150.0, 200.0],
         })
@@ -480,25 +487,30 @@ class _FakeCtxATM:
 
 def test_nearest_expiry_skips_expired() -> None:
     conn = MoomooEarningsConnector()
-    conn._ctx = _FakeCtxFull()  # expiries: 2020-01-17 (expired), 2026-06-15 (live)
-    expiry = MoomooEarningsConnector._nearest_expiry(conn._ctx, "US.AAPL", date(2026, 6, 14))
-    assert expiry == "2026-06-15"             # the expired one is skipped
+    conn._ctx = _FakeCtxFull()  # 2020-01-17 (expired) + a live expiry today+4
+    live = (date.today() + timedelta(days=_FakeCtxFull.LIVE_DTE)).isoformat()
+    expiry = MoomooEarningsConnector._nearest_expiry(conn._ctx, "US.AAPL", date.today())
+    assert expiry == live                      # the expired one is skipped
 
 
 def test_nearest_expiry_none_when_all_expired() -> None:
     conn = MoomooEarningsConnector()
     conn._ctx = _FakeCtxFull()
-    assert MoomooEarningsConnector._nearest_expiry(conn._ctx, "US.AAPL", date(2030, 1, 1)) is None
+    far = date.today() + timedelta(days=3650)
+    assert MoomooEarningsConnector._nearest_expiry(conn._ctx, "US.AAPL", far) is None
 
 
 def test_atm_iv_full_path_with_rank() -> None:
-    # Full ATM path: snapshot IV + straddle expected move + rank from contract series.
+    import math
+
+    # Full ATM path: snapshot IV + IV-implied expected move + rank from series.
     conn = MoomooEarningsConnector()
     conn._ctx = _FakeCtxFull(spot=291.13, call_iv=48.0, put_iv=52.0,
                              rank_ivs=[30, 40, 60, 50, 55])  # latest 55
-    iv = conn.get_atm_iv("AAPL", spot=291.13, earnings_date=date(2026, 6, 15))
+    iv = conn.get_atm_iv("AAPL", spot=291.13, earnings_date=date.today() + timedelta(days=2))
     assert iv["iv_current"] == 50.0           # avg(48, 52)
-    assert iv["expected_move"] == pytest.approx(12 / 291.13 * 100, abs=0.1)  # straddle 6+6
+    # expected move = IV × √(DTE/365), DTE = live expiry (today+4) − today.
+    assert iv["expected_move"] == pytest.approx(50.0 * math.sqrt(4 / 365.0), abs=0.05)
     assert iv["iv_rank"] == 83                 # (55-30)/(60-30)*100 from the contract series
     assert iv["iv_source"] == "atm_chain"
 
@@ -528,20 +540,22 @@ def test_expected_move_uses_price_not_premium() -> None:
 
 
 def test_atm_iv_without_rank(monkeypatch) -> None:
+    import math
+
     # option_volatility errors → ATM IV still works, rank absent.
     conn = MoomooEarningsConnector()
     conn._ctx = _FakeCtxATM()
-    iv = conn.get_atm_iv("AAPL", spot=150.0, earnings_date=date(2026, 7, 15))
+    iv = conn.get_atm_iv("AAPL", spot=150.0, earnings_date=date.today() + timedelta(days=2))
     assert iv["iv_current"] == 50.0
     assert iv["iv_rank"] is None
-    assert iv["expected_move"] == pytest.approx(10 / 150 * 100, abs=0.1)
+    assert iv["expected_move"] == pytest.approx(50.0 * math.sqrt(4 / 365.0), abs=0.05)
 
 
 def test_enrich_event_iv_full_path(monkeypatch) -> None:
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
     conn._ctx = _FakeCtxFull(spot=291.13, rank_ivs=[30, 40, 60, 50, 55])
-    event = EarningsEvent(ticker="AAPL", earnings_date=date(2026, 6, 15))
+    event = EarningsEvent(ticker="AAPL", earnings_date=date.today() + timedelta(days=2))
     assert conn.enrich_event_iv(event) is True
     assert event.iv_current == 50.0
     assert event.iv_rank == 83
@@ -565,7 +579,7 @@ def test_provider_enriches_fmp_dates_with_moomoo_iv(monkeypatch) -> None:
     monkeypatch.setattr(manual, "load", lambda: [])
     provider = EarningsDataProvider(connector=conn, manual=manual)
     # FMP supplies dates-only events; Moomoo supplies the IV.
-    fmp_event = EarningsEvent(ticker="AAPL", earnings_date=date(2026, 6, 15))
+    fmp_event = EarningsEvent(ticker="AAPL", earnings_date=date.today() + timedelta(days=2))
     monkeypatch.setattr(provider, "_fmp_calendar", lambda days: [fmp_event])
     out = provider.get_upcoming_earnings(60)
     assert len(out) == 1
@@ -574,11 +588,92 @@ def test_provider_enriches_fmp_dates_with_moomoo_iv(monkeypatch) -> None:
     assert out[0].iv_rank == 83
 
 
+def test_pub_time_and_pct_helpers() -> None:
+    from broker_client.earnings.moomoo_earnings import _earnings_pub_time, _pct
+
+    assert _earnings_pub_time(1) == "BMO"      # PreMarket
+    assert _earnings_pub_time(2) == "AMC"      # AfterMarket
+    assert _earnings_pub_time(3) == "AMC"      # DuringMarket
+    assert _earnings_pub_time(None) == "AMC"
+    assert _pct(0.1001) == pytest.approx(10.01, abs=0.01)  # fraction → percent
+    assert _pct(10.01) == pytest.approx(10.01, abs=0.01)   # already percent
+    assert _pct(0.28) == pytest.approx(28.0, abs=0.01)
+    assert _pct(None) is None
+
+
+def test_get_moomoo_earnings_f10(monkeypatch) -> None:
+    # get_financials_earnings_price_history → authoritative date/BMO/crush/expected.
+    class _F10Ctx:
+        def get_financials_earnings_price_history(self, code):
+            import moomoo as ft  # type: ignore[import-untyped]
+            import pandas as pd
+
+            up = (date.today() + timedelta(days=4)).isoformat()
+            return ft.RET_OK, pd.DataFrame([
+                {"is_current": True, "pub_trading_day_str": up, "pub_type": 1,
+                 "predict_vola_ratio_newest": 0.1001, "period_text": "2026Q3"},
+                {"is_current": False, "pub_trading_day_str": "2026-03-19", "pub_type": 1,
+                 "predict_vola_ratio_newest": 0.06, "option_iv_crush": 0.22,
+                 "period_text": "2026Q2", "close_price": 165.0, "last_close_price": 170.0},
+                {"is_current": False, "pub_trading_day_str": "2025-12-18", "pub_type": 1,
+                 "predict_vola_ratio_newest": 0.058, "option_iv_crush": 0.20,
+                 "period_text": "2026Q1", "close_price": 172.0, "last_close_price": 169.0},
+            ])
+
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    conn._ctx = _F10Ctx()
+    me = conn.get_moomoo_earnings("ACN")
+    assert me is not None
+    # Upcoming: BMO (PreMarket), expected move 10.01%.
+    assert me["upcoming"]["earnings_time"] == "BMO"
+    assert me["upcoming"]["expected_move"] == pytest.approx(10.01, abs=0.05)
+    # Historical: per-quarter IV crush from option_iv_crush (authoritative).
+    assert me["history"].count == 2
+    crushes = [q.iv_crush for q in me["history"].quarters]
+    assert crushes == [pytest.approx(22.0, abs=0.1), pytest.approx(20.0, abs=0.1)]
+    # actual move from close vs last_close.
+    q0 = me["history"].quarters[0]
+    assert q0.actual_move_close == pytest.approx((165 - 170) / 170 * 100, abs=0.1)
+
+
+def test_get_moomoo_earnings_cached(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def fake_fetch(t):
+        calls["n"] += 1
+        return {"upcoming": None, "history": EarningsIVHistory(ticker=t, quarters=[])}
+
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_fetch_moomoo_earnings", fake_fetch)
+    conn.get_moomoo_earnings("ACN")
+    conn.get_moomoo_earnings("ACN")
+    assert calls["n"] == 1  # second call served from cache
+
+
+def test_get_ticker_earnings_prefers_moomoo_f10(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    up_date = date.today() + timedelta(days=4)
+    monkeypatch.setattr(conn, "get_moomoo_earnings", lambda t: {
+        "upcoming": {"earnings_date": up_date, "earnings_time": "BMO", "expected_move": 10.01},
+        "history": EarningsIVHistory(ticker=t, quarters=[]),
+    })
+    monkeypatch.setattr(conn, "enrich_event_iv", lambda e: False)  # no IV layer
+    provider = EarningsDataProvider(connector=conn)
+    event = provider.get_ticker_earnings("ACN", days_ahead=14)
+    assert event.earnings_date == up_date
+    assert event.earnings_time == "BMO"        # authoritative PRE, not AMC
+    assert event.expected_move == 10.01        # Moomoo's figure
+    assert event.source == "moomoo"
+
+
 def test_get_ticker_earnings_resolves_date_and_enriches(monkeypatch) -> None:
     import broker_client.earnings.moomoo_earnings as mod
 
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    monkeypatch.setattr(conn, "get_moomoo_earnings", lambda t: None)  # force FMP/yfinance path
     monkeypatch.setattr(
         conn, "enrich_event_iv",
         lambda e: (setattr(e, "iv_current", 60.0) or setattr(e, "iv_rank", 80)

@@ -121,7 +121,8 @@ class IVCrushTrade(BaseModel):
     earnings_time: str = "AMC"
 
     # Put side (recoverable — Bucket 2A)
-    put_strike: float
+    put_strike: float                   # primary (conservative — full safety buffer)
+    aggressive_put_strike: float | None = None  # tighter strike, higher premium/ROI
     put_expiry: date
     put_premium: float = 0.0
     put_safety_pct: float = 0.0         # how far OTM the strike sits (%)

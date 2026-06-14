@@ -120,6 +120,14 @@ def main(argv: list[str] | None = None) -> int:
                     atm_call, query_time_period=OptionVolatilityTimePeriodType_Year,
                 ),
             )
+        # 6. AUTHORITATIVE earnings data (F10) — date, PRE/AMC, IV crush, expected move.
+        _show(
+            "6) get_financials_earnings_price_history(code) — date/BMO-AMC/IV-crush/expected-move",
+            *ctx.get_financials_earnings_price_history(code),
+        )
+        print("\n[note] pubType: 1=PreMarket(BMO)  2=AfterMarket(AMC)  3=DuringMarket")
+        print("[note] is_current=True row is the UPCOMING earnings; "
+              "predict_vola_ratio_newest = expected move; option_iv_crush = per-quarter crush")
     finally:
         ctx.close()
 

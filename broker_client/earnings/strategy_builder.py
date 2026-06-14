@@ -74,9 +74,14 @@ class EarningsStrategyBuilder:
 
         expected_move = analysis.expected_move_current or event.expected_move
         safe_level = analysis.safe_move_level or expected_move
+        # Primary = full safety buffer (conservative); aggressive = no buffer
+        # (tighter strike, higher premium/ROI, more assignment risk).
         put_strike = self.select_put_strike(price, expected_move, safe_level)
         if put_strike <= 0:
             return None
+        _agg = self.select_put_strike(price, expected_move, safe_level, safety_buffer=1.0)
+        # Only offer the aggressive (tighter) strike when it's meaningfully closer.
+        aggressive_strike: float | None = _agg if _agg > put_strike else None
         put_expiry = self._expiry_after_earnings(event)
         put_safety_pct = round((price - put_strike) / price * 100.0, 2) if price else 0.0
 
@@ -95,6 +100,7 @@ class EarningsStrategyBuilder:
             earnings_date=event.earnings_date,
             earnings_time=event.earnings_time,
             put_strike=put_strike,
+            aggressive_put_strike=aggressive_strike,
             put_expiry=put_expiry,
             put_premium=round(premium, 2),
             put_safety_pct=put_safety_pct,
