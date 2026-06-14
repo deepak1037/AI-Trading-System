@@ -75,10 +75,9 @@ def main(argv: list[str] | None = None) -> int:
         # 2. Option volatility on the STOCK code — expected to FAIL ("only option
         #    codes are supported"). This is why the old code returned no IV.
         _show(
-            "2) get_option_volatility(STOCK code) — expected RET_ERROR",
+            "2) get_option_volatility(STOCK code) — expected RET_ERROR (only option codes)",
             *ctx.get_option_volatility(
                 code, query_time_period=OptionVolatilityTimePeriodType_Year,
-                hv_time_period=int(ft.OptionHVPeriod.HV_365D),
             ),
         )
 
@@ -114,11 +113,11 @@ def main(argv: list[str] | None = None) -> int:
                 *ctx.get_market_snapshot([atm_call, atm_put]),
             )
             # 5. Option-vol on the ATM OPTION code → IV rank series (correct usage).
+            #    hvTimePeriod omitted — live OpenD rejects the HV_365D enum value.
             _show(
-                "5) get_option_volatility(ATM OPTION code, Year) — IV rank series",
+                "5) get_option_volatility(ATM OPTION code, Year, no hvTimePeriod) — IV rank series",
                 *ctx.get_option_volatility(
                     atm_call, query_time_period=OptionVolatilityTimePeriodType_Year,
-                    hv_time_period=int(ft.OptionHVPeriod.HV_365D),
                 ),
             )
     finally:

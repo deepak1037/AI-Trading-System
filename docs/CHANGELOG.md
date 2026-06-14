@@ -13,6 +13,16 @@ Keep newest first. Reference the git commit where relevant.
 
 Built per `CLAUDE_PHASE3.md` (12 steps, two modules).
 
+**Moomoo IV — two live-data fixes (verified against ACN).** With OpenD live: (1)
+`get_option_volatility` on the ATM *option* code failed with "Parameter error:
+hvTimePeriod" — the `OptionHVPeriod.HV_365D` (=4) value is rejected; `hvTimePeriod`
+is now omitted (we only need `implied_volatility`), so IV rank computes. (2) The
+expected move used `option_premium`, which Moomoo reports as *extrinsic value only*
+(ACN 170 call: premium 4.24 vs price 7.50), understating the straddle; it now uses
+the option **price** (mid of bid/ask, else last) via `_option_price`. Confirmed
+end-to-end on ACN: IV 97.9% (avg call/put), expected move 8.7% (straddle), IV rank
+from the ATM contract's series.
+
 **Moomoo IV — option-code requirement (final working path).** Live OpenD revealed
 `get_option_volatility` rejects a *stock* code ("Only option codes are supported"),
 so the underlying-IV-series approach can't work, and `get_option_expiration_date`

@@ -66,7 +66,8 @@ class _FakeCtxFull:
             if any(ch.isdigit() for ch in sym):  # option code
                 rows.append({
                     "option_implied_volatility": self._call_iv if "C" in sym else self._put_iv,
-                    "option_premium": 6.0,
+                    "option_premium": 2.0,    # extrinsic only — must NOT be used
+                    "last_price": 6.0,        # the real option price → straddle 12
                 })
             else:
                 rows.append({"last_price": self._spot})
@@ -419,7 +420,7 @@ class _FakeCtxATM:
             sym = c.split(".")[-1]
             if any(ch.isdigit() for ch in sym):          # an option code
                 rows.append({"option_implied_volatility": 48.0 if "C" in sym else 52.0,
-                             "option_premium": 5.0})
+                             "option_premium": 2.0, "last_price": 5.0})  # price → straddle 10
             else:                                         # the underlying stock
                 rows.append({"last_price": 150.0})
         return ft.RET_OK, pd.DataFrame(rows)
@@ -464,6 +465,30 @@ def test_atm_iv_full_path_with_rank() -> None:
     assert iv["expected_move"] == pytest.approx(12 / 291.13 * 100, abs=0.1)  # straddle 6+6
     assert iv["iv_rank"] == 83                 # (55-30)/(60-30)*100 from the contract series
     assert iv["iv_source"] == "atm_chain"
+
+
+def test_option_price_prefers_mid_then_last() -> None:
+    from broker_client.earnings.moomoo_earnings import _option_price
+
+    assert _option_price({"bid_price": 7.0, "ask_price": 8.0, "last_price": 7.5}) == 7.5  # mid
+    assert _option_price({"bid_price": 0, "ask_price": 0, "last_price": 7.5}) == 7.5       # last
+    assert _option_price({"option_premium": 4.24}) is None                                 # never premium
+
+
+def test_expected_move_uses_price_not_premium() -> None:
+    # ACN-style: premium (extrinsic) 4.24/4.29 but real price ~7.5/7.0.
+    import pandas as pd
+
+    snap = pd.DataFrame([
+        {"option_implied_volatility": 50.0, "option_premium": 4.24,
+         "bid_price": 7.3, "ask_price": 8.0, "last_price": 7.5},   # call mid 7.65
+        {"option_implied_volatility": 50.0, "option_premium": 4.29,
+         "bid_price": 6.6, "ask_price": 7.7, "last_price": 7.03},  # put mid 7.15
+    ])
+    atm = MoomooEarningsConnector._atm_from_snapshot(snap, spot=170.28)
+    # straddle = 7.65 + 7.15 = 14.80 → 8.69% (NOT premium 8.53/170 = 5.0%)
+    assert atm["expected_move"] == pytest.approx(14.80 / 170.28 * 100, abs=0.1)
+    assert atm["expected_move"] > 8.0          # would be ~5% if premium were (wrongly) used
 
 
 def test_atm_iv_without_rank(monkeypatch) -> None:

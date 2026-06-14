@@ -43,7 +43,8 @@ _FMP_BASE = "https://financialmodelingprep.com/stable"
 # get_option_volatility's queryTimePeriod uses Qot_Common.OptionVolatilityTimePeriodType
 # (Year = 5). The SDK exposes NO friendly enum for it, and — critically —
 # ft.RangePeriod.ONE_YEAR is a DIFFERENT enum whose value 3 means *Quarter* here.
-_HV_PERIOD_365D = 4  # OptionHVPeriod.HV_365D (hvTimePeriod is a plain int field)
+# hvTimePeriod is left UNSET: live OpenD rejects OptionHVPeriod.HV_365D (=4) with
+# "Parameter error: hvTimePeriod", and we only need implied_volatility, not HV.
 
 
 def _vol_year_period() -> int:
@@ -183,8 +184,9 @@ class MoomooEarningsConnector:
         last: Any = "no response"
         for period in (_vol_year_period(), None):
             try:
+                # hv_time_period omitted (None) — server rejects the HV_365D enum.
                 ret, df = ctx.get_option_volatility(
-                    code, query_time_period=period, hv_time_period=_HV_PERIOD_365D
+                    code, query_time_period=period, hv_time_period=None
                 )
             except Exception as exc:  # noqa: BLE001 — try the next variant
                 last = repr(exc)
@@ -308,24 +310,28 @@ class MoomooEarningsConnector:
 
     @staticmethod
     def _atm_from_snapshot(snap: Any, spot: float) -> dict[str, Any] | None:
-        """ATM IV (avg of call/put) + straddle-implied expected move."""
+        """ATM IV (avg of call/put) + straddle-implied expected move.
+
+        Expected move uses the option *price* (mid of bid/ask, else last) — NOT
+        ``option_premium``, which Moomoo reports as extrinsic/time value only and
+        understates the straddle (e.g. ACN 170 call: premium 4.24 vs price 7.50).
+        """
         rows = snap.to_dict("records") if hasattr(snap, "to_dict") else list(snap)
         ivs: list[float] = []
-        prems: list[float] = []
+        prices: list[float] = []
         for r in rows:
             iv = _normalize_iv(r.get("option_implied_volatility"))
             if iv is not None:
                 ivs.append(iv)
-            prem = _num(r.get("option_premium"))
-            if prem is None:
-                prem = _num(r.get("last_price"))
-            if prem is not None:
-                prems.append(prem)
+            price = _option_price(r)
+            if price is not None:
+                prices.append(price)
         if not ivs:
             return None
         iv_current = round(sum(ivs) / len(ivs), 2)
+        # Straddle = sum of the ATM call + put prices ≈ the market expected move.
         expected_move = (
-            round(sum(prems) / spot * 100.0, 2) if prems and spot > 0 else 0.0
+            round(sum(prices) / spot * 100.0, 2) if prices and spot > 0 else 0.0
         )
         return {
             "iv_current": iv_current,
@@ -624,6 +630,20 @@ def _num(value: Any) -> float | None:
         return None
     # Reject obvious sentinels.
     return None if f != f or abs(f) >= 1e12 else f  # f != f catches NaN
+
+
+def _option_price(row: dict[str, Any]) -> float | None:
+    """An option's traded price: mid of bid/ask when both present, else last.
+
+    Deliberately NOT ``option_premium`` — Moomoo reports that as extrinsic value
+    only, which understates an ATM straddle.
+    """
+    bid = _num(row.get("bid_price"))
+    ask = _num(row.get("ask_price"))
+    if bid and ask and bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    last = _num(row.get("last_price"))
+    return last if last and last > 0 else None
 
 
 def _normalize_iv(value: Any) -> float | None:
