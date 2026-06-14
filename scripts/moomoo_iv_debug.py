@@ -60,55 +60,73 @@ def main(argv: list[str] | None = None) -> int:
         print(f"moomoo SDK import failed: {exc}", file=sys.stderr)
         return 1
 
+    from datetime import date
+
     ctx = ft.OpenQuoteContext(host=settings.MOOMOO_HOST, port=settings.MOOMOO_PORT)
     try:
-        # 1. Stock snapshot (spot price; has no IV/earnings for a stock code).
-        _show("1) get_market_snapshot([stock])", *ctx.get_market_snapshot([code]))
+        # 1. Stock snapshot → spot price (a stock code carries NO IV/earnings).
+        ret_s, snap = ctx.get_market_snapshot([code])
+        _show("1) get_market_snapshot([stock]) → spot price", ret_s, snap)
+        spot = None
+        if ret_s == ft.RET_OK and hasattr(snap, "empty") and not snap.empty:
+            spot = float(snap.iloc[0].get("last_price") or 0) or None
+        print(f"\n[spot] {ticker} last_price = {spot}")
 
-        # 2. Option volatility — the IV-rank source. CORRECT period enum (Year=5).
-        print(f"\n[note] OptionVolatilityTimePeriodType_Year = {OptionVolatilityTimePeriodType_Year} "
-              f"(NOT ft.RangePeriod.ONE_YEAR={int(ft.RangePeriod.ONE_YEAR)}, which is Quarter here)")
+        # 2. Option volatility on the STOCK code — expected to FAIL ("only option
+        #    codes are supported"). This is why the old code returned no IV.
         _show(
-            "2) get_option_volatility(code, queryTimePeriod=Year, hvTimePeriod=HV_365D)",
+            "2) get_option_volatility(STOCK code) — expected RET_ERROR",
             *ctx.get_option_volatility(
-                code,
-                query_time_period=OptionVolatilityTimePeriodType_Year,
+                code, query_time_period=OptionVolatilityTimePeriodType_Year,
                 hv_time_period=int(ft.OptionHVPeriod.HV_365D),
             ),
         )
-        # 2b. Same call with server-default period (in case the explicit one is rejected).
-        _show(
-            "2b) get_option_volatility(code) [server-default period]",
-            *ctx.get_option_volatility(code),
-        )
 
-        # 3. Option expiries.
+        # 3. Option expiries → pick the nearest LIVE one (>= today), never expired.
         ret_e, exp = ctx.get_option_expiration_date(code)
         _show("3) get_option_expiration_date(code)", ret_e, exp)
-
-        # 4. Option chain for the nearest expiry + ATM-option IV via snapshot.
+        live_expiry = None
         if ret_e == ft.RET_OK and hasattr(exp, "empty") and not exp.empty:
-            expiry = str(sorted(exp["strike_time"])[0])
-            ret_c, chain = ctx.get_option_chain(code, start=expiry, end=expiry)
-            _show(f"4) get_option_chain(code, start=end={expiry})", ret_c, chain)
-            if ret_c == ft.RET_OK and hasattr(chain, "empty") and not chain.empty:
-                opt_codes = list(chain["code"].head(2))
-                _show(
-                    f"4b) get_market_snapshot(option codes {opt_codes}) — has option_implied_volatility",
-                    *ctx.get_market_snapshot(opt_codes),
-                )
+            today = date.today().isoformat()
+            live = sorted(str(s) for s in exp["strike_time"] if str(s) >= today)
+            live_expiry = live[0] if live else None
+        print(f"\n[expiry] nearest LIVE expiry (>= today) = {live_expiry}")
 
-        # 5. Basic info (sanity).
-        _show(
-            "5) get_stock_basicinfo(US, STOCK, [code])",
-            *ctx.get_stock_basicinfo(
-                market=ft.Market.US, stock_type=ft.SecurityType.STOCK, code_list=[code]
-            ),
-        )
+        # 4. Chain for the live expiry → find the ATM option code (closest to spot).
+        atm_call = atm_put = None
+        if live_expiry:
+            ret_c, chain = ctx.get_option_chain(code, start=live_expiry, end=live_expiry)
+            _show(f"4) get_option_chain(code, start=end={live_expiry})", ret_c, chain)
+            if ret_c == ft.RET_OK and hasattr(chain, "empty") and not chain.empty and spot:
+                rows = chain.to_dict("records")
+                calls = [r for r in rows if str(r.get("option_type", "")).upper().endswith("CALL")]
+                puts = [r for r in rows if str(r.get("option_type", "")).upper().endswith("PUT")]
+                if calls:
+                    atm_call = min(calls, key=lambda r: abs(float(r["strike_price"]) - spot))["code"]
+                if puts:
+                    atm_put = min(puts, key=lambda r: abs(float(r["strike_price"]) - spot))["code"]
+        print(f"\n[ATM] call={atm_call}  put={atm_put}  (spot={spot})")
+
+        # 4b. Snapshot the ATM options → option_implied_volatility (the WORKING IV).
+        if atm_call and atm_put:
+            _show(
+                "4b) get_market_snapshot([ATM call, ATM put]) — option_implied_volatility",
+                *ctx.get_market_snapshot([atm_call, atm_put]),
+            )
+            # 5. Option-vol on the ATM OPTION code → IV rank series (correct usage).
+            _show(
+                "5) get_option_volatility(ATM OPTION code, Year) — IV rank series",
+                *ctx.get_option_volatility(
+                    atm_call, query_time_period=OptionVolatilityTimePeriodType_Year,
+                    hv_time_period=int(ft.OptionHVPeriod.HV_365D),
+                ),
+            )
     finally:
         ctx.close()
 
-    print(f"\n{_BAR}\nDone. Endpoint (2) drives IV rank; (4b) is the ATM-IV fallback.\n{_BAR}")
+    print(f"\n{_BAR}\nWorking IV path: (4b) ATM option snapshot = current IV + straddle "
+          f"expected move; (5) on the ATM OPTION code = IV rank.\n"
+          f"(2) on the STOCK code is EXPECTED to fail.\n{_BAR}")
     return 0
 
 

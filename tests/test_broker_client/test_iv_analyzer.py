@@ -105,6 +105,57 @@ def test_analyze_from_event_summary_path() -> None:
     assert a.strategy == IV_CRUSH
 
 
+def test_lite_path_crush_on_iv_rank_only() -> None:
+    # Moomoo enrichment: IV rank present, but NO crush history (hist_iv_crush=0).
+    event = EarningsEvent(
+        ticker="AAPL",
+        earnings_date=__import__("datetime").date(2026, 6, 20),
+        iv_rank=72,
+        iv_percentile=80,
+        hist_iv_crush=0.0,          # no per-quarter crush table
+        expected_move=6.5,
+    )
+    a = IVHistoryAnalyzer().analyze_from_event(event)
+    assert a.strategy == IV_CRUSH
+    assert 0 < a.confidence <= 70                 # capped lite confidence
+    assert "no per-quarter crush history" in a.reasoning
+
+
+def test_lite_path_spike_on_low_iv_rank() -> None:
+    event = EarningsEvent(
+        ticker="TSLA",
+        earnings_date=__import__("datetime").date(2026, 6, 20),
+        iv_rank=22,
+        iv_percentile=30,
+        hist_iv_crush=0.0,
+        expected_move=10.0,
+    )
+    a = IVHistoryAnalyzer().analyze_from_event(event)
+    assert a.strategy == IV_SPIKE
+    assert 0 < a.confidence <= 70
+
+
+def test_lite_path_skip_midrange_iv_rank() -> None:
+    event = EarningsEvent(
+        ticker="X",
+        earnings_date=__import__("datetime").date(2026, 6, 20),
+        iv_rank=42,
+        iv_percentile=45,
+        hist_iv_crush=0.0,
+        expected_move=5.0,
+    )
+    a = IVHistoryAnalyzer().analyze_from_event(event)
+    assert a.strategy == SKIP
+
+
+def test_full_history_takes_precedence_over_lite() -> None:
+    # With real crush history, the full (higher-confidence) path is used.
+    hist = _hist("NVDA", [(25, 8, 4), (28, 8, -3), (22, 8, 5), (26, 8, 2), (24, 8, -4), (27, 8, 3)])
+    a = IVHistoryAnalyzer().analyze("NVDA", hist, iv_rank=70, iv_percentile=70)
+    assert a.strategy == IV_CRUSH
+    assert a.confidence > 70                       # full path beats the lite cap
+
+
 def test_analyze_from_event_breach_flag() -> None:
     event = EarningsEvent(
         ticker="BIG",

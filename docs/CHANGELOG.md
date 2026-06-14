@@ -13,6 +13,20 @@ Keep newest first. Reference the git commit where relevant.
 
 Built per `CLAUDE_PHASE3.md` (12 steps, two modules).
 
+**Moomoo IV — option-code requirement (final working path).** Live OpenD revealed
+`get_option_volatility` rejects a *stock* code ("Only option codes are supported"),
+so the underlying-IV-series approach can't work, and `get_option_expiration_date`
+returns expired dates too. The IV path is now: nearest **live** expiry (≥ today,
+capturing the print) → ATM call/put (strike closest to spot) →
+`get_market_snapshot` `option_implied_volatility` (current IV) + `option_premium`
+(straddle → expected move); IV rank from the ATM contract's own
+`get_option_volatility` series (best-effort). Because Moomoo serves no per-quarter
+crush table, the IV analyzer gained a **lite decision path**: an elevated IV rank
+is itself the crush setup (a low one, the spike setup), at a capped, clearly-flagged
+confidence — so Moomoo-enriched events are actionable on IV rank alone. The
+diagnostic (`make moomoo-iv-debug`) now probes the ATM-option path and shows the
+stock-code call failing as expected.
+
 **Moomoo IV enum bug (silent failure).** Even with OpenD connected, IV enrichment
 returned nothing because `get_option_volatility` was called with
 `ft.RangePeriod.ONE_YEAR` (=3) — but that field's enum is

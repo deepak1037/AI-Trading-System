@@ -176,7 +176,16 @@ class IVHistoryAnalyzer:
 
     # ── strategy decision ──────────────────────────────────────────────────────
     def _decide_strategy(self, a: IVAnalysis) -> None:
-        """Set ``a.strategy`` / ``confidence`` / ``reasoning`` in place."""
+        """Set ``a.strategy`` / ``confidence`` / ``reasoning`` in place.
+
+        When per-quarter IV-crush history is unavailable (Moomoo serves current IV
+        rank but no crush table), decide on IV rank alone via the "lite" path — an
+        elevated IV rank IS the crush setup; a low one IS the spike setup — at a
+        capped, clearly-flagged confidence.
+        """
+        if not self._has_crush_history(a) and a.iv_rank_current > 0:
+            self._decide_lite(a)
+            return
         if self._should_sell_iv_crush(a):
             a.strategy = IV_CRUSH
             a.confidence = self._crush_confidence(a)
@@ -198,6 +207,45 @@ class IVHistoryAnalyzer:
             a.strategy = SKIP
             a.confidence = 0
             a.reasoning = self._skip_reason(a)
+
+    @staticmethod
+    def _has_crush_history(a: IVAnalysis) -> bool:
+        """True when we have real per-quarter crush data to reason from."""
+        return a.quarters_analyzed > 0 or a.avg_iv_crush > 0
+
+    def _decide_lite(self, a: IVAnalysis) -> None:
+        """IV-rank-only decision when no crush history is available.
+
+        Confidence is capped (max ~70) and the reasoning flags the missing crush
+        history, so these never outrank a fully-backed analysis.
+        """
+        rank = a.iv_rank_current
+        pct = a.iv_percentile_current
+        if (
+            rank >= settings.EARNINGS_IV_RANK_SELL_THRESHOLD
+            and pct >= settings.EARNINGS_IV_PERCENTILE_SELL_THRESHOLD
+        ):
+            a.strategy = IV_CRUSH
+            a.confidence = int(min(45 + (rank - 50) * 0.5, 70))
+            a.reasoning = (
+                f"IV rank {rank}/100 elevated (pct {pct}); no per-quarter crush "
+                "history — sell premium into the expected post-earnings IV collapse. "
+                "Lower confidence than a crush-history-backed setup."
+            )
+        elif rank <= settings.EARNINGS_IV_RANK_BUY_THRESHOLD:
+            a.strategy = IV_SPIKE
+            a.confidence = int(min(45 + (35 - rank) * 0.7, 70))
+            a.reasoning = (
+                f"IV rank {rank}/100 low; no crush history — buy premium for "
+                "pre-earnings IV expansion and exit before the print. Lower "
+                "confidence than a history-backed setup."
+            )
+        else:
+            a.strategy = SKIP
+            a.confidence = 0
+            a.reasoning = (
+                f"IV rank {rank}/100 in no-man's-land and no crush history to refine."
+            )
 
     @staticmethod
     def _should_sell_iv_crush(a: IVAnalysis) -> bool:
