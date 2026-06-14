@@ -190,10 +190,12 @@ class IVHistoryAnalyzer:
             a.strategy = IV_CRUSH
             a.confidence = self._crush_confidence(a)
             a.reasoning = (
-                f"Reliable IV crush: avg {a.avg_iv_crush:.0f}% over "
-                f"{a.iv_crush_consistency:.0%} of quarters, breach rate "
-                f"{a.breach_rate:.0%} ≤ {settings.EARNINGS_MAX_BREACH_RATE:.0%}, "
-                f"IV rank {a.iv_rank_current} elevated — sell premium."
+                f"IV crush: avg {a.avg_iv_crush:.0f}% over "
+                f"{a.iv_crush_consistency:.0%} of quarters, downside breach "
+                f"{a.breach_rate_lower:.0%} ≤ {settings.EARNINGS_MAX_BREACH_RATE:.0%}, "
+                f"IV rank {a.iv_rank_current} elevated — sell premium"
+                + (" (size down for breach)" if a.breach_rate_lower >= 0.20 else "")
+                + "."
             )
         elif self._should_buy_iv_spike(a):
             a.strategy = IV_SPIKE
@@ -272,10 +274,15 @@ class IVHistoryAnalyzer:
 
     @staticmethod
     def _crush_confidence(a: IVAnalysis) -> int:
-        """0-100 — stronger crush, higher consistency, lower breach → higher."""
-        crush_score = min(a.avg_iv_crush / 30.0, 1.0) * 40      # up to 40 pts
+        """0-100 — stronger crush, higher consistency, lower DOWNSIDE breach → higher.
+
+        Uses downside breach (what threatens a short put), scaled to ~15% so a
+        clean crusher scores high and a borderline one (≈25-30%) lands mid-range
+        rather than zero.
+        """
+        crush_score = min(a.avg_iv_crush / 20.0, 1.0) * 40      # up to 40 pts
         consistency_score = a.iv_crush_consistency * 30          # up to 30 pts
-        breach_score = (1.0 - min(a.breach_rate / 0.25, 1.0)) * 30  # up to 30 pts
+        breach_score = (1.0 - min(a.breach_rate_lower / 0.15, 1.0)) * 30  # up to 30 pts
         return int(round(crush_score + consistency_score + breach_score))
 
     @staticmethod

@@ -351,10 +351,13 @@ class Settings(BaseSettings):
     EARNINGS_IV_PERCENTILE_SELL_THRESHOLD: int = 60
     EARNINGS_IV_PERCENTILE_BUY_THRESHOLD: int = 40
     EARNINGS_MIN_IV_CRUSH_HISTORY: int = 6     # min quarters of data to trust pattern
-    EARNINGS_MIN_IV_CRUSH_PCT: float = 15.0    # avg crush to be a "reliable crusher"
-    EARNINGS_IV_CRUSH_MEANINGFUL_PCT: float = 10.0  # per-quarter crush counted as real
+    EARNINGS_MIN_IV_CRUSH_PCT: float = 10.0    # avg crush to be a "reliable crusher"
+    # (Moomoo's authoritative option_iv_crush runs ~6-18%; 10 matches that scale)
+    EARNINGS_IV_CRUSH_MEANINGFUL_PCT: float = 7.0  # per-quarter crush counted as real
+    # (≈70% of the avg-crush bar; matches Moomoo option_iv_crush's ~6-18% scale)
     EARNINGS_IV_CRUSH_CONSISTENCY: float = 0.6      # frac of quarters that must crush
-    EARNINGS_MAX_BREACH_RATE: float = 0.25     # max breach for a crush (sell) trade
+    EARNINGS_MAX_BREACH_RATE: float = 0.30     # max DOWNSIDE breach for a crush (sell)
+    # trade — 20-30% is tradeable at HALF size (see LLM sizing guidance); > 30% skips
     EARNINGS_MIN_BREACH_RATE: float = 0.40     # min breach for a spike (buy) trade
     EARNINGS_MIN_ACTUAL_MOVE_FOR_SPIKE: float = 8.0  # avg move % needed for a spike buy
     EARNINGS_SAFETY_BUFFER: float = 1.1        # 10% extra OTM buffer on put strike

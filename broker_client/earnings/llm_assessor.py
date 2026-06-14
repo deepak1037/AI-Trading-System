@@ -40,7 +40,9 @@ IV Analysis:
 - Current IV Rank: {iv_rank}/100
 - Avg Historical IV Crush: {avg_iv_crush:.1f}%
 - IV Crush Consistency: {consistency:.0%} of quarters
-- Breach Rate: {breach_rate:.0%} (stock exceeds expected move)
+- Total Breach Rate: {breach_rate:.0%} (stock exceeds expected move, either direction)
+- DOWNSIDE Breach Rate: {downside_breach:.0%} ({downside_breaches} of {quarters} quarters \
+breached to the downside) — this is what threatens a short PUT
 - Expected Move this quarter: ±{expected_move:.1f}%
 - Historical avg actual move: {avg_actual_move:.1f}%
 
@@ -50,6 +52,14 @@ Trade Setup:
 Fundamental context:
 - Forecast Revenue YoY: {revenue_yoy}
 - Forecast EPS YoY: {eps_yoy}
+
+SIZING GUIDANCE:
+- Downside breach 20-30%: this is an elevated-but-acceptable assignment risk —
+  recommend EXECUTE at "half" size, and call out the specific downside breach
+  history (e.g. "{downside_breaches} of {quarters} quarters breached to the
+  downside") in your reasoning. Prefer the more conservative (primary) put strike.
+- Downside breach <20%: full size is reasonable if the other metrics agree.
+- Downside breach >30%: lean SKIP or "quarter".
 
 Respond with JSON:
 {{
@@ -132,6 +142,8 @@ class LLMEarningsAssessor:
         trade: IVCrushTrade | IVSpikeTrade,
         event: Any,
     ) -> str:
+        quarters = analysis.quarters_analyzed
+        downside_breaches = int(round(analysis.breach_rate_lower * quarters)) if quarters else 0
         return _USER_PROMPT.format(
             ticker=ticker,
             earnings_date=trade.earnings_date,
@@ -141,6 +153,9 @@ class LLMEarningsAssessor:
             avg_iv_crush=analysis.avg_iv_crush,
             consistency=analysis.iv_crush_consistency,
             breach_rate=analysis.breach_rate,
+            downside_breach=analysis.breach_rate_lower,
+            downside_breaches=downside_breaches,
+            quarters=quarters or "?",
             expected_move=analysis.expected_move_current,
             avg_actual_move=analysis.avg_actual_move,
             trade_details=self._trade_details(trade),
@@ -214,23 +229,40 @@ class LLMEarningsAssessor:
     def _rule_crush(
         self, analysis: IVAnalysis, trade: Any, confidence: int
     ) -> EarningsAssessment:
-        rec, sizing = self._rec_from_confidence(confidence)
+        # The analyzer already approved this as a valid crush setup → EXECUTE; the
+        # confidence drives SIZE (full/half/quarter), not whether to trade.
         pop = int(round((1.0 - analysis.breach_rate_lower) * 100))
+        quarters = analysis.quarters_analyzed
+        downside_breaches = int(round(analysis.breach_rate_lower * quarters)) if quarters else 0
+        rec = "EXECUTE"
+        breach_note = ""
+        if 0.20 <= analysis.breach_rate_lower <= settings.EARNINGS_MAX_BREACH_RATE and quarters:
+            # Elevated-but-acceptable downside breach (20-30%) → HALF size, called out.
+            sizing = "half"
+            breach_note = (
+                f" {downside_breaches} of {quarters} quarters breached to the downside "
+                f"({analysis.breach_rate_lower:.0%}) — size HALF and keep the strike conservative."
+            )
+        elif confidence >= settings.CONFIDENCE_HIGH:
+            sizing = "full"
+        else:
+            sizing = "half"
         strengths = [
             f"Avg IV crush {analysis.avg_iv_crush:.0f}% over "
             f"{analysis.iv_crush_consistency:.0%} of quarters",
-            f"Breach rate only {analysis.breach_rate:.0%}",
+            f"Downside breach only {analysis.breach_rate_lower:.0%}",
         ]
         risks = [
             f"Gap below ${trade.put_strike:.0f} put on a surprise miss",
-            "Naked-put assignment if the stock breaches the strike",
+            f"{downside_breaches}/{quarters} quarters broke the expected move to the downside",
         ]
         return EarningsAssessment(
             recommendation=rec, confidence=confidence, probability_of_profit=pop,
             key_strengths=strengths, key_risks=risks, sizing_suggestion=sizing,
             reasoning=(
-                f"Reliable crusher with a {trade.break_even_pct:.0f}% downside cushion "
-                f"and {trade.roi_margin:.0%} margin ROI; sell the put and let IV collapse."
+                f"Crusher with a {trade.break_even_pct:.0f}% downside cushion and "
+                f"{trade.roi_margin:.0%} margin ROI; sell the put and let IV collapse."
+                + breach_note
             ),
             exit_plan="Close at 50% premium decay or the day after earnings (IV crush done).",
             watch_for="A guidance cut or sector-wide selloff widening the actual move.",

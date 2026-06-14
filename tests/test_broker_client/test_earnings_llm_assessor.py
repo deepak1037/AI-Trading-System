@@ -73,17 +73,47 @@ def test_fallback_spike_exit_plan_before_earnings(monkeypatch) -> None:
     assert str(trade.exit_date) in a.exit_plan
 
 
-def test_fallback_low_confidence_skips(monkeypatch) -> None:
+def test_fallback_half_size_on_elevated_downside_breach(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "")
+    # ACN-like: high confidence but downside breach 25% (3 of 12) → half size.
+    analysis = IVAnalysis(
+        ticker="ACN", avg_iv_crush=10.0, iv_crush_consistency=0.8,
+        breach_rate=0.42, breach_rate_lower=0.25, quarters_analyzed=12,
+        iv_rank_current=99, strategy=IV_CRUSH, confidence=85,
+    )
+    a = LLMEarningsAssessor().assess("ACN", analysis, _crush_trade())
+    assert a.recommendation == "EXECUTE"
+    assert a.sizing_suggestion == "half"          # downgraded from full
+    assert "3 of 12 quarters breached to the downside" in a.reasoning
+    assert "25%" in a.reasoning
+
+
+def test_fallback_full_size_when_downside_breach_low(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "")
+    analysis = IVAnalysis(
+        ticker="NVDA", avg_iv_crush=25.0, iv_crush_consistency=0.9,
+        breach_rate=0.1, breach_rate_lower=0.05, quarters_analyzed=12,
+        iv_rank_current=70, strategy=IV_CRUSH, confidence=85,
+    )
+    a = LLMEarningsAssessor().assess("NVDA", analysis, _crush_trade())
+    assert a.recommendation == "EXECUTE"
+    assert a.sizing_suggestion == "full"          # low breach → full size
+
+
+def test_fallback_crush_executes_sized_down_on_low_confidence(monkeypatch) -> None:
+    # An approved IV_CRUSH always EXECUTEs (analyzer already vetted it); low
+    # confidence drives smaller SIZE, not a SKIP.
     monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "")
     a = LLMEarningsAssessor().assess("NVDA", _crush_analysis(confidence=30), _crush_trade())
-    assert a.recommendation == "SKIP"
+    assert a.recommendation == "EXECUTE"
+    assert a.sizing_suggestion == "half"      # low confidence → reduced size
 
 
-def test_fallback_reduce_size_mid_confidence(monkeypatch) -> None:
+def test_fallback_mid_confidence_executes_half(monkeypatch) -> None:
     monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "")
     a = LLMEarningsAssessor().assess("NVDA", _crush_analysis(confidence=55), _crush_trade())
-    assert a.recommendation == "REDUCE_SIZE"
-    assert a.sizing_suggestion == "quarter"
+    assert a.recommendation == "EXECUTE"
+    assert a.sizing_suggestion == "half"      # < CONFIDENCE_HIGH and low breach → half
 
 
 def test_no_trade_returns_skip() -> None:
