@@ -560,6 +560,40 @@ class EarningsDataProvider:
     def get_iv_history(self, ticker: str) -> EarningsIVHistory:
         return self.connector.get_earnings_iv_history(ticker)
 
+    def get_ticker_earnings(
+        self, ticker: str, days_ahead: int | None = None
+    ) -> EarningsEvent | None:
+        """Earnings date for ONE ticker (any symbol) + Moomoo IV enrichment.
+
+        The market-wide FMP calendar is tiny on the free tier (it returned only a
+        couple of demo names), so a single-ticker scan resolves the date directly:
+        FMP per-symbol → yfinance. Then the event is Moomoo-IV enriched in place.
+        Returns None when the ticker has no earnings in the window.
+        """
+        days = days_ahead if days_ahead is not None else settings.EARNINGS_DAYS_AHEAD
+        ed, source = self._next_earnings_date(ticker, days)
+        if ed is None:
+            logger.info("No upcoming earnings date for %s in %d days (FMP/yfinance)", ticker, days)
+            return None
+        event = EarningsEvent(ticker=ticker.upper(), earnings_date=ed, source=source)
+        enriched = self._enrich_iv([event])
+        logger.info(
+            "Ticker earnings %s: %s (%s)%s",
+            ticker.upper(), ed, source,
+            " + Moomoo IV" if enriched else " (dates only — Moomoo IV unavailable)",
+        )
+        return event
+
+    def _next_earnings_date(self, ticker: str, days: int) -> tuple[date | None, str]:
+        """Next earnings date for a single ticker (FMP per-symbol → yfinance)."""
+        start = date.today()
+        end = start + timedelta(days=days)
+        for fetch, label in ((_next_earnings_fmp, "fmp"), (_yfinance_next_date, "yfinance")):
+            ed = fetch(ticker)
+            if ed is not None and start <= ed <= end:
+                return ed, label
+        return None, "none"
+
     # ── helpers ───────────────────────────────────────────────────────────────
     @staticmethod
     def _within_window(events: list[EarningsEvent], days: int) -> list[EarningsEvent]:
@@ -736,6 +770,47 @@ def _past_earnings_dates(ticker: str, lookback_days: int = 400, limit: int = 8) 
     except Exception as exc:  # noqa: BLE001 - best-effort
         logger.debug("FMP past earnings failed for %s: %s", ticker, exc)
         return []
+
+
+def _next_earnings_fmp(ticker: str) -> date | None:
+    """Next (future) earnings date for a symbol from FMP's per-symbol endpoint.
+
+    The per-symbol ``/earnings`` works for any ticker, unlike the market-wide
+    ``/earnings-calendar`` which is capped to a few demo names on the free tier.
+    """
+    if not settings.FMP_API_KEY:
+        return None
+    today = date.today()
+    try:
+        resp = requests.get(
+            f"{_FMP_BASE}/earnings",
+            params={"symbol": ticker.upper(), "apikey": settings.FMP_API_KEY},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        future = sorted(
+            d for d in (_parse_any_date(r.get("date")) for r in resp.json() or [])
+            if d is not None and d >= today
+        )
+        return future[0] if future else None
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.debug("FMP next earnings failed for %s: %s", ticker, exc)
+        return None
+
+
+def _yfinance_next_date(ticker: str) -> date | None:
+    """Next earnings date for a single ticker from yfinance (keyless, any symbol)."""
+    try:
+        import yfinance as yf
+
+        cal = yf.Ticker(ticker).calendar
+        vals = cal.get("Earnings Date") if isinstance(cal, dict) else None
+        ed = vals[0] if isinstance(vals, list) and vals else vals
+        return _parse_any_date(ed)
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.debug("yfinance next earnings failed for %s: %s", ticker, exc)
+        return None
 
 
 def _earnings_moves(ticker: str, dates: list[date]) -> dict[date, float]:

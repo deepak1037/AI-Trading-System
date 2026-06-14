@@ -30,6 +30,12 @@ class _StubProvider:
     def get_upcoming_earnings(self, days_ahead=None, only_ticker=None):
         return self._events
 
+    def get_ticker_earnings(self, ticker, days_ahead=None):
+        for e in self._events:
+            if e.ticker.upper() == ticker.upper():
+                return e
+        return None
+
     def get_iv_history(self, ticker):
         return EarningsIVHistory(ticker=ticker, quarters=[])  # force summary path
 

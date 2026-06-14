@@ -538,6 +538,46 @@ def test_provider_enriches_fmp_dates_with_moomoo_iv(monkeypatch) -> None:
     assert out[0].iv_rank == 83
 
 
+def test_get_ticker_earnings_resolves_date_and_enriches(monkeypatch) -> None:
+    import broker_client.earnings.moomoo_earnings as mod
+
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    monkeypatch.setattr(
+        conn, "enrich_event_iv",
+        lambda e: (setattr(e, "iv_current", 60.0) or setattr(e, "iv_rank", 80)
+                   or setattr(e, "source", "moomoo_iv") or True),
+    )
+    provider = EarningsDataProvider(connector=conn)
+    # FMP per-symbol has no date; yfinance supplies it.
+    monkeypatch.setattr(mod, "_next_earnings_fmp", lambda t: None)
+    monkeypatch.setattr(mod, "_yfinance_next_date", lambda t: date.today() + timedelta(days=6))
+
+    event = provider.get_ticker_earnings("ACN", days_ahead=14)
+    assert event is not None
+    assert event.ticker == "ACN"
+    assert event.source == "moomoo_iv"
+    assert event.iv_rank == 80
+
+
+def test_get_ticker_earnings_none_when_no_date(monkeypatch) -> None:
+    import broker_client.earnings.moomoo_earnings as mod
+
+    provider = EarningsDataProvider(connector=MoomooEarningsConnector())
+    monkeypatch.setattr(mod, "_next_earnings_fmp", lambda t: None)
+    monkeypatch.setattr(mod, "_yfinance_next_date", lambda t: None)
+    assert provider.get_ticker_earnings("ZZZZ", days_ahead=14) is None
+
+
+def test_get_ticker_earnings_out_of_window(monkeypatch) -> None:
+    import broker_client.earnings.moomoo_earnings as mod
+
+    provider = EarningsDataProvider(connector=MoomooEarningsConnector())
+    monkeypatch.setattr(mod, "_next_earnings_fmp", lambda t: date.today() + timedelta(days=60))
+    monkeypatch.setattr(mod, "_yfinance_next_date", lambda t: None)
+    assert provider.get_ticker_earnings("ACN", days_ahead=14) is None  # 60d > 14d window
+
+
 def test_provider_only_ticker_limits_enrichment(monkeypatch) -> None:
     # only_ticker → just that symbol is IV-enriched; others stay dates-only.
     conn = MoomooEarningsConnector()
