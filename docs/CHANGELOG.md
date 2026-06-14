@@ -13,6 +13,17 @@ Keep newest first. Reference the git commit where relevant.
 
 Built per `CLAUDE_PHASE3.md` (12 steps, two modules).
 
+**Moomoo IV integration (correction).** The first cut tried to read an earnings
+calendar + IV from `get_market_snapshot`, which has no such fields for a *stock*
+code — so it always fell through to FMP. Moomoo OpenD has **no earnings-calendar
+endpoint**. Corrected design (`moomoo_earnings.py`): dates come from FMP/yfinance/CSV;
+IV is enriched per ticker from `get_option_volatility` (1-year series → real
+`iv_current`, `iv_rank`, `iv_percentile`, IV-derived expected move). Per-quarter
+**IV crush history is computed** by pairing that IV series with past earnings
+dates (FMP) and realized close-to-close moves (yfinance) — `iv_before`/`iv_after`/
+`iv_crush`/`actual_move_close` per quarter — since OpenD exposes no crush table.
+Log now reads e.g. `Earnings source: FMP calendar dates + Moomoo IV (12/20 enriched)`.
+
 **Module A — Earnings Analyzer** (`broker_client/earnings/`):
 - `models.py` — `EarningsEvent`, `EarningsIVHistory`/`QuarterlyData`, `IVAnalysis`,
   `IVCrushTrade`, `IVSpikeTrade` (with a validator that **refuses** any setup not

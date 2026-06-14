@@ -1,24 +1,28 @@
 """Earnings data connector (Phase 3, Step 1).
 
-``MoomooEarningsConnector`` talks to the local Moomoo OpenD gateway for upcoming
-earnings + per-quarter IV history. Because OpenD's earnings-IV endpoints require
-permissions that may not be granted, the ``EarningsDataProvider`` wraps it in a
-priority chain that always returns *something* usable:
+**Moomoo OpenD has no earnings-calendar endpoint** — it exposes quotes, option
+chains, and option *volatility*, but not "who reports when". So the dates and the
+IV come from different places and are combined:
 
-    Priority 1: Moomoo OpenD API (full IV + per-quarter history)
-    Priority 2: Manual CSV export (broker_client/earnings/data/)
-    Priority 3: FMP earnings calendar (dates only, no IV)
-    Priority 4: yfinance earnings dates (dates only, no IV)
+    Dates  (when each company reports):
+        manual CSV export → FMP earnings-calendar → yfinance calendar
+    IV     (current implied vol, IV rank/percentile, expected move):
+        Moomoo ``get_option_volatility`` (1-year series) per ticker
+
+``EarningsDataProvider.get_upcoming_earnings`` resolves the dates, then — when
+OpenD is reachable — enriches each event in place with real Moomoo IV via
+``MoomooEarningsConnector.enrich_event_iv``. A manual CSV already carries the full
+IV columns, so it is used as-is without re-querying Moomoo.
 
 Every Moomoo call is best-effort and never raises out of the connector — a
-gateway that is down simply degrades to the next source.
+gateway that is down simply yields dates-only events.
 """
 
 from __future__ import annotations
 
 import contextlib
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -97,34 +101,90 @@ class MoomooEarningsConnector:
 
     # ── upcoming earnings ─────────────────────────────────────────────────────
     def get_upcoming_earnings(self, days_ahead: int = 14) -> list[EarningsEvent]:
-        """Fetch upcoming earnings + IV from Moomoo (``[]`` when unavailable).
+        """Always ``[]`` — Moomoo OpenD has no earnings-*calendar* endpoint.
 
-        OpenD exposes earnings calendar + IV via per-ticker snapshots. We probe
-        the watchlist tickers and keep those whose next report falls inside the
-        window. Pacing respects the 30 req/30s OpenD cap.
+        Dates come from FMP/yfinance/CSV (see ``EarningsDataProvider``); Moomoo's
+        role is IV *enrichment* per ticker via ``enrich_event_iv``. Kept as a
+        no-op so the provider's source chain stays uniform.
         """
-        try:
-            if not self._opend_reachable():
-                logger.debug("Moomoo OpenD not reachable — skipping to next source")
-                return []
-            tickers = self._watchlist_tickers()
-            if not tickers:
-                return []
-            start = date.today()
-            end = start + timedelta(days=days_ahead)
-            events: list[EarningsEvent] = []
-            for ticker in tickers:
-                event = self._fetch_earnings_iv(ticker)
-                if event is not None and start <= event.earnings_date <= end:
-                    events.append(event)
-                time.sleep(settings.MOOMOO_PACE_SECONDS)
-            return events
-        except Exception as exc:
-            logger.debug("Moomoo upcoming earnings failed: %s", exc)
-            return []
+        return []
 
-    def _fetch_earnings_iv(self, ticker: str) -> EarningsEvent | None:
-        """One ticker → EarningsEvent from a Moomoo snapshot. None on any gap."""
+    # ── IV enrichment (the real Moomoo value-add) ─────────────────────────────
+    def enrich_event_iv(self, event: EarningsEvent) -> bool:
+        """Fill ``event`` IV fields from Moomoo in place. True if IV was added.
+
+        Pulls the underlying's 1-year implied-vol series (``get_option_volatility``)
+        for current IV + IV rank/percentile, the spot price, and derives the
+        expected move from IV and days-to-expiry. Never raises.
+        """
+        if not self._opend_reachable():
+            return False
+        try:
+            iv = self.get_underlying_iv(event.ticker)
+            if iv is None:
+                return False
+            event.iv_current = iv["iv_current"]
+            event.iv_rank = iv["iv_rank"]
+            event.iv_percentile = iv["iv_percentile"]
+            spot = self.get_spot(event.ticker)
+            if spot:
+                event.stock_price = spot
+            event.expected_move = self._expected_move(iv["iv_current"], event.earnings_date)
+            event.source = "moomoo_iv"
+            logger.debug(
+                "Moomoo IV %s: iv=%.1f%% rank=%d pct=%d exp_move=±%.1f%%",
+                event.ticker, event.iv_current, event.iv_rank,
+                event.iv_percentile, event.expected_move,
+            )
+            return True
+        except Exception as exc:
+            logger.debug("Moomoo IV enrichment failed for %s: %s", event.ticker, exc)
+            return False
+
+    def get_underlying_iv(self, ticker: str) -> dict[str, Any] | None:
+        """Current IV + IV rank/percentile + HV from Moomoo's 1-year IV series.
+
+        ``get_option_volatility`` returns a time series of ``implied_volatility``
+        / ``history_volatility`` for the underlying. IV rank is where current IV
+        sits in its 52-week range; IV percentile is the fraction of days at or
+        below it. IV values are normalized to a percent (Moomoo may return either
+        a percent or a fraction depending on field). Returns None on any gap.
+        """
+        import moomoo as ft  # type: ignore[import-untyped]
+
+        ctx = self._ensure_ctx()
+        ret, df = ctx.get_option_volatility(
+            f"US.{ticker}",
+            query_time_period=ft.RangePeriod.ONE_YEAR,
+            hv_time_period=ft.OptionHVPeriod.HV_365D,
+        )
+        if ret != ft.RET_OK or not _has_rows(df) or "implied_volatility" not in df:
+            return None
+
+        frame = df.sort_values("timestamp") if "timestamp" in df else df
+        series = [
+            iv for iv in (_normalize_iv(v) for v in frame["implied_volatility"])
+            if iv is not None
+        ]
+        if not series:
+            return None
+        current = series[-1]
+        lo, hi = min(series), max(series)
+        iv_rank = 100.0 * (current - lo) / (hi - lo) if hi > lo else 50.0
+        iv_percentile = 100.0 * sum(1 for v in series if v <= current) / len(series)
+        hv = None
+        if "history_volatility" in frame:
+            hv = _normalize_iv(frame["history_volatility"].iloc[-1])
+        return {
+            "iv_current": round(current, 2),
+            "iv_rank": int(round(max(0.0, min(iv_rank, 100.0)))),
+            "iv_percentile": int(round(max(0.0, min(iv_percentile, 100.0)))),
+            "hv_current": hv,
+            "samples": len(series),
+        }
+
+    def get_spot(self, ticker: str) -> float | None:
+        """Underlying last price from a Moomoo market snapshot (None on gap)."""
         try:
             import moomoo as ft  # type: ignore[import-untyped]
 
@@ -133,60 +193,108 @@ class MoomooEarningsConnector:
             if ret != ft.RET_OK or not _has_rows(data):
                 return None
             row = data.iloc[0].to_dict() if hasattr(data, "iloc") else dict(data)
-            ed = _parse_any_date(row.get("earnings_date") or row.get("report_date"))
-            if ed is None:
-                return None
-            return EarningsEvent(
-                ticker=ticker,
-                earnings_date=ed,
-                iv_current=_num(row.get("option_implied_volatility")) or 0.0,
-                stock_price=_num(row.get("last_price")),
-                source="moomoo",
-            )
+            return _num(row.get("last_price"))
         except Exception as exc:
-            logger.debug("Moomoo IV fetch failed for %s: %s", ticker, exc)
+            logger.debug("Moomoo spot fetch failed for %s: %s", ticker, exc)
             return None
 
-    def get_earnings_iv_history(self, ticker: str) -> EarningsIVHistory:
-        """Per-quarter IV crush / expected-move history (empty when unavailable).
+    @staticmethod
+    def _expected_move(iv_pct: float, earnings_date: date) -> float:
+        """±% expected move to the post-earnings expiry, from IV and DTE.
 
-        Mirrors Moomoo's "Historical Earnings Data" table. Returns an empty
-        history rather than raising so the analyzer can fall back to the summary
-        fields on the ``EarningsEvent`` instead.
+        A 1-sigma move over ``T`` years ≈ IV·√T. We use the calendar days to the
+        first weekly expiry that captures the print (earnings + ~2 days).
+        """
+        import math
+
+        dte = max((earnings_date - date.today()).days, 0) + 2
+        return round(iv_pct * math.sqrt(dte / 365.0), 2)
+
+    def get_earnings_iv_history(self, ticker: str) -> EarningsIVHistory:
+        """Per-quarter IV-crush history, *computed* from Moomoo's IV series.
+
+        Moomoo OpenD has no "Historical Earnings Data" table, but it does serve a
+        daily implied-vol series (``get_option_volatility``). We pair that with
+        past earnings dates (FMP) and the realized close-to-close move (yfinance)
+        to reconstruct, per quarter:
+
+          * ``iv_before`` / ``iv_after`` / ``iv_crush`` — IV the trading day before
+            the print vs a few days after, and the % collapse between them.
+          * ``expected_move`` — the IV-implied 1-sigma move over that same window.
+          * ``actual_move_close`` — what the stock actually did (for breach rate).
+
+        Best-effort: returns an empty history (→ analyzer's summary path) if OpenD
+        is down or any source is missing. Never raises.
         """
         if not self._opend_reachable():
             return EarningsIVHistory(ticker=ticker, quarters=[])
         try:
-            import moomoo as ft  # type: ignore[import-untyped]
-
-            ctx = self._ensure_ctx()
-            # OpenD has no dedicated earnings-IV-history endpoint on the free
-            # tier; this hook exists for installs that do. Probe and degrade.
-            getter = getattr(ctx, "get_history_kl_quote", None)
-            if getter is None:
+            series = self._iv_series(ticker)
+            past = _past_earnings_dates(ticker)
+            if not series or not past:
                 return EarningsIVHistory(ticker=ticker, quarters=[])
-            ret, data = getter(f"US.{ticker}")  # pragma: no cover - perms-gated
-            if ret != ft.RET_OK or not _has_rows(data):  # pragma: no cover
-                return EarningsIVHistory(ticker=ticker, quarters=[])
-            quarters = [self._row_to_quarter(r) for r in _rows(data)]  # pragma: no cover
-            return EarningsIVHistory(  # pragma: no cover
-                ticker=ticker, quarters=[q for q in quarters if q is not None]
-            )
+            moves = _earnings_moves(ticker, past)
+            quarters: list[QuarterlyData] = []
+            for ed in past:
+                q = self._quarter_from_series(ed, series, moves.get(ed))
+                if q is not None:
+                    quarters.append(q)
+            logger.debug("Computed %d IV-crush quarters for %s", len(quarters), ticker)
+            return EarningsIVHistory(ticker=ticker, quarters=quarters)
         except Exception as exc:
             logger.debug("Moomoo IV history failed for %s: %s", ticker, exc)
             return EarningsIVHistory(ticker=ticker, quarters=[])
 
+    def _iv_series(self, ticker: str) -> list[tuple[date, float]]:
+        """Daily (date, IV%) series for the underlying, oldest-first."""
+        import moomoo as ft  # type: ignore[import-untyped]
+
+        ctx = self._ensure_ctx()
+        ret, df = ctx.get_option_volatility(
+            f"US.{ticker}",
+            query_time_period=ft.RangePeriod.ONE_YEAR,
+            hv_time_period=ft.OptionHVPeriod.HV_365D,
+        )
+        if ret != ft.RET_OK or not _has_rows(df) or "implied_volatility" not in df:
+            return []
+        out: list[tuple[date, float]] = []
+        for _, row in df.iterrows():
+            d = _parse_any_date(row.get("timestamp_str")) or _epoch_to_date(row.get("timestamp"))
+            iv = _normalize_iv(row.get("implied_volatility"))
+            if d is not None and iv is not None:
+                out.append((d, iv))
+        out.sort(key=lambda x: x[0])
+        return out
+
     @staticmethod
-    def _row_to_quarter(row: dict[str, Any]) -> QuarterlyData | None:  # pragma: no cover
-        try:
-            return QuarterlyData(
-                quarter=str(row.get("period_text", "")),
-                iv_crush=_num(row.get("iv_crush")),
-                expected_move=_num(row.get("expected_move")),
-                actual_move_close=_num(row.get("actual_move")),
-            )
-        except Exception:
+    def _quarter_from_series(
+        earnings_date: date,
+        series: list[tuple[date, float]],
+        actual_move: float | None,
+    ) -> QuarterlyData | None:
+        """One quarter's crush from IV just-before vs just-after the print."""
+        import math
+
+        before = [iv for d, iv in series if 0 <= (earnings_date - d).days <= 3]
+        after = [iv for d, iv in series if 1 <= (d - earnings_date).days <= 4]
+        if not before or not after:
             return None
+        iv_before = before[-1]        # closest trading day at/just-before earnings
+        iv_after = after[0]           # first sample after the print
+        if iv_before <= 0:
+            return None
+        crush = (iv_before - iv_after) / iv_before * 100.0
+        window_days = 3               # ~before→after holding window
+        expected_move = iv_before * math.sqrt(window_days / 365.0)
+        return QuarterlyData(
+            quarter=earnings_date.isoformat(),
+            earnings_date=earnings_date,
+            iv_before=round(iv_before, 2),
+            iv_after=round(iv_after, 2),
+            iv_crush=round(crush, 2),
+            expected_move=round(expected_move, 2),
+            actual_move_close=actual_move,
+        )
 
     @staticmethod
     def _watchlist_tickers() -> list[str]:
@@ -216,31 +324,68 @@ class EarningsDataProvider:
         self.manual = manual or ManualEarningsInput()
 
     def get_upcoming_earnings(self, days_ahead: int | None = None) -> list[EarningsEvent]:
-        """First source that returns events wins; logs which one was used."""
-        days = days_ahead if days_ahead is not None else settings.EARNINGS_DAYS_AHEAD
+        """Resolve earnings dates, then enrich each with Moomoo IV in place.
 
+        Dates: manual CSV → FMP calendar → yfinance. IV: Moomoo
+        ``get_option_volatility`` per ticker (when OpenD is reachable). A manual
+        CSV already carries full IV, so it is not re-queried.
+        """
+        days = days_ahead if days_ahead is not None else settings.EARNINGS_DAYS_AHEAD
+        events, source, has_iv = self._resolve_dates(days)
+        if not events:
+            logger.warning("No earnings data from any source (CSV/FMP/yfinance)")
+            return []
+
+        events = self._within_window(events, days)
+        enriched = 0 if has_iv else self._enrich_iv(events)
+
+        if enriched:
+            logger.info(
+                "Earnings source: %s dates + Moomoo IV (%d/%d enriched)",
+                source, enriched, len(events),
+            )
+        elif has_iv:
+            logger.info("Earnings source: %s (%d events, IV included)", source, len(events))
+        else:
+            logger.info(
+                "Earnings source: %s (%d events, dates only — Moomoo IV unavailable)",
+                source, len(events),
+            )
+        return events
+
+    def _resolve_dates(self, days: int) -> tuple[list[EarningsEvent], str, bool]:
+        """(events, source_label, dates_already_have_iv). First non-empty wins."""
+        # A legacy/native Moomoo events hook (normally empty — no calendar API).
         events = self.connector.get_upcoming_earnings(days)
         if events:
-            logger.info("Earnings source: Moomoo OpenD (%d events)", len(events))
-            return self._within_window(events, days)
+            return events, "Moomoo OpenD", True
 
         events = self.manual.load()
         if events:
-            logger.info("Earnings source: manual CSV (%d events)", len(events))
-            return self._within_window(events, days)
+            return events, "manual CSV", True  # CSV carries full IV columns
 
         events = self._fmp_calendar(days)
         if events:
-            logger.info("Earnings source: FMP calendar (%d events, dates only)", len(events))
-            return events
+            return events, "FMP calendar", False
 
         events = self._yfinance_dates(days)
         if events:
-            logger.info("Earnings source: yfinance (%d events, dates only)", len(events))
-            return events
+            return events, "yfinance", False
 
-        logger.warning("No earnings data from any source (Moomoo/CSV/FMP/yfinance)")
-        return []
+        return [], "none", False
+
+    def _enrich_iv(self, events: list[EarningsEvent]) -> int:
+        """Enrich dates-only events with Moomoo IV. Returns how many got IV."""
+        if not self.connector._opend_reachable():
+            return 0
+        enriched = 0
+        for event in events:
+            if event.iv_current and event.iv_current > 0:
+                continue  # already has IV (e.g. from CSV)
+            if self.connector.enrich_event_iv(event):
+                enriched += 1
+            time.sleep(settings.MOOMOO_PACE_SECONDS)  # 30 req/30s OpenD cap
+        return enriched
 
     def get_iv_history(self, ticker: str) -> EarningsIVHistory:
         return self.connector.get_earnings_iv_history(ticker)
@@ -329,6 +474,19 @@ def _num(value: Any) -> float | None:
     return None if f != f or abs(f) >= 1e12 else f  # f != f catches NaN
 
 
+def _normalize_iv(value: Any) -> float | None:
+    """Implied/historical vol as a percent.
+
+    Moomoo returns IV as a percent (45.2 = 45.2%) on most fields, but some feeds
+    give a fraction (0.452). Values < 3 are treated as fractions and scaled up;
+    non-positive / sentinel values are dropped.
+    """
+    v = _num(value)
+    if v is None or v <= 0:
+        return None
+    return round(v, 2) if v >= 3 else round(v * 100.0, 2)
+
+
 def _parse_any_date(value: Any) -> date | None:
     if value is None or value == "":
         return None
@@ -356,6 +514,82 @@ def _parse_any_date(value: Any) -> date | None:
         return None
 
 
+def _epoch_to_date(value: Any) -> date | None:
+    """Epoch seconds (Moomoo IV-series timestamp) → date. None on any gap."""
+    v = _num(value)
+    if v is None or v <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(v, tz=timezone.utc).date()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _past_earnings_dates(ticker: str, lookback_days: int = 400, limit: int = 8) -> list[date]:
+    """Past earnings dates (most-recent first) from FMP, within the IV window.
+
+    Used to align Moomoo's IV series to each prior print. Returns [] when FMP is
+    unconfigured or the call fails — the caller then yields no IV history.
+    """
+    if not settings.FMP_API_KEY:
+        return []
+    today = date.today()
+    earliest = today - timedelta(days=lookback_days)
+    try:
+        resp = requests.get(
+            f"{_FMP_BASE}/earnings",
+            params={"symbol": ticker.upper(), "apikey": settings.FMP_API_KEY},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return []
+        dates: list[date] = []
+        for row in resp.json() or []:
+            ed = _parse_any_date(row.get("date"))
+            if ed is not None and earliest <= ed < today:
+                dates.append(ed)
+        return sorted(set(dates), reverse=True)[:limit]
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.debug("FMP past earnings failed for %s: %s", ticker, exc)
+        return []
+
+
+def _earnings_moves(ticker: str, dates: list[date]) -> dict[date, float]:
+    """Signed close-to-close % move around each earnings date (best-effort).
+
+    Uses yfinance daily closes: the move from the last close before the print to
+    the first close after it. Missing data degrades to an absent entry (the
+    quarter then carries no actual-move, so it's skipped from breach analysis).
+    """
+    if not dates:
+        return {}
+    try:
+        import pandas as pd  # noqa: F401
+        import yfinance as yf
+
+        start = (min(dates) - timedelta(days=5)).isoformat()
+        end = (max(dates) + timedelta(days=6)).isoformat()
+        hist = yf.Ticker(ticker).history(start=start, end=end)
+        if hist is None or hist.empty:
+            return {}
+        closes = hist["Close"]
+        idx_dates = [d.date() for d in closes.index]
+        out: dict[date, float] = {}
+        for ed in dates:
+            before = [(d, c) for d, c in zip(idx_dates, closes) if d <= ed]
+            after = [(d, c) for d, c in zip(idx_dates, closes) if d > ed]
+            if not before or not after:
+                continue
+            prev_close = before[-1][1]
+            post_close = after[0][1]
+            if prev_close:
+                out[ed] = round((post_close - prev_close) / prev_close * 100.0, 2)
+        return out
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        logger.debug("Earnings moves failed for %s: %s", ticker, exc)
+        return {}
+
+
 def _fmp_time(raw: object) -> str:
     t = str(raw or "").strip().lower()
     if t in ("bmo", "before market open"):
@@ -373,14 +607,6 @@ def _has_rows(data: Any) -> bool:
     if isinstance(data, list | tuple):
         return len(data) > 0
     return bool(data)
-
-
-def _rows(data: Any) -> list[dict[str, Any]]:  # pragma: no cover - perms-gated path
-    if hasattr(data, "to_dict"):
-        return list(data.to_dict("records"))
-    if isinstance(data, list):
-        return [r if isinstance(r, dict) else dict(r) for r in data]
-    return []
 
 
 __all__ = ["MoomooEarningsConnector", "EarningsDataProvider"]

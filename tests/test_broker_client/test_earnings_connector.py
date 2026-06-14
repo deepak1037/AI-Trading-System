@@ -12,9 +12,38 @@ from broker_client.earnings.moomoo_earnings import (
     EarningsDataProvider,
     MoomooEarningsConnector,
     _fmp_time,
+    _normalize_iv,
     _num,
     _parse_any_date,
 )
+
+
+class _FakeCtx:
+    """Stand-in for a Moomoo OpenQuoteContext for the IV-enrichment path."""
+
+    def __init__(self, ivs, spot=150.0, hv=20.0) -> None:
+        self._ivs = ivs
+        self._spot = spot
+        self._hv = hv
+
+    def get_option_volatility(self, code, query_time_period=None, hv_time_period=None):
+        import moomoo as ft  # type: ignore[import-untyped]
+        import pandas as pd
+
+        df = pd.DataFrame(
+            {
+                "timestamp": list(range(len(self._ivs))),
+                "implied_volatility": self._ivs,
+                "history_volatility": [self._hv] * len(self._ivs),
+            }
+        )
+        return ft.RET_OK, df
+
+    def get_market_snapshot(self, codes):
+        import moomoo as ft  # type: ignore[import-untyped]
+        import pandas as pd
+
+        return ft.RET_OK, pd.DataFrame([{"last_price": self._spot}])
 
 _MOOMOO_CSV = (
     "Ticker,Earnings Date,IV,Last IV Crush,Historical IV Crush,IV Rank,"
@@ -159,6 +188,78 @@ def test_provider_returns_empty_when_no_source(monkeypatch) -> None:
     assert provider.get_upcoming_earnings(14) == []
 
 
+def test_epoch_to_date() -> None:
+    from broker_client.earnings.moomoo_earnings import _epoch_to_date
+
+    assert _epoch_to_date(1_700_000_000).year == 2023
+    assert _epoch_to_date(0) is None
+    assert _epoch_to_date(None) is None
+
+
+def test_quarter_from_series_computes_crush() -> None:
+    ed = date(2026, 3, 10)
+    series = [(ed - timedelta(days=10), 30.0), (ed - timedelta(days=1), 60.0),
+              (ed + timedelta(days=2), 35.0)]
+    q = MoomooEarningsConnector._quarter_from_series(ed, series, actual_move=-8.0)
+    assert q is not None
+    assert q.iv_before == 60.0
+    assert q.iv_after == 35.0
+    assert q.iv_crush == pytest.approx((60 - 35) / 60 * 100, abs=0.1)  # ~41.7%
+    assert q.actual_move_close == -8.0
+    assert q.expected_move > 0
+
+
+def test_quarter_from_series_skips_without_after_sample() -> None:
+    ed = date(2026, 3, 10)
+    series = [(ed - timedelta(days=1), 60.0)]  # no post-earnings sample
+    assert MoomooEarningsConnector._quarter_from_series(ed, series, None) is None
+
+
+def test_iv_series_parses_dataframe(monkeypatch) -> None:
+    import pandas as pd
+
+    class _Ctx:
+        def get_option_volatility(self, code, query_time_period=None, hv_time_period=None):
+            import moomoo as ft  # type: ignore[import-untyped]
+
+            df = pd.DataFrame({
+                "timestamp_str": ["2026-03-12", "2026-03-09"],
+                "implied_volatility": [35.0, 60.0],
+            })
+            return ft.RET_OK, df
+
+    conn = MoomooEarningsConnector()
+    conn._ctx = _Ctx()
+    series = conn._iv_series("NVDA")
+    assert series == [(date(2026, 3, 9), 60.0), (date(2026, 3, 12), 35.0)]  # sorted oldest-first
+
+
+def test_get_earnings_iv_history_orchestration(monkeypatch) -> None:
+    import broker_client.earnings.moomoo_earnings as mod
+
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    ed = date.today() - timedelta(days=90)
+    monkeypatch.setattr(
+        conn, "_iv_series",
+        lambda t: [(ed - timedelta(days=1), 60.0), (ed + timedelta(days=2), 35.0)],
+    )
+    monkeypatch.setattr(mod, "_past_earnings_dates", lambda t, **kw: [ed])
+    monkeypatch.setattr(mod, "_earnings_moves", lambda t, dates: {ed: -8.0})
+
+    hist = conn.get_earnings_iv_history("NVDA")
+    assert hist.count == 1
+    q = hist.quarters[0]
+    assert q.iv_crush == pytest.approx(41.67, abs=0.1)
+    assert q.actual_move_close == -8.0
+
+
+def test_get_earnings_iv_history_empty_when_opend_down(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: False)
+    assert conn.get_earnings_iv_history("NVDA").count == 0
+
+
 def test_iv_history_empty_when_unavailable(monkeypatch) -> None:
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(
@@ -171,7 +272,114 @@ def test_iv_history_empty_when_unavailable(monkeypatch) -> None:
     assert hist.count == 0
 
 
-def test_watchlist_tickers_empty_without_db(monkeypatch) -> None:
-    # No watchlist rows → empty list, and get_upcoming_earnings returns [] early.
-    monkeypatch.setattr(MoomooEarningsConnector, "_watchlist_tickers", staticmethod(lambda: []))
+def test_connector_no_native_earnings_calendar() -> None:
+    # Moomoo has no earnings-calendar endpoint → connector.get_upcoming_earnings is [].
     assert MoomooEarningsConnector().get_upcoming_earnings(14) == []
+
+
+# ── Moomoo IV enrichment ────────────────────────────────────────────────────────
+def test_normalize_iv() -> None:
+    assert _normalize_iv(45.2) == 45.2      # already a percent
+    assert _normalize_iv(0.45) == 45.0      # fraction → percent
+    assert _normalize_iv(0) is None
+    assert _normalize_iv(None) is None
+
+
+def test_get_underlying_iv_computes_rank_and_percentile(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    conn._ctx = _FakeCtx(ivs=[20, 30, 40, 50, 45])  # latest = 45
+    iv = conn.get_underlying_iv("NVDA")
+    assert iv is not None
+    assert iv["iv_current"] == 45.0
+    assert iv["iv_rank"] == 83            # (45-20)/(50-20)*100
+    assert iv["iv_percentile"] == 80      # 4 of 5 values <= 45
+    assert iv["samples"] == 5
+
+
+def test_get_underlying_iv_empty_series_returns_none(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    conn._ctx = _FakeCtx(ivs=[])
+    assert conn.get_underlying_iv("X") is None
+
+
+def test_enrich_event_iv_fills_fields(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    conn._ctx = _FakeCtx(ivs=[20, 30, 40, 50, 45], spot=135.0)
+    event = EarningsEvent(ticker="NVDA", earnings_date=date.today() + timedelta(days=10))
+    assert conn.enrich_event_iv(event) is True
+    assert event.iv_current == 45.0
+    assert event.iv_rank == 83
+    assert event.iv_percentile == 80
+    assert event.stock_price == 135.0
+    assert event.expected_move > 0          # derived from IV + DTE
+    assert event.source == "moomoo_iv"
+
+
+def test_enrich_event_iv_skips_when_opend_down(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: False)
+    event = EarningsEvent(ticker="NVDA", earnings_date=date.today() + timedelta(days=10))
+    assert conn.enrich_event_iv(event) is False
+    assert event.iv_current == 0.0
+
+
+def test_expected_move_scales_with_iv() -> None:
+    far = date.today() + timedelta(days=10)
+    low = MoomooEarningsConnector._expected_move(20.0, far)
+    high = MoomooEarningsConnector._expected_move(60.0, far)
+    assert high > low > 0
+
+
+def test_provider_enriches_fmp_dates_with_moomoo_iv(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    conn._ctx = _FakeCtx(ivs=[20, 30, 40, 50, 45], spot=135.0)
+    manual = ManualEarningsInput("/no/file.csv")
+    monkeypatch.setattr(manual, "load", lambda: [])
+    provider = EarningsDataProvider(connector=conn, manual=manual)
+    # FMP supplies dates-only events; Moomoo supplies the IV.
+    fmp_event = EarningsEvent(ticker="NVDA", earnings_date=date.today() + timedelta(days=8))
+    monkeypatch.setattr(provider, "_fmp_calendar", lambda days: [fmp_event])
+    out = provider.get_upcoming_earnings(14)
+    assert len(out) == 1
+    assert out[0].source == "moomoo_iv"
+    assert out[0].iv_current == 45.0
+    assert out[0].iv_rank == 83
+
+
+def test_provider_dates_only_when_opend_down(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: False)
+    manual = ManualEarningsInput("/no/file.csv")
+    monkeypatch.setattr(manual, "load", lambda: [])
+    provider = EarningsDataProvider(connector=conn, manual=manual)
+    fmp_event = EarningsEvent(
+        ticker="NVDA", earnings_date=date.today() + timedelta(days=8), source="fmp",
+    )
+    monkeypatch.setattr(provider, "_fmp_calendar", lambda days: [fmp_event])
+    out = provider.get_upcoming_earnings(14)
+    assert len(out) == 1
+    assert out[0].source == "fmp"          # not enriched
+    assert out[0].iv_current == 0.0
+
+
+def test_provider_csv_not_re_queried(monkeypatch) -> None:
+    # CSV already has IV → provider must NOT call Moomoo enrichment.
+    conn = MoomooEarningsConnector()
+    called = {"enrich": 0}
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    monkeypatch.setattr(
+        conn, "enrich_event_iv",
+        lambda e: called.__setitem__("enrich", called["enrich"] + 1) or True,
+    )
+    manual = ManualEarningsInput("/no/file.csv")
+    csv_event = EarningsEvent(
+        ticker="CSV", earnings_date=date.today() + timedelta(days=3), iv_current=55.0,
+    )
+    monkeypatch.setattr(manual, "load", lambda: [csv_event])
+    provider = EarningsDataProvider(connector=conn, manual=manual)
+    out = provider.get_upcoming_earnings(14)
+    assert out[0].iv_current == 55.0
+    assert called["enrich"] == 0           # CSV path never re-queries Moomoo
