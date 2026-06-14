@@ -200,6 +200,11 @@ earnings-ticker: _check_venv _mklogs
 	@test -n "$(ticker)" || (echo "Usage: make earnings-ticker ticker=NVDA" && exit 1)
 	@$(PYTHON) -m broker_client.earnings.cli --ticker $(ticker)
 
+# Diagnose Moomoo OpenD IV endpoints (which call works, exact ret/data)
+.PHONY: moomoo-iv-debug
+moomoo-iv-debug: _check_venv
+	@$(PYTHON) scripts/moomoo_iv_debug.py --ticker $(or $(ticker),AAPL)
+
 # ── paper-balance: paper account summary ─────────────────────────────────────
 .PHONY: paper-balance
 paper-balance: _check_venv

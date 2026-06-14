@@ -13,6 +13,20 @@ Keep newest first. Reference the git commit where relevant.
 
 Built per `CLAUDE_PHASE3.md` (12 steps, two modules).
 
+**Moomoo IV enum bug (silent failure).** Even with OpenD connected, IV enrichment
+returned nothing because `get_option_volatility` was called with
+`ft.RangePeriod.ONE_YEAR` (=3) — but that field's enum is
+`OptionVolatilityTimePeriodType`, where **3 = Quarter** and **Year = 5**. The wrong
+period plus a `RET_ERROR` path that returned `None` with *no logging* made it look
+like "no IV." Fixes: send the correct period (`OptionVolatilityTimePeriodType_Year`
+= 5, via `_vol_year_period()`); **log the real `ret`/message** on failure; add an
+**ATM-chain IV fallback** (`get_atm_iv`: nearest expiry → ATM call/put →
+`get_market_snapshot` `option_implied_volatility` + straddle expected move) for when
+`get_option_volatility` is unentitled; and ship `scripts/moomoo_iv_debug.py`
+(`make moomoo-iv-debug ticker=AAPL`) that prints raw `(ret, data)` for every IV
+endpoint. Note: the option *chain* carries no IV — IV per contract comes from the
+option code's market snapshot.
+
 **Moomoo IV integration (correction).** The first cut tried to read an earnings
 calendar + IV from `get_market_snapshot`, which has no such fields for a *stock*
 code — so it always fell through to FMP. Moomoo OpenD has **no earnings-calendar

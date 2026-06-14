@@ -303,6 +303,116 @@ def test_get_underlying_iv_empty_series_returns_none(monkeypatch) -> None:
     assert conn.get_underlying_iv("X") is None
 
 
+def test_option_volatility_uses_year_period_not_quarter() -> None:
+    """Regression: must send OptionVolatilityTimePeriodType_Year (5), not 3."""
+    from broker_client.earnings.moomoo_earnings import _vol_year_period
+
+    assert _vol_year_period() == 5            # Year, not RangePeriod.ONE_YEAR (3=Quarter)
+
+    class _RecCtx:
+        def __init__(self) -> None:
+            self.period = "unset"
+
+        def get_option_volatility(self, code, query_time_period=None, hv_time_period=None):
+            import moomoo as ft  # type: ignore[import-untyped]
+            import pandas as pd
+
+            self.period = query_time_period
+            df = pd.DataFrame(
+                {"timestamp": [1, 2], "implied_volatility": [30.0, 45.0],
+                 "history_volatility": [20.0, 20.0]}
+            )
+            return ft.RET_OK, df
+
+    conn = MoomooEarningsConnector()
+    rec = _RecCtx()
+    conn._ctx = rec
+    iv = conn.get_underlying_iv("NVDA")
+    assert rec.period == 5                    # the corrected enum value
+    assert iv is not None and iv["iv_source"] == "option_volatility"
+
+
+def test_get_underlying_iv_returns_none_on_ret_error(monkeypatch, caplog) -> None:
+    class _ErrCtx:
+        def get_option_volatility(self, code, query_time_period=None, hv_time_period=None):
+            import moomoo as ft  # type: ignore[import-untyped]
+
+            return ft.RET_ERROR, "no option volatility data entitlement"
+
+    conn = MoomooEarningsConnector()
+    conn._ctx = _ErrCtx()
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert conn.get_underlying_iv("X") is None
+    # No longer silent: the real ret message is surfaced.
+    assert any("no option volatility data" in r.message for r in caplog.records)
+
+
+# ── ATM-chain IV fallback ───────────────────────────────────────────────────────
+class _FakeCtxATM:
+    """option_volatility fails, but the option chain + snapshot work."""
+
+    def get_option_volatility(self, code, query_time_period=None, hv_time_period=None):
+        import moomoo as ft  # type: ignore[import-untyped]
+
+        return ft.RET_ERROR, "no IV series"
+
+    def get_market_snapshot(self, codes):
+        import moomoo as ft  # type: ignore[import-untyped]
+        import pandas as pd
+
+        rows = []
+        for c in codes:
+            sym = c.split(".")[-1]
+            if any(ch.isdigit() for ch in sym):          # an option code
+                rows.append({"option_implied_volatility": 48.0 if "C" in sym else 52.0,
+                             "option_premium": 5.0})
+            else:                                         # the underlying stock
+                rows.append({"last_price": 150.0})
+        return ft.RET_OK, pd.DataFrame(rows)
+
+    def get_option_expiration_date(self, code, index_option_type="NORMAL"):
+        import moomoo as ft  # type: ignore[import-untyped]
+        import pandas as pd
+
+        return ft.RET_OK, pd.DataFrame({"strike_time": ["2026-07-17"]})
+
+    def get_option_chain(self, code, start=None, end=None, **kw):
+        import moomoo as ft  # type: ignore[import-untyped]
+        import pandas as pd
+
+        return ft.RET_OK, pd.DataFrame({
+            "code": ["US.AAPL260717C150", "US.AAPL260717P150", "US.AAPL260717C200"],
+            "option_type": ["CALL", "PUT", "CALL"],
+            "strike_price": [150.0, 150.0, 200.0],
+        })
+
+
+def test_atm_iv_fallback(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    conn._ctx = _FakeCtxATM()
+    iv = conn.get_atm_iv("AAPL", spot=150.0, earnings_date=date(2026, 7, 15))
+    assert iv is not None
+    assert iv["iv_current"] == 50.0           # avg(48, 52)
+    assert iv["iv_rank"] is None              # single point — not rankable
+    assert iv["expected_move"] == pytest.approx(10 / 150 * 100, abs=0.1)  # straddle 5+5
+    assert iv["iv_source"] == "atm_chain"
+
+
+def test_enrich_uses_atm_when_volatility_unavailable(monkeypatch) -> None:
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    conn._ctx = _FakeCtxATM()
+    event = EarningsEvent(ticker="AAPL", earnings_date=date(2026, 7, 15))
+    assert conn.enrich_event_iv(event) is True
+    assert event.iv_current == 50.0
+    assert event.expected_move > 0
+    assert event.source == "moomoo_iv"
+    assert event.iv_rank == 0                 # ATM path can't rank → left at default
+
+
 def test_enrich_event_iv_fills_fields(monkeypatch) -> None:
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)

@@ -40,6 +40,23 @@ logger = get_logger(__name__)
 
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 
+# get_option_volatility's queryTimePeriod uses Qot_Common.OptionVolatilityTimePeriodType
+# (Year = 5). The SDK exposes NO friendly enum for it, and — critically —
+# ft.RangePeriod.ONE_YEAR is a DIFFERENT enum whose value 3 means *Quarter* here.
+_HV_PERIOD_365D = 4  # OptionHVPeriod.HV_365D (hvTimePeriod is a plain int field)
+
+
+def _vol_year_period() -> int:
+    """The protobuf value for a 1-year IV window (OptionVolatilityTimePeriodType_Year)."""
+    try:
+        from moomoo.common.pb.Qot_Common_pb2 import (  # type: ignore[import-untyped]
+            OptionVolatilityTimePeriodType_Year,
+        )
+
+        return int(OptionVolatilityTimePeriodType_Year)
+    except Exception:  # noqa: BLE001 — value is stable across SDK builds
+        return 5
+
 
 class MoomooEarningsConnector:
     """Best-effort Moomoo OpenD earnings/IV connector.
@@ -113,52 +130,86 @@ class MoomooEarningsConnector:
     def enrich_event_iv(self, event: EarningsEvent) -> bool:
         """Fill ``event`` IV fields from Moomoo in place. True if IV was added.
 
-        Pulls the underlying's 1-year implied-vol series (``get_option_volatility``)
-        for current IV + IV rank/percentile, the spot price, and derives the
-        expected move from IV and days-to-expiry. Never raises.
+        Primary source is the 1-year IV series (``get_option_volatility``), which
+        yields current IV + IV rank/percentile. If that serves nothing, falls back
+        to the ATM option's snapshot IV + straddle-implied expected move (no rank).
+        Spot comes from the market snapshot. Never raises.
         """
         if not self._opend_reachable():
             return False
         try:
-            iv = self.get_underlying_iv(event.ticker)
-            if iv is None:
-                return False
-            event.iv_current = iv["iv_current"]
-            event.iv_rank = iv["iv_rank"]
-            event.iv_percentile = iv["iv_percentile"]
             spot = self.get_spot(event.ticker)
             if spot:
                 event.stock_price = spot
-            event.expected_move = self._expected_move(iv["iv_current"], event.earnings_date)
+
+            iv = self.get_underlying_iv(event.ticker)
+            if iv is None:
+                iv = self.get_atm_iv(event.ticker, spot, event.earnings_date)
+            if iv is None:
+                return False
+
+            event.iv_current = iv["iv_current"]
+            if iv.get("iv_rank") is not None:
+                event.iv_rank = iv["iv_rank"]
+            if iv.get("iv_percentile") is not None:
+                event.iv_percentile = iv["iv_percentile"]
+            event.expected_move = iv.get("expected_move") or self._expected_move(
+                iv["iv_current"], event.earnings_date
+            )
             event.source = "moomoo_iv"
-            logger.debug(
-                "Moomoo IV %s: iv=%.1f%% rank=%d pct=%d exp_move=±%.1f%%",
-                event.ticker, event.iv_current, event.iv_rank,
-                event.iv_percentile, event.expected_move,
+            logger.info(
+                "Moomoo IV %s: iv=%.1f%% rank=%s pct=%s exp_move=±%.1f%% (via %s)",
+                event.ticker, event.iv_current, event.iv_rank, event.iv_percentile,
+                event.expected_move, iv.get("iv_source", "?"),
             )
             return True
-        except Exception as exc:
-            logger.debug("Moomoo IV enrichment failed for %s: %s", event.ticker, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Moomoo IV enrichment failed for %s: %s", event.ticker, exc)
             return False
+
+    def _option_volatility_df(self, ticker: str) -> Any | None:
+        """Raw 1-year IV/HV DataFrame from ``get_option_volatility``, or None.
+
+        Surfaces the actual ``ret``/message on failure (the old code swallowed it,
+        which is why a broken call looked like "no IV"). Uses the CORRECT period
+        enum — ``OptionVolatilityTimePeriodType_Year`` (=5). The earlier code sent
+        ``RangePeriod.ONE_YEAR`` (=3), which in this field's enum means *Quarter*.
+        Falls back to the server-default window if the explicit period errors.
+        """
+        import moomoo as ft  # type: ignore[import-untyped]
+
+        ctx = self._ensure_ctx()
+        code = f"US.{ticker}"
+        last: Any = "no response"
+        for period in (_vol_year_period(), None):
+            try:
+                ret, df = ctx.get_option_volatility(
+                    code, query_time_period=period, hv_time_period=_HV_PERIOD_365D
+                )
+            except Exception as exc:  # noqa: BLE001 — try the next variant
+                last = repr(exc)
+                continue
+            if ret == ft.RET_OK and _has_rows(df) and "implied_volatility" in df:
+                return df
+            # On RET_ERROR moomoo returns (RET_ERROR, message_string).
+            last = df if ret != ft.RET_OK else "empty IV series"
+        logger.warning(
+            "Moomoo get_option_volatility('%s') returned no IV (period tried "
+            "Year+default): %s", code, last,
+        )
+        return None
 
     def get_underlying_iv(self, ticker: str) -> dict[str, Any] | None:
         """Current IV + IV rank/percentile + HV from Moomoo's 1-year IV series.
 
         ``get_option_volatility`` returns a time series of ``implied_volatility``
         / ``history_volatility`` for the underlying. IV rank is where current IV
-        sits in its 52-week range; IV percentile is the fraction of days at or
-        below it. IV values are normalized to a percent (Moomoo may return either
-        a percent or a fraction depending on field). Returns None on any gap.
+        sits in its range; IV percentile is the fraction of days at or below it.
+        Returns None when Moomoo serves no IV (logged) — the caller then tries the
+        ATM-chain fallback.
         """
-        import moomoo as ft  # type: ignore[import-untyped]
-
-        ctx = self._ensure_ctx()
-        ret, df = ctx.get_option_volatility(
-            f"US.{ticker}",
-            query_time_period=ft.RangePeriod.ONE_YEAR,
-            hv_time_period=ft.OptionHVPeriod.HV_365D,
-        )
-        if ret != ft.RET_OK or not _has_rows(df) or "implied_volatility" not in df:
+        df = self._option_volatility_df(ticker)
+        if df is None:
             return None
 
         frame = df.sort_values("timestamp") if "timestamp" in df else df
@@ -181,6 +232,109 @@ class MoomooEarningsConnector:
             "iv_percentile": int(round(max(0.0, min(iv_percentile, 100.0)))),
             "hv_current": hv,
             "samples": len(series),
+            "iv_source": "option_volatility",
+        }
+
+    def get_atm_iv(
+        self, ticker: str, spot: float | None, earnings_date: date
+    ) -> dict[str, Any] | None:
+        """Fallback IV from the ATM option's snapshot (no IV rank).
+
+        Used when ``get_option_volatility`` serves nothing (e.g. no option-vol
+        data entitlement). Picks the nearest expiry on/after earnings, finds the
+        ATM call+put, and reads ``option_implied_volatility`` + ``option_premium``
+        from ``get_market_snapshot`` — the same snapshot call that already works.
+        Expected move comes from the ATM straddle. IV rank/percentile are left
+        absent (a single point can't be ranked). Returns None on any gap.
+        """
+        import moomoo as ft  # type: ignore[import-untyped]
+
+        ctx = self._ensure_ctx()
+        code = f"US.{ticker}"
+        try:
+            if spot is None:
+                spot = self.get_spot(ticker)
+            if not spot or spot <= 0:
+                return None
+            expiry = self._nearest_expiry(ctx, code, earnings_date)
+            if expiry is None:
+                logger.warning("Moomoo ATM IV %s: no option expiry found", ticker)
+                return None
+            ret, chain = ctx.get_option_chain(code, start=expiry, end=expiry)
+            if ret != ft.RET_OK or not _has_rows(chain):
+                logger.warning("Moomoo ATM IV %s: option chain empty (%s)", ticker, chain)
+                return None
+            call_code, put_code = self._atm_codes(chain, spot)
+            if not call_code or not put_code:
+                return None
+            ret, snap = ctx.get_market_snapshot([call_code, put_code])
+            if ret != ft.RET_OK or not _has_rows(snap):
+                logger.warning("Moomoo ATM IV %s: option snapshot empty (%s)", ticker, snap)
+                return None
+            return self._atm_from_snapshot(snap, spot)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Moomoo ATM IV failed for %s: %s", ticker, exc)
+            return None
+
+    @staticmethod
+    def _nearest_expiry(ctx: Any, code: str, earnings_date: date) -> str | None:
+        """First listed option expiry on/after earnings (else the latest)."""
+        import moomoo as ft  # type: ignore[import-untyped]
+
+        ret, exp = ctx.get_option_expiration_date(code)
+        if ret != ft.RET_OK or not _has_rows(exp) or "strike_time" not in exp:
+            return None
+        dates = sorted(str(s) for s in exp["strike_time"] if s)
+        for s in dates:
+            d = _parse_any_date(s)
+            if d is not None and d >= earnings_date:
+                return s
+        return dates[-1] if dates else None
+
+    @staticmethod
+    def _atm_codes(chain: Any, spot: float) -> tuple[str | None, str | None]:
+        """ATM call + put option codes (strike closest to spot)."""
+        rows = chain.to_dict("records") if hasattr(chain, "to_dict") else list(chain)
+        calls = [r for r in rows if str(r.get("option_type", "")).upper().endswith("CALL")]
+        puts = [r for r in rows if str(r.get("option_type", "")).upper().endswith("PUT")]
+
+        def _closest(rs: list[dict]) -> str | None:
+            usable = [r for r in rs if _num(r.get("strike_price")) is not None]
+            if not usable:
+                return None
+            best = min(usable, key=lambda r: abs(_num(r["strike_price"]) - spot))  # type: ignore[operator]
+            return str(best.get("code")) if best.get("code") else None
+
+        return _closest(calls), _closest(puts)
+
+    @staticmethod
+    def _atm_from_snapshot(snap: Any, spot: float) -> dict[str, Any] | None:
+        """ATM IV (avg of call/put) + straddle-implied expected move."""
+        rows = snap.to_dict("records") if hasattr(snap, "to_dict") else list(snap)
+        ivs: list[float] = []
+        prems: list[float] = []
+        for r in rows:
+            iv = _normalize_iv(r.get("option_implied_volatility"))
+            if iv is not None:
+                ivs.append(iv)
+            prem = _num(r.get("option_premium"))
+            if prem is None:
+                prem = _num(r.get("last_price"))
+            if prem is not None:
+                prems.append(prem)
+        if not ivs:
+            return None
+        iv_current = round(sum(ivs) / len(ivs), 2)
+        expected_move = (
+            round(sum(prems) / spot * 100.0, 2) if prems and spot > 0 else 0.0
+        )
+        return {
+            "iv_current": iv_current,
+            "iv_rank": None,            # single point — not rankable
+            "iv_percentile": None,
+            "hv_current": None,
+            "expected_move": expected_move,
+            "iv_source": "atm_chain",
         }
 
     def get_spot(self, ticker: str) -> float | None:
@@ -247,15 +401,8 @@ class MoomooEarningsConnector:
 
     def _iv_series(self, ticker: str) -> list[tuple[date, float]]:
         """Daily (date, IV%) series for the underlying, oldest-first."""
-        import moomoo as ft  # type: ignore[import-untyped]
-
-        ctx = self._ensure_ctx()
-        ret, df = ctx.get_option_volatility(
-            f"US.{ticker}",
-            query_time_period=ft.RangePeriod.ONE_YEAR,
-            hv_time_period=ft.OptionHVPeriod.HV_365D,
-        )
-        if ret != ft.RET_OK or not _has_rows(df) or "implied_volatility" not in df:
+        df = self._option_volatility_df(ticker)
+        if df is None:
             return []
         out: list[tuple[date, float]] = []
         for _, row in df.iterrows():
