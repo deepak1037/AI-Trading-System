@@ -481,12 +481,15 @@ class EarningsDataProvider:
         self.connector = connector or MoomooEarningsConnector()
         self.manual = manual or ManualEarningsInput()
 
-    def get_upcoming_earnings(self, days_ahead: int | None = None) -> list[EarningsEvent]:
+    def get_upcoming_earnings(
+        self, days_ahead: int | None = None, only_ticker: str | None = None
+    ) -> list[EarningsEvent]:
         """Resolve earnings dates, then enrich each with Moomoo IV in place.
 
-        Dates: manual CSV → FMP calendar → yfinance. IV: Moomoo
-        ``get_option_volatility`` per ticker (when OpenD is reachable). A manual
-        CSV already carries full IV, so it is not re-queried.
+        Dates: manual CSV → FMP calendar → yfinance. IV: Moomoo ATM-option
+        snapshot per ticker (when OpenD is reachable). A manual CSV already carries
+        full IV, so it is not re-queried. ``only_ticker`` restricts the (expensive)
+        IV enrichment to a single symbol — used by ``scan_ticker``.
         """
         days = days_ahead if days_ahead is not None else settings.EARNINGS_DAYS_AHEAD
         events, source, has_iv = self._resolve_dates(days)
@@ -495,7 +498,7 @@ class EarningsDataProvider:
             return []
 
         events = self._within_window(events, days)
-        enriched = 0 if has_iv else self._enrich_iv(events)
+        enriched = 0 if has_iv else self._enrich_iv(events, only_ticker=only_ticker)
 
         if enriched:
             logger.info(
@@ -532,12 +535,21 @@ class EarningsDataProvider:
 
         return [], "none", False
 
-    def _enrich_iv(self, events: list[EarningsEvent]) -> int:
-        """Enrich dates-only events with Moomoo IV. Returns how many got IV."""
+    def _enrich_iv(
+        self, events: list[EarningsEvent], only_ticker: str | None = None
+    ) -> int:
+        """Enrich dates-only events with Moomoo IV. Returns how many got IV.
+
+        ``only_ticker`` restricts enrichment to one symbol (the rest stay
+        dates-only) so a single-ticker scan doesn't query the whole calendar.
+        """
         if not self.connector._opend_reachable():
             return 0
+        want = only_ticker.upper() if only_ticker else None
         enriched = 0
         for event in events:
+            if want is not None and event.ticker.upper() != want:
+                continue
             if event.iv_current and event.iv_current > 0:
                 continue  # already has IV (e.g. from CSV)
             if self.connector.enrich_event_iv(event):

@@ -72,9 +72,13 @@ class EarningsScanner:
         return opportunities
 
     def scan_ticker(self, ticker: str, days_ahead: int | None = None) -> EarningsOpportunity | None:
-        """Evaluate a single named ticker if it has earnings in the window."""
+        """Evaluate a single named ticker if it has earnings in the window.
+
+        Only the target ticker is IV-enriched (``only_ticker``), so this stays
+        fast even when the date source returns a large calendar.
+        """
         days = days_ahead if days_ahead is not None else settings.EARNINGS_DAYS_AHEAD
-        for event in self.provider.get_upcoming_earnings(days):
+        for event in self.provider.get_upcoming_earnings(days, only_ticker=ticker):
             if event.ticker.upper() == ticker.upper():
                 return self._evaluate(event)
         logger.info("No upcoming earnings found for %s in %d days", ticker, days)

@@ -538,6 +538,35 @@ def test_provider_enriches_fmp_dates_with_moomoo_iv(monkeypatch) -> None:
     assert out[0].iv_rank == 83
 
 
+def test_provider_only_ticker_limits_enrichment(monkeypatch) -> None:
+    # only_ticker → just that symbol is IV-enriched; others stay dates-only.
+    conn = MoomooEarningsConnector()
+    monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: True)
+    enriched_calls = []
+
+    def fake_enrich(event):
+        enriched_calls.append(event.ticker)
+        event.iv_current = 50.0
+        event.source = "moomoo_iv"
+        return True
+
+    monkeypatch.setattr(conn, "enrich_event_iv", fake_enrich)
+    manual = ManualEarningsInput("/no/file.csv")
+    monkeypatch.setattr(manual, "load", lambda: [])
+    provider = EarningsDataProvider(connector=conn, manual=manual)
+    events = [
+        EarningsEvent(ticker="AAPL", earnings_date=date.today() + timedelta(days=5), source="fmp"),
+        EarningsEvent(ticker="MSFT", earnings_date=date.today() + timedelta(days=6), source="fmp"),
+        EarningsEvent(ticker="ACN", earnings_date=date.today() + timedelta(days=7), source="fmp"),
+    ]
+    monkeypatch.setattr(provider, "_fmp_calendar", lambda days: events)
+    out = provider.get_upcoming_earnings(14, only_ticker="acn")
+    assert enriched_calls == ["ACN"]                 # only ACN queried Moomoo
+    acn = next(e for e in out if e.ticker == "ACN")
+    assert acn.source == "moomoo_iv"
+    assert all(e.source == "fmp" for e in out if e.ticker != "ACN")
+
+
 def test_provider_dates_only_when_opend_down(monkeypatch) -> None:
     conn = MoomooEarningsConnector()
     monkeypatch.setattr(conn, "_opend_reachable", lambda timeout=1.0: False)

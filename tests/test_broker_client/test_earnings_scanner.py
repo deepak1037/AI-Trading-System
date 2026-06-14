@@ -27,7 +27,7 @@ class _StubProvider:
     def __init__(self, events) -> None:
         self._events = events
 
-    def get_upcoming_earnings(self, days_ahead=None):
+    def get_upcoming_earnings(self, days_ahead=None, only_ticker=None):
         return self._events
 
     def get_iv_history(self, ticker):
