@@ -479,3 +479,73 @@ def test_db_logging_roundtrip(monkeypatch, tmp_path) -> None:
             ("post-99",),
         ).fetchone()
     assert row == ("short", "rss")
+
+
+# ── Context filter (false-positive suppression) ───────────────────────────────
+def test_context_filter_opponent_rant_skipped(monitor) -> None:
+    """A border rant naming Biden matches 'invasion' but must NOT alert."""
+    assert monitor._classify_post(
+        "Biden poured millions into the invasion of our southern border — a disaster"
+    ) is None
+
+
+def test_context_filter_historical_no_opponent_skipped(monitor) -> None:
+    """Past-tense single-keyword commentary (no opponent name) is skipped."""
+    assert monitor._classify_post(
+        "The invasion was the worst thing that ever happened, years ago"
+    ) is None
+
+
+def test_context_filter_dumocrat_post_skipped(monitor) -> None:
+    """Opponent slur ('Dumocrats') cancels even with a market keyword."""
+    assert monitor._classify_post(
+        "The Dumocrats want more tariffs — terrible for the country"
+    ) is None
+
+
+def test_context_filter_lone_keyword_no_anchor_skipped(monitor) -> None:
+    """A single market keyword with no current-action anchor is suppressed."""
+    assert monitor._classify_post("It was an invasion of privacy, frankly") is None
+
+
+def test_context_filter_iran_deal_still_long(monitor) -> None:
+    """Verify scenario: Iran deal post → LONG alert."""
+    sig = monitor._classify_post(
+        "We are signing a historic peace deal with Iran today"
+    )
+    assert sig is not None
+    assert sig.direction == "long"
+
+
+def test_context_filter_new_tariff_still_short(monitor) -> None:
+    """Verify scenario: new tariff post → SHORT alert."""
+    sig = monitor._classify_post("Imposing new tariffs on China effective today")
+    assert sig is not None
+    assert sig.direction == "short"
+
+
+def test_db_dedup_blocks_realert(monkeypatch, tmp_path) -> None:
+    """A post_id already in presidential_signals is never alerted again."""
+    from data.db import get_connection, init_db
+
+    db = tmp_path / "t.db"
+    monkeypatch.setattr(settings, "DB_PATH", str(db))
+    init_db(str(db))
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO presidential_signals "
+            "(post_id, post_text, source, direction, confidence, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("dup1", "New tariffs on China", "rss", "short", 80,
+             "2026-06-15T03:40:00+00:00"),
+        )
+
+    mon = RealTimePresidentialMonitor(alert_engine=MagicMock())
+    mon._process_post(
+        post_id="dup1",
+        text="New tariffs on China",
+        created_at=_now_iso(),
+        url="http://x",
+        source="rss",
+    )
+    mon.alert_engine.send_alert.assert_not_called()

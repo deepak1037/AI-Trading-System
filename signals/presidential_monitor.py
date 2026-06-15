@@ -24,6 +24,7 @@ Design guarantees:
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -322,9 +323,16 @@ class RealTimePresidentialMonitor:
         startup catch-up a ``cutoff`` is passed instead: only posts published
         strictly after it (the last-processed timestamp) are handled, so missed
         posts from an outage are replayed without flooding old history.
+
+        Dedup is DB-backed (``presidential_signals.post_id``) as well as
+        in-memory, so a post already alerted in a previous run — or by the
+        startup catch-up before normal polling began — is never alerted twice.
         """
         try:
             if not post_id or post_id in self.seen_post_ids:
+                return
+            if self._already_processed(post_id):
+                self.seen_post_ids.add(post_id)
                 return
             self.seen_post_ids.add(post_id)
 
@@ -427,6 +435,12 @@ class RealTimePresidentialMonitor:
         if not positive and not negative:
             return None  # no market keywords — ignore
 
+        # Context filter: suppress historical commentary / opponent-bashing that
+        # merely happens to contain a market keyword (e.g. "Biden poured millions
+        # into the invasion" → matched "invasion" but is NOT market-moving).
+        if not self._passes_context_filter(t, len(positive) + len(negative)):
+            return None
+
         if len(positive) > len(negative):
             direction = "long"
         elif len(negative) > len(positive):
@@ -443,6 +457,54 @@ class RealTimePresidentialMonitor:
             keywords=matched,
             suggested_instruments=self._get_instruments(direction, matched),
         )
+
+    @staticmethod
+    def _contains_any(text_lower: str, words: list[str]) -> bool:
+        """Whole-word membership test (so 'did' never matches 'candidate')."""
+        return any(
+            re.search(rf"\b{re.escape(w.lower())}\b", text_lower) for w in words
+        )
+
+    def _passes_context_filter(self, text_lower: str, keyword_count: int) -> bool:
+        """Gate a keyword match against tense/opponent/evidence context.
+
+        Three checks (CLAUDE bug report — first live false positive):
+          A) Past-tense post with no current-action word → historical commentary.
+          B) Opponent-criticism markers (Biden, Democrats, Fake News, …) → the
+             post is bashing opponents, not announcing policy.
+          C) A lone market keyword needs a current-action or announcement anchor;
+             two or more distinct keywords always clear the bar.
+        """
+        # B) Opponent-bashing is political noise, never a policy announcement.
+        if self._contains_any(text_lower, settings.PRESIDENTIAL_OPPONENT_KEYWORDS):
+            return False
+
+        has_action = self._contains_any(
+            text_lower, settings.PRESIDENTIAL_CURRENT_ACTION_KEYWORDS
+        )
+        # A de-escalation word ("cancelled strikes", "lifted sanctions") is itself
+        # a live, market-moving action.
+        has_negation = self._contains_any(
+            text_lower, settings.PRESIDENTIAL_NEGATION_WORDS
+        )
+        strong_current = has_action or has_negation
+        has_past = self._contains_any(
+            text_lower, settings.PRESIDENTIAL_HISTORICAL_KEYWORDS
+        )
+
+        # A) Past tense and nothing live happening → old commentary.
+        if has_past and not strong_current:
+            return False
+
+        # C) Single bare keyword needs an anchor; weak announcement markers
+        # ("new tariffs") count here but not for the past-tense override above.
+        anchor = strong_current or self._contains_any(
+            text_lower, settings.PRESIDENTIAL_ANNOUNCEMENT_KEYWORDS
+        )
+        if keyword_count < settings.PRESIDENTIAL_MIN_MARKET_KEYWORDS and not anchor:
+            return False
+
+        return True
 
     @staticmethod
     def _get_instruments(direction: str, keywords: list[str]) -> list[str]:
@@ -467,6 +529,27 @@ class RealTimePresidentialMonitor:
         return ["QQQ puts", "SPY puts"]
 
     # ── Persistence + alerting ────────────────────────────────────────────────
+    def _already_processed(self, post_id: str) -> bool:
+        """True if this post_id is already in presidential_signals.
+
+        DB-backed dedup survives a restart and the catch-up→polling handover (an
+        in-memory ``seen_post_ids`` set is rebuilt empty on each start, which is
+        how the same post alerted twice). On any DB error we fall back to the
+        in-memory set (return False) rather than drop a potentially live post.
+        """
+        try:
+            from data.db import get_connection
+
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM presidential_signals WHERE post_id = ? LIMIT 1",
+                    (post_id,),
+                ).fetchone()
+            return row is not None
+        except Exception as exc:
+            logger.debug("Presidential dedup DB check failed: %s", exc)
+            return False
+
     def _log_to_db(
         self,
         post_id: str,

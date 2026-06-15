@@ -167,6 +167,52 @@ class Settings(BaseSettings):
         ]
     )
 
+    # ── Context filter (suppress false-positive political rants) ───────────────
+    # A market keyword alone isn't enough: a post must describe a CURRENT/future
+    # action, must not be opponent-bashing, and a lone keyword must have an
+    # action anchor. This kills the "Biden poured millions into the invasion"
+    # class of historical commentary that matched "invasion" and fired SHORT.
+
+    # B) Opponent-criticism markers — if present, the post is political
+    # commentary, not a policy announcement → never alert (even with a keyword).
+    PRESIDENTIAL_OPPONENT_KEYWORDS: list[str] = Field(
+        default_factory=lambda: [
+            "biden", "obama", "kamala", "harris", "hillary", "clinton",
+            "pelosi", "schumer", "newsom", "sleepy joe", "crooked",
+            "democrat", "democrats", "dumocrat", "dumocrats", "radical left",
+            "the left", "fake news", "witch hunt", "hoax", "deep state",
+            "rino", "lamestream", "do nothing democrats",
+        ]
+    )
+    # A) Past-tense / historical markers — old commentary, not a live action.
+    PRESIDENTIAL_HISTORICAL_KEYWORDS: list[str] = Field(
+        default_factory=lambda: [
+            "poured", "came", "was", "were", "did", "had", "used to",
+            "back then", "years ago", "last year", "in the past",
+            "previously", "decades", "remember when", "for years",
+            "history", "historically", "once again allowed",
+        ]
+    )
+    # A/C) Present/future action markers — a real, market-moving announcement.
+    PRESIDENTIAL_CURRENT_ACTION_KEYWORDS: list[str] = Field(
+        default_factory=lambda: [
+            "launching", "launch", "imposing", "impose", "placing",
+            "signing", "announcing", "announce", "ordering", "deploying",
+            "today", "tonight", "now", "immediately", "this morning",
+            "moments ago", "effective immediately", "effective today",
+            "starting", "will", "going to", "about to", "set to",
+            "coming", "incoming", "soon", "hereby", "as of today",
+        ]
+    )
+    # C) Weak announcement anchors — enough to let a single keyword through
+    # (e.g. "New tariffs on China") but NOT enough to override a past-tense post.
+    PRESIDENTIAL_ANNOUNCEMENT_KEYWORDS: list[str] = Field(
+        default_factory=lambda: ["new", "major", "just", "breaking"]
+    )
+    # A lone market keyword without an action/announcement anchor is suppressed;
+    # this many distinct keywords always alerts.
+    PRESIDENTIAL_MIN_MARKET_KEYWORDS: int = 2
+
     PREMARKET_FUTURES_THRESHOLD: float = -0.008  # -0.8% NQ futures
     CONFIDENCE_CRITICAL: int = 80
     CONFIDENCE_HIGH: int = 65
