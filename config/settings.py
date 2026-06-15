@@ -90,6 +90,12 @@ class Settings(BaseSettings):
     # Only alert on posts published within this window — react to breaking posts,
     # not the whole 100-post backlog on the first poll after startup.
     PRESIDENTIAL_FRESH_MINUTES: int = 15
+    # On startup, catch up on posts missed while the system was down: process
+    # everything published since the last logged signal (MAX created_at), so a
+    # market-moving post during an outage isn't lost. First-ever run looks back
+    # CATCHUP_MINUTES; never processes more than CATCHUP_MAX_POSTS.
+    PRESIDENTIAL_CATCHUP_MINUTES: int = 60
+    PRESIDENTIAL_CATCHUP_MAX_POSTS: int = 100
     PRESIDENTIAL_SHOCK_CONFIDENCE: int = 80  # critical — routes to #alerts
     PRESIDENTIAL_POSITIVE_KEYWORDS: list[str] = Field(
         default_factory=lambda: [

@@ -350,12 +350,110 @@ def test_start_sets_active_source(monkeypatch) -> None:
     monkeypatch.setattr(settings, "SCRAPECREATORS_API_KEY", "")
     monkeypatch.setattr(settings, "TWEETSTREAM_API_KEY", "")
     monkeypatch.setattr(settings, "APIFY_API_KEY", "")
-    # Stop the RSS loop immediately so the test doesn't hang.
+    # Stop the RSS loop immediately so the test doesn't hang; skip the live
+    # catch-up fetch so the daemon thread makes no network call.
     monkeypatch.setattr(mon, "_run_rss_loop", lambda: None)
+    monkeypatch.setattr(mon, "_startup_catchup", lambda _source: None)
     mon.start()
     assert mon.active_source == "rss"
     assert mon._thread is not None
     mon.stop()
+
+
+def test_get_last_processed_timestamp(monkeypatch, tmp_path) -> None:
+    """Returns the parsed MAX(created_at) from presidential_signals."""
+    from data.db import get_connection, init_db
+
+    db = tmp_path / "t.db"
+    monkeypatch.setattr(settings, "DB_PATH", str(db))
+    init_db(str(db))
+    mon = RealTimePresidentialMonitor(alert_engine=MagicMock())
+    assert mon._get_last_processed_timestamp() is None  # empty table
+
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO presidential_signals "
+            "(post_id, post_text, source, direction, confidence, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("p1", "deal", "rss", "long", 70, "2026-06-14T20:00:00+00:00"),
+        )
+    ts = mon._get_last_processed_timestamp()
+    assert ts is not None
+    assert ts.isoformat() == "2026-06-14T20:00:00+00:00"
+
+
+def test_startup_catchup_replays_missed_posts(monkeypatch) -> None:
+    """Posts published after last_seen are processed; older ones are skipped."""
+    mon = RealTimePresidentialMonitor(alert_engine=MagicMock())
+    monkeypatch.setattr(
+        mon, "_get_last_processed_timestamp",
+        lambda: datetime(2026, 6, 14, 20, 0, tzinfo=UTC),
+    )
+    posts = [
+        {"post_id": "before", "text": "Deal signed last week",
+         "created_at": "2026-06-14T19:50:00+00:00", "url": "u0"},
+        {"post_id": "iran1", "text": "Deal with Iran is complete — peace!",
+         "created_at": "2026-06-14T21:29:00+00:00", "url": "u1"},
+        {"post_id": "iran2", "text": "Great Deal for Peace, signing soon",
+         "created_at": "2026-06-14T22:27:00+00:00", "url": "u2"},
+    ]
+    monkeypatch.setattr(mon, "_fetch_posts", lambda _source: posts)
+    logged: list = []
+    monkeypatch.setattr(
+        mon, "_log_to_db",
+        lambda post_id, text, url, signal, source: logged.append((post_id, signal)),
+    )
+    monkeypatch.setattr(
+        mon, "_send_alert", lambda text, url, signal, source: None
+    )
+
+    mon._startup_catchup("rss")
+
+    # Only the two post-cutoff Iran-deal posts were processed, both LONG.
+    assert [pid for pid, _ in logged] == ["iran1", "iran2"]
+    assert all(sig.direction == "long" for _, sig in logged)
+
+
+def test_startup_catchup_first_run_uses_window(monkeypatch) -> None:
+    """With no prior signal, cutoff falls back to the catch-up window."""
+    mon = RealTimePresidentialMonitor(alert_engine=MagicMock())
+    monkeypatch.setattr(mon, "_get_last_processed_timestamp", lambda: None)
+    recent = (
+        datetime.now(tz=UTC) - timedelta(minutes=5)
+    ).isoformat()
+    old = (
+        datetime.now(tz=UTC)
+        - timedelta(minutes=settings.PRESIDENTIAL_CATCHUP_MINUTES + 30)
+    ).isoformat()
+    posts = [
+        {"post_id": "old", "text": "Deal done", "created_at": old, "url": "u0"},
+        {"post_id": "fresh", "text": "New trade deal and peace",
+         "created_at": recent, "url": "u1"},
+    ]
+    monkeypatch.setattr(mon, "_fetch_posts", lambda _source: posts)
+    logged: list = []
+    monkeypatch.setattr(
+        mon, "_log_to_db",
+        lambda post_id, text, url, signal, source: logged.append(post_id),
+    )
+    monkeypatch.setattr(
+        mon, "_send_alert", lambda text, url, signal, source: None
+    )
+
+    mon._startup_catchup("rss")
+
+    assert logged == ["fresh"]
+
+
+def test_classify_count_long_beats_short(monkeypatch) -> None:
+    """More LONG keyword hits than SHORT → long, regardless of order."""
+    mon = RealTimePresidentialMonitor(alert_engine=MagicMock())
+    sig = mon._classify_post(
+        "We reached a deal and peace, signing soon despite the blockade"
+    )
+    # deal/peace/signing (3 LONG) outvote blockade (1 SHORT).
+    assert sig is not None
+    assert sig.direction == "long"
 
 
 def test_db_logging_roundtrip(monkeypatch, tmp_path) -> None:

@@ -62,6 +62,16 @@ class _SourceExhausted(Exception):
     """A data source is permanently unusable — fall back to the next one now."""
 
 
+def _normalize_post(post: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a ScrapeCreators/Apify post dict to the common shape."""
+    return {
+        "post_id": str(post.get("id", post.get("url", ""))),
+        "text": str(post.get("content", post.get("text", ""))),
+        "created_at": str(post.get("created_at", post.get("timestamp", ""))),
+        "url": str(post.get("url", "")),
+    }
+
+
 class PresidentialSignal(BaseModel):
     """A classified market-moving presidential post."""
 
@@ -268,21 +278,29 @@ class RealTimePresidentialMonitor:
                         settings.SCRAPECREATORS_POLL_SECONDS)
 
     # ── Source D: RSS fallback ────────────────────────────────────────────────
+    def _fetch_rss_posts(self) -> list[dict[str, Any]]:
+        """Normalized recent posts from the RSS feed (newest-first as published)."""
+        import feedparser
+
+        feed = feedparser.parse(settings.PRESIDENTIAL_RSS_URLS[0], agent=_FEED_UA)
+        limit = settings.PRESIDENTIAL_CATCHUP_MAX_POSTS
+        return [
+            {
+                "post_id": str(entry.get("id", entry.get("link", ""))),
+                "text": str(entry.get("summary", entry.get("title", ""))),
+                "created_at": str(entry.get("published", "")),
+                "url": str(entry.get("link", "")),
+            }
+            for entry in feed.entries[:limit]
+        ]
+
     def _run_rss_loop(self) -> None:
         while self._running:
             try:
-                import feedparser
-
-                feed = feedparser.parse(
-                    settings.PRESIDENTIAL_RSS_URLS[0], agent=_FEED_UA
-                )
-                for entry in feed.entries[:10]:
+                for post in self._fetch_rss_posts()[:10]:
                     self._process_post(
-                        post_id=str(entry.get("id", entry.get("link", ""))),
-                        text=str(entry.get("summary", entry.get("title", ""))),
-                        created_at=str(entry.get("published", "")),
-                        url=str(entry.get("link", "")),
-                        source="rss",
+                        post["post_id"], post["text"], post["created_at"],
+                        post["url"], "rss",
                     )
             except Exception as exc:
                 logger.error("RSS loop error: %s", exc)
@@ -296,14 +314,25 @@ class RealTimePresidentialMonitor:
         created_at: str,
         url: str,
         source: str,
+        cutoff: datetime | None = None,
     ) -> None:
-        """Dedup → freshness → classify → log → alert. Never raises."""
+        """Dedup → freshness → classify → log → alert. Never raises.
+
+        Normal polling gates on the ``PRESIDENTIAL_FRESH_MINUTES`` window. During
+        startup catch-up a ``cutoff`` is passed instead: only posts published
+        strictly after it (the last-processed timestamp) are handled, so missed
+        posts from an outage are replayed without flooding old history.
+        """
         try:
             if not post_id or post_id in self.seen_post_ids:
                 return
             self.seen_post_ids.add(post_id)
 
-            if not self._is_recent(created_at):
+            if cutoff is not None:
+                dt = self._parse_dt(created_at)
+                if dt is None or dt <= cutoff:
+                    return  # catch-up: skip anything not strictly newer than cutoff
+            elif not self._is_recent(created_at):
                 return
 
             signal = self._classify_post(text)
@@ -535,13 +564,74 @@ class RealTimePresidentialMonitor:
             "rss": self._run_rss_loop,
         }.get(source, self._run_rss_loop)
 
+    # ── Startup catch-up (replay posts missed during downtime) ────────────────
+    def _get_last_processed_timestamp(self) -> datetime | None:
+        """Most recent ``presidential_signals.created_at`` (None if table empty)."""
+        try:
+            from data.db import get_connection
+
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT MAX(created_at) FROM presidential_signals"
+                ).fetchone()
+            value = row[0] if row else None
+            return self._parse_dt(str(value)) if value else None
+        except Exception as exc:
+            logger.debug("Presidential last-processed lookup failed: %s", exc)
+            return None
+
+    def _fetch_posts(self, source: str) -> list[dict[str, Any]]:
+        """Normalized recent posts for catch-up. TweetStream has no pollable
+        history, so it (and any gap) falls back to the RSS feed."""
+        try:
+            if source == "scrapecreators":
+                return [_normalize_post(p) for p in (self._fetch_scrapecreators() or [])]
+            if source == "apify":
+                return [_normalize_post(p) for p in (self._fetch_apify() or [])]
+            return self._fetch_rss_posts()
+        except Exception as exc:
+            logger.debug("Presidential catch-up fetch (%s) failed: %s", source, exc)
+            return self._fetch_rss_posts() if source != "rss" else []
+
+    def _startup_catchup(self, source: str) -> None:
+        """Replay posts published since the last processed one (or last 60 min).
+
+        Bridges downtime: a market-moving post during an outage is alerted on
+        restart instead of being lost to the 15-minute freshness window.
+        """
+        try:
+            last_seen = self._get_last_processed_timestamp()
+            cutoff = last_seen or (
+                datetime.now(tz=UTC)
+                - timedelta(minutes=settings.PRESIDENTIAL_CATCHUP_MINUTES)
+            )
+            logger.info(
+                "Presidential catch-up from %s (last_seen=%s)",
+                cutoff.isoformat(), last_seen.isoformat() if last_seen else "none",
+            )
+            posts = self._fetch_posts(source)[: settings.PRESIDENTIAL_CATCHUP_MAX_POSTS]
+            missed = [
+                p for p in posts
+                if (dt := self._parse_dt(p.get("created_at", ""))) is not None and dt > cutoff
+            ]
+            logger.info("Presidential catch-up: %d missed post(s) to process", len(missed))
+            for p in missed:
+                self._process_post(
+                    p["post_id"], p["text"], p["created_at"], p["url"], source,
+                    cutoff=cutoff,
+                )
+        except Exception as exc:
+            logger.warning("Presidential catch-up failed: %s", exc)
+
     def _run_chain(self, start_source: str) -> None:
-        """Run sources in priority order, advancing whenever one's loop gives up.
+        """Catch up on missed posts, then run sources in priority order, advancing
+        whenever one's loop gives up.
 
         A loop returns when its source is exhausted (402/auth) or fails repeatedly;
         the next source then starts. RSS is terminal (its loop never returns), so
         the monitor always ends up on RSS rather than spinning on a dead source.
         """
+        self._startup_catchup(start_source)
         for source in self._chain_from(start_source):
             if not self._running:
                 return
