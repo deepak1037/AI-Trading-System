@@ -51,6 +51,16 @@ _SOURCE_LAG = {
     "rss": "~60 seconds",
 }
 
+# HTTP statuses that mean a source is permanently unusable (auth / quota /
+# payment-required / forbidden) — retrying won't help, switch sources immediately.
+_FATAL_HTTP = frozenset({401, 402, 403})
+# After this many consecutive transient failures, give up on a source and switch.
+_MAX_CONSECUTIVE_FAILURES = 3
+
+
+class _SourceExhausted(Exception):
+    """A data source is permanently unusable — fall back to the next one now."""
+
 
 class PresidentialSignal(BaseModel):
     """A classified market-moving presidential post."""
@@ -81,21 +91,29 @@ class RealTimePresidentialMonitor:
         """
         for source in settings.PRESIDENTIAL_SOURCE_PRIORITY:
             try:
-                if source == "scrapecreators" and settings.SCRAPECREATORS_API_KEY:
+                if source == "scrapecreators":
+                    if not self._has_key(settings.SCRAPECREATORS_API_KEY):
+                        continue  # no key → never probe ScrapeCreators
                     if self._fetch_scrapecreators() is not None:
                         logger.info("Presidential monitor: using ScrapeCreators")
                         return "scrapecreators"
-                elif source == "tweetstream" and settings.TWEETSTREAM_API_KEY:
+                elif source == "tweetstream":
+                    if not self._has_key(settings.TWEETSTREAM_API_KEY):
+                        continue
                     if self._test_tweetstream_auth():
                         logger.info("Presidential monitor: using TweetStream WebSocket")
                         return "tweetstream"
-                elif source == "apify" and settings.APIFY_API_KEY:
+                elif source == "apify":
+                    if not self._has_key(settings.APIFY_API_KEY):
+                        continue
                     if self._fetch_apify() is not None:
                         logger.info("Presidential monitor: using Apify")
                         return "apify"
                 elif source == "rss":
                     logger.info("Presidential monitor: using RSS fallback (trumpstruth.org)")
                     return "rss"
+            except _SourceExhausted as exc:
+                logger.warning("Presidential source %s exhausted: %s", source, exc)
             except Exception as exc:
                 logger.warning("Presidential source %s unavailable: %s", source, exc)
 
@@ -120,22 +138,53 @@ class RealTimePresidentialMonitor:
         if response.status_code == 429:
             logger.warning("ScrapeCreators rate limited (429)")
             return []
+        if response.status_code in _FATAL_HTTP:
+            raise _SourceExhausted(
+                f"ScrapeCreators quota exhausted ({response.status_code})"
+            )
         raise RuntimeError(f"ScrapeCreators error: {response.status_code}")
 
     def _run_scrapecreators_loop(self) -> None:
+        """Poll ScrapeCreators; returns (to trigger a source switch) on a fatal
+        status (e.g. 402 quota) or after too many consecutive failures."""
+        self._poll_loop("ScrapeCreators", "scrapecreators", self._fetch_scrapecreators,
+                         settings.SCRAPECREATORS_POLL_SECONDS)
+
+    def _poll_loop(self, label: str, source: str, fetch, interval: float) -> None:
+        """Generic REST polling loop with fatal-error + failure-count switching.
+
+        Returns (ending the loop so ``_run_chain`` advances to the next source)
+        when ``fetch`` raises ``_SourceExhausted`` (quota/auth — switch now) or
+        fails ``_MAX_CONSECUTIVE_FAILURES`` times in a row. Otherwise polls forever.
+        """
+        failures = 0
         while self._running:
             try:
-                for post in self._fetch_scrapecreators() or []:
+                for post in fetch() or []:
                     self._process_post(
-                        post_id=str(post.get("id", "")),
+                        post_id=str(post.get("id", post.get("url", ""))),
                         text=str(post.get("content", post.get("text", ""))),
-                        created_at=str(post.get("created_at", "")),
+                        created_at=str(post.get("created_at", post.get("timestamp", ""))),
                         url=str(post.get("url", "")),
-                        source="scrapecreators",
+                        source=source,
                     )
+                failures = 0
+            except _SourceExhausted as exc:
+                logger.warning("%s — falling back to next source (RSS)", exc)
+                return
             except Exception as exc:
-                logger.error("ScrapeCreators loop error: %s", exc)
-            time.sleep(settings.SCRAPECREATORS_POLL_SECONDS)
+                failures += 1
+                logger.error(
+                    "%s loop error (%d/%d): %s",
+                    label, failures, _MAX_CONSECUTIVE_FAILURES, exc,
+                )
+                if failures >= _MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(
+                        "%s failed %d times in a row — falling back to next source",
+                        label, failures,
+                    )
+                    return
+            time.sleep(interval)
 
     # ── Source B: TweetStream (WebSocket) ─────────────────────────────────────
     def _test_tweetstream_auth(self) -> bool:
@@ -210,22 +259,13 @@ class RealTimePresidentialMonitor:
         if response.status_code == 200:
             data = response.json()
             return list(data) if isinstance(data, list) else []
+        if response.status_code in _FATAL_HTTP:
+            raise _SourceExhausted(f"Apify quota exhausted ({response.status_code})")
         raise RuntimeError(f"Apify error: {response.status_code}")
 
     def _run_apify_loop(self) -> None:
-        while self._running:
-            try:
-                for post in self._fetch_apify() or []:
-                    self._process_post(
-                        post_id=str(post.get("id", post.get("url", ""))),
-                        text=str(post.get("content", post.get("text", ""))),
-                        created_at=str(post.get("created_at", post.get("timestamp", ""))),
-                        url=str(post.get("url", "")),
-                        source="apify",
-                    )
-            except Exception as exc:
-                logger.error("Apify loop error: %s", exc)
-            time.sleep(settings.SCRAPECREATORS_POLL_SECONDS)
+        self._poll_loop("Apify", "apify", self._fetch_apify,
+                        settings.SCRAPECREATORS_POLL_SECONDS)
 
     # ── Source D: RSS fallback ────────────────────────────────────────────────
     def _run_rss_loop(self) -> None:
@@ -459,21 +499,77 @@ class RealTimePresidentialMonitor:
             dedup=False,
         )
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
-    def start(self) -> None:
-        """Detect the best source and run it in a daemon thread."""
-        self._running = True
-        self.active_source = self.detect_active_source()
+    # ── Source chain (runtime fallback) ───────────────────────────────────────
+    @staticmethod
+    def _has_key(value: object) -> bool:
+        """True only for a non-empty, non-whitespace API key."""
+        return bool(value) and bool(str(value).strip())
 
-        loop = {
+    def _usable_sources(self) -> list[str]:
+        """Configured sources in priority order, with RSS always last (terminal)."""
+        key_for = {
+            "scrapecreators": settings.SCRAPECREATORS_API_KEY,
+            "tweetstream": settings.TWEETSTREAM_API_KEY,
+            "apify": settings.APIFY_API_KEY,
+        }
+        out = [
+            s for s in settings.PRESIDENTIAL_SOURCE_PRIORITY
+            if s == "rss" or (s in key_for and self._has_key(key_for[s]))
+        ]
+        if "rss" not in out:
+            out.append("rss")  # RSS needs no key and always works — terminal fallback
+        return out
+
+    def _chain_from(self, start_source: str) -> list[str]:
+        """The fallback chain beginning at ``start_source`` (ending at RSS)."""
+        chain = self._usable_sources()
+        if start_source in chain:
+            return chain[chain.index(start_source):]
+        return chain
+
+    def _runner_for(self, source: str):
+        return {
             "tweetstream": self._run_tweetstream,
             "scrapecreators": self._run_scrapecreators_loop,
             "apify": self._run_apify_loop,
             "rss": self._run_rss_loop,
-        }.get(self.active_source, self._run_rss_loop)
+        }.get(source, self._run_rss_loop)
 
+    def _run_chain(self, start_source: str) -> None:
+        """Run sources in priority order, advancing whenever one's loop gives up.
+
+        A loop returns when its source is exhausted (402/auth) or fails repeatedly;
+        the next source then starts. RSS is terminal (its loop never returns), so
+        the monitor always ends up on RSS rather than spinning on a dead source.
+        """
+        for source in self._chain_from(start_source):
+            if not self._running:
+                return
+            self.active_source = source
+            logger.info("Presidential monitor: source=%s (lag %s)",
+                        source, _SOURCE_LAG.get(source, "?"))
+            self._runner_for(source)()  # blocks until the loop returns or stops
+            if not self._running:
+                return
+            if source != "rss":
+                logger.warning(
+                    "Presidential source %s gave up — switching to next in chain", source
+                )
+        # Safety net: never leave the monitor without a running source.
+        if self._running:
+            self.active_source = "rss"
+            logger.warning("Presidential monitor: all sources exhausted — on RSS")
+            self._run_rss_loop()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    def start(self) -> None:
+        """Detect the best source and run the fallback chain in a daemon thread."""
+        self._running = True
+        # Set synchronously so callers see the initial source immediately.
+        self.active_source = self.detect_active_source()
         self._thread = threading.Thread(
-            target=loop, daemon=True, name=f"presidential-{self.active_source}"
+            target=self._run_chain, args=(self.active_source,),
+            daemon=True, name="presidential-monitor",
         )
         self._thread.start()
         logger.info("Presidential monitor started | source=%s", self.active_source)

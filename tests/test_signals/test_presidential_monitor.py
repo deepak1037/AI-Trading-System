@@ -14,8 +14,10 @@ import pytest
 
 from config.settings import settings
 from signals.presidential_monitor import (
+    _MAX_CONSECUTIVE_FAILURES,
     PresidentialSignal,
     RealTimePresidentialMonitor,
+    _SourceExhausted,
 )
 
 
@@ -60,6 +62,81 @@ def test_source_priority_prefers_scrapecreators(monitor, monkeypatch) -> None:
 
 
 # ── Classification ────────────────────────────────────────────────────────────
+# ── ScrapeCreators 402 / runtime fallback (bug fix) ─────────────────────────────
+def test_detect_skips_empty_scrapecreators_key(monitor, monkeypatch) -> None:
+    """An empty/whitespace SC key → never probe ScrapeCreators, go straight to RSS."""
+    monkeypatch.setattr(settings, "SCRAPECREATORS_API_KEY", "   ")  # whitespace only
+    monkeypatch.setattr(settings, "TWEETSTREAM_API_KEY", "")
+    monkeypatch.setattr(settings, "APIFY_API_KEY", "")
+    called = []
+    monkeypatch.setattr(monitor, "_fetch_scrapecreators", lambda: called.append(1) or [])
+    assert monitor.detect_active_source() == "rss"
+    assert called == []  # SC fetch was never attempted
+
+
+def test_fetch_scrapecreators_402_raises_exhausted(monitor, monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(settings, "SCRAPECREATORS_API_KEY", "sc")
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: MagicMock(status_code=402))
+    with pytest.raises(_SourceExhausted):
+        monitor._fetch_scrapecreators()
+
+
+def test_scrapecreators_loop_returns_on_402(monitor, monkeypatch) -> None:
+    """The loop must RETURN on 402 (not retry forever)."""
+    monitor._running = True
+
+    def _402():
+        raise _SourceExhausted("ScrapeCreators quota exhausted (402)")
+
+    monkeypatch.setattr(monitor, "_fetch_scrapecreators", _402)
+    monitor._run_scrapecreators_loop()  # returns immediately — no hang
+    assert monitor._running  # didn't stop the monitor, just gave up on this source
+
+
+def test_poll_loop_gives_up_after_max_failures(monitor, monkeypatch) -> None:
+    monitor._running = True
+    calls = {"n": 0}
+
+    def _boom():
+        calls["n"] += 1
+        raise RuntimeError("network down")
+
+    monitor._poll_loop("X", "scrapecreators", _boom, interval=0.0)
+    assert calls["n"] == _MAX_CONSECUTIVE_FAILURES  # switched after N consecutive fails
+
+
+def test_run_chain_switches_scrapecreators_to_rss(monitor, monkeypatch) -> None:
+    """SC loop gives up (402) → chain advances to RSS automatically."""
+    monkeypatch.setattr(settings, "SCRAPECREATORS_API_KEY", "sc")
+    monkeypatch.setattr(settings, "TWEETSTREAM_API_KEY", "")
+    monkeypatch.setattr(settings, "APIFY_API_KEY", "")
+    monitor._running = True
+    order: list[str] = []
+
+    monkeypatch.setattr(monitor, "_run_scrapecreators_loop", lambda: order.append("sc"))
+
+    def _rss():
+        order.append("rss")
+        monitor._running = False  # terminal — stop after RSS starts
+
+    monkeypatch.setattr(monitor, "_run_rss_loop", _rss)
+    monitor._run_chain("scrapecreators")
+    assert order == ["sc", "rss"]          # SC gave up → switched to RSS
+    assert monitor.active_source == "rss"
+
+
+def test_usable_sources_excludes_keyless(monitor, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "SCRAPECREATORS_API_KEY", "")
+    monkeypatch.setattr(settings, "TWEETSTREAM_API_KEY", "ts")
+    monkeypatch.setattr(settings, "APIFY_API_KEY", "")
+    usable = monitor._usable_sources()
+    assert "scrapecreators" not in usable
+    assert "tweetstream" in usable
+    assert usable[-1] == "rss"  # RSS always terminal
+
+
 def test_classify_cancelled_strikes_long(monitor) -> None:
     """'I cancelled the Iran strikes' → LONG (the live miss)."""
     signal = monitor._classify_post(
