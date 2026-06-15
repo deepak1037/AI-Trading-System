@@ -12,8 +12,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from broker_client.analytics.performance_attribution import PerformanceAttribution
 from broker_client.buckets.bucket_manager import BucketManager
 from broker_client.buckets.exit_rules import ExitRulesEngine
+from broker_client.risk.concentration_checker import ConcentrationChecker
+from broker_client.risk.portfolio_heat_map import PortfolioHeatMap
+from broker_client.risk.regime_advisor import RegimeAdvisor
 from config.settings import settings
 from core.logger import get_logger
 
@@ -42,6 +46,11 @@ class DailyBriefing:
         self._market_state = market_state
         self._exit_rules = exit_rules or ExitRulesEngine()
         self._events_provider = events_provider
+        # Phase 4 additions — injected lazily so old callers keep working
+        self._heat_map = PortfolioHeatMap(paper_account)
+        self._concentration = ConcentrationChecker(paper_account)
+        self._regime_advisor = RegimeAdvisor()
+        self._attribution = PerformanceAttribution(paper_account=paper_account)
 
     # ── public API ───────────────────────────────────────────────────────────
     def generate_briefing(self) -> str:
@@ -52,10 +61,12 @@ class DailyBriefing:
             now.strftime("%A %B %d, %Y"),
             _BAR,
             self._macro_section(),
+            self._risk_section(),
             self._positions_section(),
             self._opportunities_section(),
             self._health_section(),
             self._bucket_section(),
+            self._performance_section(),
             _BAR,
             f"AI Trading System | {now.strftime('%H:%M ET')}",
         ]
@@ -155,6 +166,58 @@ class DailyBriefing:
                 f"({pnl.open_positions} open)"
             )
         return "\n".join(lines)
+
+    def _risk_section(self) -> str:
+        """Phase 4: portfolio heat map + concentration alerts."""
+        try:
+            positions = self._open_positions()
+            report = self._heat_map.generate(positions)
+            alerts = self._concentration.check(positions)
+            regime_advice = self._regime_advisor.advise(self._market_state)
+
+            cash_icon = "⚠️" if report.cash_buffer_warning else "✅"
+            sector_icon = "⚠️" if report.sector_warning else "✅"
+
+            alert_lines = ""
+            if alerts:
+                alert_lines = "\n" + "\n".join(
+                    f"   {'🚨' if a.severity == 'CRITICAL' else '⚠️'} {a.message}"
+                    for a in alerts[:5]
+                )
+
+            return (
+                f"🛡️ PORTFOLIO RISK:\n"
+                f"   Net delta: {report.net_delta:+.2f} ({report.delta_direction})\n"
+                f"   Cash buffer: {report.cash_buffer_pct:.1f}% {cash_icon}\n"
+                f"   Max sector: {report.max_sector_name} {report.max_sector_pct:.1f}% {sector_icon}\n"
+                f"   Strategy mode: {regime_advice.bucket1_adjustment.upper()} (regime: {regime_advice.regime})"
+                f"{alert_lines}"
+            )
+        except Exception as exc:
+            logger.debug("DailyBriefing risk section failed: %s", exc)
+            return "🛡️ PORTFOLIO RISK: unavailable"
+
+    def _performance_section(self) -> str:
+        """Phase 4: MTD performance attribution."""
+        try:
+            report = self._attribution.generate_report("MTD")
+            if report.insufficient_data:
+                return "📈 PERFORMANCE (MTD): insufficient data (< 5 closed trades)"
+            b = report.bucket_attribution
+            return (
+                f"📈 PERFORMANCE (MTD):\n"
+                f"   Total return: {report.total_return_pct:+.2f}%\n"
+                f"   vs SPY: {report.vs_spy:+.2f}%\n"
+                f"   Win rate: {report.win_rate:.0f}%\n"
+                f"   Profit factor: {report.profit_factor:.2f}\n"
+                f"\n"
+                f"   Bucket 1: ${b[1].realized_pnl:+,.0f}\n"
+                f"   Bucket 2: ${b[2].realized_pnl:+,.0f}\n"
+                f"   Bucket 3: ${b[3].realized_pnl:+,.0f}"
+            )
+        except Exception as exc:
+            logger.debug("DailyBriefing performance section failed: %s", exc)
+            return "📈 PERFORMANCE (MTD): unavailable"
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _open_positions(self) -> list:

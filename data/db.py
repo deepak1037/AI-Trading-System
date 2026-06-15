@@ -224,6 +224,20 @@ CREATE TABLE IF NOT EXISTS earnings_opportunities (
     created_at      TEXT    DEFAULT (datetime('now'))
 );
 
+-- Phase 4: signal accuracy tracking (feeds retraining + attribution).
+CREATE TABLE IF NOT EXISTS signal_accuracy (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_date     TEXT    NOT NULL,
+    direction       TEXT    NOT NULL,
+    confidence      INTEGER,
+    composite_score INTEGER,
+    sources         TEXT,   -- JSON list of signal source names
+    trade_id        INTEGER REFERENCES trades(id),
+    was_correct     INTEGER,   -- 0 | 1
+    actual_move_pct REAL,
+    created_at      TEXT    DEFAULT (datetime('now'))
+);
+
 -- Phase 3: classified stock drops + bounce candidates (event plays).
 CREATE TABLE IF NOT EXISTS drop_signals (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,6 +288,7 @@ _EXPECTED_TABLES = frozenset(
         "presidential_signals",
         "earnings_opportunities",
         "drop_signals",
+        "signal_accuracy",
     }
 )
 

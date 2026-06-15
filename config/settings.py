@@ -446,6 +446,28 @@ class Settings(BaseSettings):
     BOUNCE_LEAP_PROFIT_TARGET_PCT: float = 40.0
     BOUNCE_SPREAD_PROFIT_TARGET_PCT: float = 40.0
 
+    # ── Phase 4: Portfolio risk thresholds ────────────────────
+    SECTOR_WARNING_PCT: float = 40.0    # warn if any sector > 40%
+    SECTOR_CRITICAL_PCT: float = 60.0   # critical if any sector > 60%
+    SAME_EXPIRY_WARNING: int = 5        # warn if 5+ positions expire same week
+    SINGLE_TICKER_WARNING_PCT: float = 10.0  # warn if ticker > 10% of portfolio
+    CASH_BUFFER_WARNING_PCT: float = 20.0    # warn if cash < 20%
+    CASH_BUFFER_CRITICAL_PCT: float = 10.0   # critical if cash < 10%
+
+    # Phase 4: Dividend risk
+    DIVIDEND_RISK_THRESHOLD_PCT: float = 0.5  # alert if dividend > 50% of put OTM buffer
+
+    # Phase 4: IV monitoring for open shorts
+    IV_RANK_EDGE_GONE_THRESHOLD: int = 30   # alert when IV rank drops below this
+    IV_RANK_SPIKE_THRESHOLD: int = 80       # alert when IV rank rises above this
+
+    # Phase 4: Performance tracking
+    PERFORMANCE_LOOKBACK_DAYS: int = 30
+    MIN_TRADES_FOR_ATTRIBUTION: int = 5     # need 5+ trades before showing attribution
+
+    # Phase 4: Signal accuracy
+    MIN_SIGNALS_FOR_ACCURACY: int = 10      # need 10+ signals before showing accuracy
+
     # ── Validators ────────────────────────────────────────────
     _VALID_ENVS: ClassVar[set[str]] = {"development", "backtest", "paper", "live"}
     _VALID_LOG_LEVELS: ClassVar[set[str]] = {

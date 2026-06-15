@@ -386,6 +386,180 @@ class PositionWatcher:
             except Exception as exc:
                 logger.warning("PositionWatcher: price refresh failed for %s: %s", ticker, exc)
 
+    # ── Phase 4: Earnings overlap warning ────────────────────────────────────
+
+    def check_earnings_overlaps(self) -> None:
+        """Alert when an open option position has earnings within its expiry window.
+
+        Call once daily at 8 AM ET. Reads earnings_opportunities table and
+        cross-references open positions.
+        """
+        today = datetime.now(tz=UTC).date()
+
+        for _ticker, d in list(self._positions.items()):
+            expiry_str = d.get("expiry")
+            if not expiry_str:
+                continue
+            try:
+                exp = date.fromisoformat(str(expiry_str))
+            except (ValueError, TypeError):
+                continue
+
+            ticker = d.get("ticker", "")
+            if not ticker:
+                continue
+
+            earnings_date = self._get_next_earnings(ticker)
+            if not earnings_date:
+                continue
+
+            # Check if earnings falls inside the remaining option window
+            if not (today <= earnings_date <= exp):
+                continue
+
+            days_to_earn = (earnings_date - today).days
+            severity = "CRITICAL" if days_to_earn <= 3 else "WARNING"
+            bucket = d.get("bucket", 1)
+            sub_type = d.get("sub_type", "msp")
+            strike = d.get("strike", "")
+            opt = str(d.get("option_type", "") or "").upper()[:1]
+            urgent = "🚨 URGENT: Earnings in 3 days or less\n" if days_to_earn <= 3 else ""
+
+            body = (
+                f"Open position expires {exp}\n"
+                f"{ticker} reports earnings {earnings_date} ({days_to_earn} days away)\n\n"
+                f"Earnings fall INSIDE your expiry window.\n\n"
+                f"Position: {ticker} {strike}{opt}\n"
+                f"Bucket: {bucket} ({sub_type})\n\n"
+                f"{urgent}"
+                f"Suggested action:\n"
+                f"  - Roll expiry beyond earnings date\n"
+                f"  - OR close position before earnings\n"
+                f"  - OR this is intentional earnings play (Bucket 2)"
+            )
+            self._send(
+                title=f"⚠️ EARNINGS OVERLAP: {ticker}",
+                body=body,
+                channel="alerts" if severity == "CRITICAL" else "signals",
+                color="red" if severity == "CRITICAL" else "yellow",
+            )
+
+    def _get_next_earnings(self, ticker: str) -> date | None:
+        """Look up next earnings date from DB, then yfinance as fallback."""
+        from data.db import get_connection as _gc
+        try:
+            with _gc(settings.DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT earnings_date FROM earnings_opportunities "
+                    "WHERE ticker=? ORDER BY earnings_date LIMIT 1",
+                    (ticker,),
+                ).fetchone()
+            if row and row["earnings_date"]:
+                return date.fromisoformat(row["earnings_date"])
+        except Exception as exc:
+            logger.debug("PositionWatcher: earnings DB lookup failed for %s: %s", ticker, exc)
+        # Fallback: yfinance calendar
+        try:
+            import yfinance as yf  # type: ignore[import-untyped]
+            cal = yf.Ticker(ticker).calendar
+            if cal is None:
+                return None
+            if isinstance(cal, dict):
+                ed = cal.get("Earnings Date")
+                if hasattr(ed, "__iter__") and not isinstance(ed, str):
+                    ed = list(ed)[0] if ed else None
+            else:
+                try:
+                    ed = cal.loc["Earnings Date"].iloc[0]
+                except Exception:
+                    return None
+            if ed is None:
+                return None
+            if hasattr(ed, "date"):
+                return ed.date()
+            return date.fromisoformat(str(ed)[:10])
+        except Exception as exc:
+            logger.debug("PositionWatcher: yfinance earnings lookup failed for %s: %s", ticker, exc)
+        return None
+
+    # ── Phase 4: IV rank monitoring for open shorts ───────────────────────────
+
+    def check_iv_rank_changes(self) -> None:
+        """Alert when IV rank drops or spikes on open short positions.
+
+        Call every 30 min during market hours. Reads iv_rank from the position
+        dict (populated at entry) and fetches current IV rank from yfinance
+        historical volatility as a proxy.
+        """
+        short_positions = [
+            (t, d) for t, d in self._positions.items()
+            if "short" in str(d.get("position_type", "") or "").lower()
+        ]
+
+        for _ticker, d in short_positions:
+            ticker = d.get("ticker", "")
+            if not ticker:
+                continue
+
+            current_iv_rank = self._get_current_iv_rank(ticker)
+            if current_iv_rank is None:
+                continue
+
+            entry_iv_rank = float(d.get("iv_rank_at_entry") or d.get("iv_rank") or 50)
+            iv_rank_change = current_iv_rank - entry_iv_rank
+            unrealized_pct = d.get("profit_pct", 0.0) or 0.0
+            strike = d.get("strike", "")
+            opt = str(d.get("option_type", "") or "").upper()[:1]
+
+            if current_iv_rank < settings.IV_RANK_EDGE_GONE_THRESHOLD and entry_iv_rank >= 50:
+                self._send(
+                    title=f"📉 IV RANK DROP: {ticker}",
+                    body=(
+                        f"Short position: {ticker} {strike}{opt}\n"
+                        f"IV Rank at entry: {entry_iv_rank:.0f}\n"
+                        f"IV Rank now: {current_iv_rank:.0f}\n\n"
+                        f"Your premium-selling edge has diminished.\n"
+                        f"Consider closing early to lock in remaining profit.\n"
+                        f"Current P&L: {unrealized_pct:+.1f}%"
+                    ),
+                    channel="opportunities",
+                    color="yellow",
+                )
+
+            elif current_iv_rank > settings.IV_RANK_SPIKE_THRESHOLD and iv_rank_change > 20:
+                self._send(
+                    title=f"⚠️ IV SPIKE: {ticker}",
+                    body=(
+                        f"Short position: {ticker} {strike}{opt}\n"
+                        f"IV Rank at entry: {entry_iv_rank:.0f}\n"
+                        f"IV Rank now: {current_iv_rank:.0f} (↑{iv_rank_change:.0f} points)\n\n"
+                        f"IV spike is working against your short position.\n"
+                        f"Review position and consider rolling or closing.\n"
+                        f"Current P&L: {unrealized_pct:+.1f}%"
+                    ),
+                    channel="alerts",
+                    color="red",
+                )
+
+    @staticmethod
+    def _get_current_iv_rank(ticker: str) -> float | None:
+        """Approximate IV rank from 252-day rolling HV as a proxy."""
+        try:
+            import yfinance as yf  # type: ignore[import-untyped]
+            hist = yf.Ticker(ticker).history(period="1y")
+            if hist is None or len(hist) < 30:
+                return None
+            log_ret = hist["Close"].pct_change().dropna()
+            current_hv = float(log_ret.rolling(21).std().iloc[-1]) * (252 ** 0.5) * 100
+            low_hv = float(log_ret.rolling(21).std().rolling(252).min().iloc[-1]) * (252 ** 0.5) * 100
+            high_hv = float(log_ret.rolling(21).std().rolling(252).max().iloc[-1]) * (252 ** 0.5) * 100
+            if high_hv == low_hv:
+                return 50.0
+            return (current_hv - low_hv) / (high_hv - low_hv) * 100.0
+        except Exception as exc:
+            logger.debug("PositionWatcher: IV rank calc failed for %s: %s", ticker, exc)
+            return None
+
     @property
     def positions(self) -> dict[str, dict]:
         return dict(self._positions)
