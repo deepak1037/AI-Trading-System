@@ -369,6 +369,7 @@ class Settings(BaseSettings):
     EARNINGS_SPIKE_TARGET_PROFIT_PCT: float = 30.0  # IV-spike exit target before earnings
     EARNINGS_IV_SPIKE_FORCE_EXIT_DTE: int = 1   # force-exit IV spike at/under this DTE
     EARNINGS_CSV_PATH: str = "broker_client/earnings/data/upcoming_earnings.csv"
+    EARNINGS_CSV_STALE_DAYS: int = 7  # warn if the Moomoo export is older than this
 
     # ── Drop / bounce detector (Phase 3, Module B) ────────────
     DROP_ALERT_THRESHOLD_PCT: float = 4.0      # alert on drops > 4%

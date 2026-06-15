@@ -200,6 +200,11 @@ earnings-ticker: _check_venv _mklogs
 	@test -n "$(ticker)" || (echo "Usage: make earnings-ticker ticker=NVDA" && exit 1)
 	@$(PYTHON) -m broker_client.earnings.cli --ticker $(ticker)
 
+# Show Moomoo CSV export freshness; reminds you to re-export when stale (>7 days)
+.PHONY: earnings-refresh
+earnings-refresh: _check_venv
+	@$(PYTHON) -m broker_client.earnings.cli --refresh
+
 # Diagnose Moomoo OpenD IV endpoints (which call works, exact ret/data)
 .PHONY: moomoo-iv-debug
 moomoo-iv-debug: _check_venv

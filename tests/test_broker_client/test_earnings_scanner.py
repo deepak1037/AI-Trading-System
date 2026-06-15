@@ -160,6 +160,41 @@ def test_cli_render_empty() -> None:
     assert "No actionable earnings plays" in out
 
 
+def test_cli_refresh_missing_csv(monkeypatch) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "EARNINGS_CSV_PATH", "/no/such/file.csv")
+    out = cli.render_refresh()
+    assert "NOT FOUND" in out
+    assert "Options → Upcoming Earnings" in out
+    assert "_template.csv" in out
+
+
+def test_cli_refresh_fresh_and_stale(monkeypatch, tmp_path) -> None:
+    import os
+
+    from config.settings import settings
+
+    csv = tmp_path / "upcoming_earnings.csv"
+    csv.write_text("Ticker,Earnings Date,IV\nACN,2026-06-18,99\n")
+    monkeypatch.setattr(settings, "EARNINGS_CSV_PATH", str(csv))
+    assert "fresh" in cli.render_refresh()
+    old = os.path.getmtime(csv) - 10 * 86400
+    os.utime(csv, (old, old))
+    out = cli.render_refresh()
+    assert "STALE" in out
+    assert "Re-export" in out
+
+
+def test_cli_main_refresh(monkeypatch, capsys) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "EARNINGS_CSV_PATH", "/no/file.csv")
+    rc = cli.main(["--refresh"])
+    assert rc == 0
+    assert "EARNINGS CSV" in capsys.readouterr().out
+
+
 def test_cli_main_runs(monkeypatch, capsys) -> None:
     # No broker, stub the scanner so main() runs end-to-end offline.
     scanner = _scanner([_crush_event()])

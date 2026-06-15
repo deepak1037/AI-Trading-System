@@ -70,6 +70,31 @@ class ManualEarningsInput:
     def exists(self) -> bool:
         return Path(self.csv_path).exists()
 
+    def status(self, stale_days: int = 7, now: float | None = None) -> dict[str, Any]:
+        """Freshness info for the export CSV (drives ``make earnings-refresh``).
+
+        Returns ``{exists, path, last_modified, age_days, stale, rows}``. ``age_days``
+        is None when the file is absent; ``stale`` is True when it's older than
+        ``stale_days``. ``now`` may be injected for deterministic tests.
+        """
+        import time
+
+        path = Path(self.csv_path)
+        if not path.exists():
+            return {"exists": False, "path": self.csv_path, "last_modified": None,
+                    "age_days": None, "stale": True, "rows": 0}
+        mtime = path.stat().st_mtime
+        ref = now if now is not None else time.time()
+        age_days = max((ref - mtime) / 86400.0, 0.0)
+        return {
+            "exists": True,
+            "path": self.csv_path,
+            "last_modified": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"),
+            "age_days": round(age_days, 1),
+            "stale": age_days > stale_days,
+            "rows": len(self.load()),
+        }
+
     def load(self) -> list[EarningsEvent]:
         """Return all parseable events from the CSV (``[]`` if absent/empty)."""
         path = Path(self.csv_path)

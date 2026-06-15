@@ -31,6 +31,7 @@ from broker_client.earnings.models import (  # noqa: E402
 
 _BAR = "=" * 70
 _RULE = "─" * 70
+_TEMPLATE = "broker_client/earnings/data/upcoming_earnings_template.csv"
 
 
 def render(opportunities: list[EarningsOpportunity], days: int) -> str:
@@ -92,12 +93,56 @@ def _render_trade(opp: EarningsOpportunity) -> list[str]:
     return out
 
 
+def render_refresh() -> str:
+    """Freshness report for the Moomoo CSV export (``make earnings-refresh``)."""
+    from broker_client.earnings.manual_input import ManualEarningsInput
+    from config.settings import settings
+
+    st = ManualEarningsInput().status(stale_days=settings.EARNINGS_CSV_STALE_DAYS)
+    lines = ["", _BAR, "  EARNINGS CSV — Moomoo export status", _BAR]
+    lines.append(f"  Path: {st['path']}")
+    if not st["exists"]:
+        lines += [
+            "  Status: ⚠️  NOT FOUND — the scanner is running on yfinance/FMP + live IV.",
+            "",
+            "  To use Moomoo's verified IV data as the PRIMARY source:",
+            "    1. Open Moomoo desktop → Options → Upcoming Earnings",
+            "    2. Export the table to CSV",
+            f"    3. Save it as: {st['path']}",
+            f"  (See {_TEMPLATE} for the exact columns to export.)",
+        ]
+    else:
+        flag = "⚠️  STALE" if st["stale"] else "✅ fresh"
+        lines += [
+            f"  Last updated: {st['last_modified']}  ({st['age_days']} days ago)  {flag}",
+            f"  Rows: {st['rows']}",
+        ]
+        if st["stale"]:
+            lines += [
+                "",
+                f"  ⚠️  Older than {settings.EARNINGS_CSV_STALE_DAYS} days — IV data may be "
+                "out of date.",
+                "  Re-export from Moomoo desktop → Options → Upcoming Earnings → CSV,",
+                f"  and overwrite {st['path']}.",
+            ]
+        else:
+            lines.append("  Up to date — no action needed.")
+    lines += [_BAR, ""]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Earnings IV opportunity scanner")
     parser.add_argument("--days", type=int, default=None, help="Days ahead to scan (default 14)")
     parser.add_argument("--ticker", default=None, help="Scan a single ticker")
     parser.add_argument("--save", action="store_true", help="Persist results to the DB")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Show the Moomoo CSV export freshness (no scan)")
     args = parser.parse_args(argv)
+
+    if args.refresh:
+        print(render_refresh())
+        return 0
 
     try:
         from broker_core.factory import get_broker

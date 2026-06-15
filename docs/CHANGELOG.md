@@ -13,6 +13,15 @@ Keep newest first. Reference the git commit where relevant.
 
 Built per `CLAUDE_PHASE3.md` (12 steps, two modules).
 
+**Manual CSV is now the PRIMARY earnings source.** A Moomoo desktop "Options →
+Upcoming Earnings" CSV export carries verified IV/crush/expected-move/BMO-AMC for
+the whole calendar, so when ``broker_client/earnings/data/upcoming_earnings.csv``
+exists it is used as-is (no Moomoo enrichment). New resolution chain: **CSV →
+yfinance dates (Moomoo-IV-enriched) → FMP dates (Moomoo-IV-enriched)**. Added
+``make earnings-refresh`` (shows the export's age, warns when older than
+``EARNINGS_CSV_STALE_DAYS`` = 7, and reminds how to re-export) and a committed
+``upcoming_earnings_template.csv`` with the exact Moomoo column headers.
+
 **Moomoo IV — two live-data fixes (verified against ACN).** With OpenD live: (1)
 `get_option_volatility` on the ATM *option* code failed with "Parameter error:
 hvTimePeriod" — the `OptionHVPeriod.HV_365D` (=4) value is rejected; `hvTimePeriod`

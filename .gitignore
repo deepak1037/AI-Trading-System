@@ -46,3 +46,4 @@ paper_trading/backups/*.json
 .env.*.bak
 *.bak
 broker_client/earnings/data/*.csv
+!broker_client/earnings/data/upcoming_earnings_template.csv

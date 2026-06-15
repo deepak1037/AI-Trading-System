@@ -678,23 +678,26 @@ class EarningsDataProvider:
         return events
 
     def _resolve_dates(self, days: int) -> tuple[list[EarningsEvent], str, bool]:
-        """(events, source_label, dates_already_have_iv). First non-empty wins."""
-        # A legacy/native Moomoo events hook (normally empty — no calendar API).
-        events = self.connector.get_upcoming_earnings(days)
-        if events:
-            return events, "Moomoo OpenD", True
+        """(events, source_label, dates_already_have_iv). First non-empty wins.
 
+        Priority (CLAUDE_PHASE3 update):
+          1. Manual CSV (Moomoo "Upcoming Earnings" export) — PRIMARY when present;
+             carries verified IV/crush/expected-move, so no Moomoo enrichment needed.
+          2. yfinance dates (watchlist) → Moomoo-IV-enriched.
+          3. FMP calendar dates → Moomoo-IV-enriched.
+        The native Moomoo calendar isn't a source — OpenD has no earnings calendar.
+        """
         events = self.manual.load()
         if events:
-            return events, "manual CSV", True  # CSV carries full IV columns
-
-        events = self._fmp_calendar(days)
-        if events:
-            return events, "FMP calendar", False
+            return events, "manual CSV (Moomoo export)", True  # verified IV included
 
         events = self._yfinance_dates(days)
         if events:
             return events, "yfinance", False
+
+        events = self._fmp_calendar(days)
+        if events:
+            return events, "FMP calendar", False
 
         return [], "none", False
 

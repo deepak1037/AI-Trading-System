@@ -144,6 +144,37 @@ def test_manual_load_missing_file_returns_empty() -> None:
     assert ManualEarningsInput("/nonexistent/path.csv").load() == []
 
 
+def test_manual_status_missing() -> None:
+    st = ManualEarningsInput("/no/file.csv").status()
+    assert st["exists"] is False
+    assert st["age_days"] is None
+    assert st["stale"] is True
+
+
+def test_manual_status_fresh_and_stale(csv_file) -> None:
+    import os
+
+    # Fresh: mtime ~ now.
+    st = ManualEarningsInput(csv_file).status(stale_days=7)
+    assert st["exists"] is True and st["stale"] is False
+    assert st["rows"] == 2
+    assert st["age_days"] < 1
+    # Stale: backdate mtime 10 days.
+    old = os.path.getmtime(csv_file) - 10 * 86400
+    os.utime(csv_file, (old, old))
+    st2 = ManualEarningsInput(csv_file).status(stale_days=7)
+    assert st2["stale"] is True
+    assert st2["age_days"] >= 9
+
+
+def test_manual_status_injected_now(csv_file) -> None:
+    import os
+
+    mtime = os.path.getmtime(csv_file)
+    st = ManualEarningsInput(csv_file).status(stale_days=7, now=mtime + 8 * 86400)
+    assert st["age_days"] == 8.0 and st["stale"] is True
+
+
 def test_manual_load_skips_bad_rows(tmp_path) -> None:
     bad = tmp_path / "bad.csv"
     bad.write_text("Ticker,Earnings Date,IV\nGOOD,2026-07-01,40\n,,,\nNODATE,N/A,30\n")
@@ -202,13 +233,23 @@ def test_fmp_time() -> None:
 
 
 # ── EarningsDataProvider priority chain ─────────────────────────────────────────
-def test_provider_prefers_moomoo(monkeypatch) -> None:
+def test_provider_prefers_csv_as_primary(monkeypatch) -> None:
+    # CSV (Moomoo export) is the PRIMARY source — used as-is (full IV), no enrichment.
     conn = MoomooEarningsConnector()
-    ev = EarningsEvent(ticker="MMOO", earnings_date=date.today() + timedelta(days=3))
-    monkeypatch.setattr(conn, "get_upcoming_earnings", lambda days=14: [ev])
-    provider = EarningsDataProvider(connector=conn)
+    manual = ManualEarningsInput("/no/file.csv")
+    csv_event = EarningsEvent(
+        ticker="ACN", earnings_date=date.today() + timedelta(days=3),
+        iv_current=99.0, iv_rank=99, source="manual",
+    )
+    monkeypatch.setattr(manual, "load", lambda: [csv_event])
+    # Even if yfinance/FMP could supply dates, CSV wins and is not re-enriched.
+    enrich_calls = []
+    monkeypatch.setattr(conn, "enrich_event_iv", lambda e: enrich_calls.append(e.ticker))
+    provider = EarningsDataProvider(connector=conn, manual=manual)
     out = provider.get_upcoming_earnings(14)
-    assert [e.ticker for e in out] == ["MMOO"]
+    assert [e.ticker for e in out] == ["ACN"]
+    assert out[0].iv_rank == 99               # CSV's verified IV preserved
+    assert enrich_calls == []                 # CSV path never calls Moomoo enrichment
 
 
 def test_provider_falls_back_to_csv(monkeypatch) -> None:
@@ -580,6 +621,7 @@ def test_provider_enriches_fmp_dates_with_moomoo_iv(monkeypatch) -> None:
     provider = EarningsDataProvider(connector=conn, manual=manual)
     # FMP supplies dates-only events; Moomoo supplies the IV.
     fmp_event = EarningsEvent(ticker="AAPL", earnings_date=date.today() + timedelta(days=2))
+    monkeypatch.setattr(provider, "_yfinance_dates", lambda days: [])
     monkeypatch.setattr(provider, "_fmp_calendar", lambda days: [fmp_event])
     out = provider.get_upcoming_earnings(60)
     assert len(out) == 1
@@ -730,6 +772,7 @@ def test_provider_only_ticker_limits_enrichment(monkeypatch) -> None:
         EarningsEvent(ticker="MSFT", earnings_date=date.today() + timedelta(days=6), source="fmp"),
         EarningsEvent(ticker="ACN", earnings_date=date.today() + timedelta(days=7), source="fmp"),
     ]
+    monkeypatch.setattr(provider, "_yfinance_dates", lambda days: [])
     monkeypatch.setattr(provider, "_fmp_calendar", lambda days: events)
     out = provider.get_upcoming_earnings(14, only_ticker="acn")
     assert enriched_calls == ["ACN"]                 # only ACN queried Moomoo
@@ -747,6 +790,7 @@ def test_provider_dates_only_when_opend_down(monkeypatch) -> None:
     fmp_event = EarningsEvent(
         ticker="NVDA", earnings_date=date.today() + timedelta(days=8), source="fmp",
     )
+    monkeypatch.setattr(provider, "_yfinance_dates", lambda days: [])
     monkeypatch.setattr(provider, "_fmp_calendar", lambda days: [fmp_event])
     out = provider.get_upcoming_earnings(14)
     assert len(out) == 1
