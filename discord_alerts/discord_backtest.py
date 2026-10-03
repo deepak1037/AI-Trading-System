@@ -32,6 +32,7 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 import time
@@ -466,6 +467,89 @@ def _settle_open_positions(acct: BacktestAccount, rules: dict, today: date,
 # Main backtest
 # ─────────────────────────────────────────────────────────────────────────────
 
+_CSV_FIELDS = [
+    "status",          # closed | open
+    "symbol",
+    "action",          # STO | BTO
+    "strategy",
+    "option_type",     # PUT | CALL
+    "strike",
+    "expiry",
+    "contracts",
+    "entry_date",
+    "entry_price",     # premium per share
+    "capital_tied",    # $ locked up (MSP margin×mult, or BTO premium×100)
+    "margin_method",   # MSP×2.0 (margin≈$X) | BTO
+    "exit_date",
+    "exit_price",      # premium per share at close (0 = expired worthless)
+    "gross_pnl",       # $ realised P&L
+    "return_pct",      # gross_pnl / capital_tied × 100
+    "exit_reason",
+    "hold_days",
+]
+
+
+def _hold_days(open_d: Optional[str], close_d: Optional[str]) -> Optional[int]:
+    if not open_d or not close_d:
+        return None
+    try:
+        return (date.fromisoformat(close_d[:10]) - date.fromisoformat(open_d[:10])).days
+    except ValueError:
+        return None
+
+
+def _write_trades_csv(acct: "BacktestAccount", path: str) -> None:
+    """Write one row per trade (closed + still-open) for later analysis."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+        w.writeheader()
+
+        for t in acct.closed_trades:
+            w.writerow({
+                "status"       : "closed",
+                "symbol"       : t.get("symbol"),
+                "action"       : t.get("action"),
+                "strategy"     : t.get("strategy"),
+                "option_type"  : t.get("option_type"),
+                "strike"       : t.get("strike"),
+                "expiry"       : t.get("expiry"),
+                "contracts"    : t.get("contracts"),
+                "entry_date"   : t.get("open_date"),
+                "entry_price"  : round(t.get("entry", 0) or 0, 4),
+                "capital_tied" : round(t.get("cost", 0) or 0, 2),
+                "margin_method": t.get("method"),
+                "exit_date"    : t.get("close_date"),
+                "exit_price"   : round(t.get("exit", 0) or 0, 4),
+                "gross_pnl"    : round(t.get("gross_pnl", 0) or 0, 2),
+                "return_pct"   : round(t.get("pnl_pct", 0) or 0, 2),
+                "exit_reason"  : t.get("reason"),
+                "hold_days"    : _hold_days(t.get("open_date"), t.get("close_date")),
+            })
+
+        for p in acct.open_positions:
+            w.writerow({
+                "status"       : "open",
+                "symbol"       : p.get("symbol"),
+                "action"       : p.get("action"),
+                "strategy"     : p.get("strategy"),
+                "option_type"  : p.get("option_type"),
+                "strike"       : p.get("strike"),
+                "expiry"       : p.get("expiry"),
+                "contracts"    : p.get("contracts"),
+                "entry_date"   : p.get("open_date"),
+                "entry_price"  : round(p.get("entry", 0) or 0, 4),
+                "capital_tied" : round(p.get("cost", 0) or 0, 2),
+                "margin_method": p.get("method"),
+                "exit_date"    : "",
+                "exit_price"   : "",
+                "gross_pnl"    : "",
+                "return_pct"   : "",
+                "exit_reason"  : "still_open",
+                "hold_days"    : "",
+            })
+
+
 def _msg_dt(msg: dict) -> datetime:
     ts = msg.get("timestamp", "")
     try:
@@ -475,7 +559,8 @@ def _msg_dt(msg: dict) -> datetime:
 
 
 def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
-                 from_date, starting_balance, msp_multiplier, verbose) -> None:
+                 from_date, starting_balance, msp_multiplier, verbose,
+                 csv_path=None) -> None:
     after_dt = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
     today    = date.today()
 
@@ -648,6 +733,12 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
     print(f"  Equity (cash+open)  :  ${acct.equity:>12,.2f}  ({total_return:+.2f}%)")
     print(f"{'─'*72}\n")
 
+    # ── Write per-trade CSV for later analysis ─────────────────────────────
+    if csv_path:
+        _write_trades_csv(acct, csv_path)
+        n = len(acct.closed_trades) + len(acct.open_positions)
+        print(f"  Wrote {n} trade rows → {csv_path}\n")
+
     # ── Still-open positions ───────────────────────────────────────────────
     if acct.open_positions:
         print(f"  STILL OPEN ({len(acct.open_positions)}) — no exit found, expiry still in future")
@@ -683,6 +774,10 @@ def main() -> None:
                    help="MSP margin multiplier   (default: 2.0)")
     p.add_argument("--verbose",    action="store_true",
                    help="Print each trade as processed")
+    p.add_argument("--csv",        dest="csv_path", default=None,
+                   help="Write per-trade CSV to this path "
+                        "(default: paper_trading/trades/discord_backtest_<from>.csv; "
+                        "pass 'none' to skip)")
     args = p.parse_args()
 
     # Load token from .env if not in environment
@@ -705,6 +800,15 @@ def main() -> None:
     update_channel_id = int(os.getenv("DISCORD_UPDATE_CHANNEL_ID", "1466838176202231829"))
     forum_channel_id  = int(os.getenv("DISCORD_FORUM_CHANNEL_ID",  "1427087208657059952"))
 
+    # Resolve CSV path: explicit --csv, 'none' to skip, else a dated default.
+    if args.csv_path is None:
+        csv_path = os.path.join(_root, "paper_trading", "trades",
+                                f"discord_backtest_{args.from_date}.csv")
+    elif args.csv_path.lower() == "none":
+        csv_path = None
+    else:
+        csv_path = args.csv_path
+
     run_backtest(
         token             = token,
         signal_channel_id = signal_channel_id,
@@ -714,6 +818,7 @@ def main() -> None:
         starting_balance  = args.balance,
         msp_multiplier    = args.multiplier,
         verbose           = args.verbose,
+        csv_path          = csv_path,
     )
 
 
