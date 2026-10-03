@@ -59,7 +59,7 @@ def _extract_text(msg: dict) -> str:
     return text.strip()
 
 
-def make_entry_handler(parser, db, rule_engine, dry_run: bool):
+def make_entry_handler(parser, db, rule_engine, dry_run: bool, bridge=None):
     async def handle(msg: dict):
         text = _extract_text(msg)
         if not text:
@@ -78,6 +78,9 @@ def make_entry_handler(parser, db, rule_engine, dry_run: bool):
             log.info("ENTRY [%s] %s  confidence=%s  entry=$%s",
                      "DRY" if dry_run else "LIVE",
                      sig.summary(), sig.parse_confidence, sig.limit_price)
+            # Always mirror to paper account regardless of dry_run
+            if bridge:
+                bridge.open_trade(sig)
             if not dry_run and rule_engine:
                 await rule_engine.validate_new_trade(sig)
         else:
@@ -118,7 +121,7 @@ def make_update_handler(exit_parser, db, rule_engine, dry_run: bool):
     return handle
 
 
-def make_forum_handler(parser, db, exit_parser, rule_engine, dry_run: bool):
+def make_forum_handler(parser, db, exit_parser, rule_engine, dry_run: bool, bridge=None):
     async def handle_thread_create(thread: dict, http: aiohttp.ClientSession):
         thread_name = thread.get("name", "")
         thread_id   = thread.get("id", "")
@@ -153,6 +156,9 @@ def make_forum_handler(parser, db, exit_parser, rule_engine, dry_run: bool):
             log.info("FORUM ENTRY [%s] %s  confidence=%s  entry=$%s",
                      "DRY" if dry_run else "LIVE",
                      sig.summary(), sig.parse_confidence, sig.limit_price)
+            # Always mirror to paper account regardless of dry_run
+            if bridge:
+                bridge.open_trade(sig)
             if not dry_run and rule_engine:
                 await rule_engine.validate_new_trade(sig)
         else:
@@ -366,25 +372,31 @@ def main():
     if not token:
         raise RuntimeError("DISCORD_USER_TOKEN not set in .env")
 
-    from discord_alerts.discord_signal_reader import AlertParser, SignalDB
-    from discord_alerts.discord_exit_parser   import ExitParser
-    from discord_alerts.discord_exit_rules    import ExitRuleEngine
-    from discord_alerts.discord_notifier      import DiscordNotifier
+    from discord_alerts.discord_signal_reader  import AlertParser, SignalDB
+    from discord_alerts.discord_exit_parser    import ExitParser
+    from discord_alerts.discord_exit_rules     import ExitRuleEngine
+    from discord_alerts.discord_notifier       import DiscordNotifier
+    from discord_alerts.discord_paper_bridge   import DiscordPaperBridge
 
     parser      = AlertParser()
     db          = SignalDB(db_path=db_path)
     exit_parser = ExitParser()
     notifier    = DiscordNotifier(token=token, user_id=owner_id)
+    bridge      = DiscordPaperBridge()
     rule_engine = ExitRuleEngine(
         rules_path = rules_path,
         db_path    = db_path,
         notifier   = notifier if not dry_run else None,
     )
 
-    entry_handler  = make_entry_handler(parser, db, rule_engine, dry_run)
+    log.info("Paper bridge: account=%s  cash=$%.2f",
+             bridge._account.account_id,
+             bridge._account.get_state().cash)
+
+    entry_handler  = make_entry_handler(parser, db, rule_engine, dry_run, bridge=bridge)
     update_handler = make_update_handler(exit_parser, db, rule_engine, dry_run)
     forum_thread_create, forum_message = make_forum_handler(
-        parser, db, exit_parser, rule_engine, dry_run
+        parser, db, exit_parser, rule_engine, dry_run, bridge=bridge
     )
 
     log.info(

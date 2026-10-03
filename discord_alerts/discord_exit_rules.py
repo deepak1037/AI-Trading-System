@@ -16,6 +16,8 @@ from typing import Optional
 
 import yaml
 
+from discord_alerts.discord_paper_bridge import DiscordPaperBridge
+
 log = logging.getLogger(__name__)
 
 RAVISH_EXIT_KEYWORDS = [
@@ -65,6 +67,7 @@ class ExitRuleEngine:
         self.notifier   = notifier
         self.rules      = {}
         self.sizing     = {}
+        self._bridge    = DiscordPaperBridge()
         self._load()
 
     def _load(self):
@@ -222,12 +225,15 @@ class ExitRuleEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT paper_entry, action FROM discord_signals WHERE id=?", (trade_id,)
+                "SELECT paper_entry, action, contracts, symbol FROM discord_signals WHERE id=?",
+                (trade_id,)
             ).fetchone()
             if not row:
                 return False
-            entry  = row["paper_entry"] or 0
-            action = row["action"] or "BTO"
+            entry     = row["paper_entry"] or 0
+            action    = row["action"] or "BTO"
+            contracts = row["contracts"] or 1
+            symbol    = row["symbol"] or "?"
             if entry:
                 if action == "STO":
                     computed_pnl = (entry - exit_price) / entry * 100
@@ -246,4 +252,14 @@ class ExitRuleEngine:
             )
         log.info("Closed trade #%d @ %.2f  P&L=%.1f%%  reason=%s",
                  trade_id, exit_price, computed_pnl or 0, reason)
+
+        # Mirror close to the paper_discord PaperAccount
+        self._bridge.close_trade(
+            symbol      = symbol,
+            entry_price = entry,
+            exit_price  = exit_price,
+            contracts   = contracts,
+            action      = action,
+            reason      = reason,
+        )
         return True
