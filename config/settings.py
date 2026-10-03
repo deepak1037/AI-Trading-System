@@ -295,9 +295,13 @@ class Settings(BaseSettings):
     # Real Schwab account numbers (leave blank to use SCHWAB_ACCOUNT_NUMBER):
     TRADING_ENGINE_SCHWAB_ACCOUNT: str = ""   # default → SCHWAB_ACCOUNT_NUMBER
     DISCORD_SCHWAB_ACCOUNT: str = ""          # default → SCHWAB_ACCOUNT_NUMBER
-    # Minimum projected available funds (buying power) after a Discord paper trade.
-    # If Schwab preview shows remaining buying power below this, the trade is skipped.
-    DISCORD_PAPER_MIN_BUFFER: float = 5_000.0
+    # MSP (Margin Secured Put / STO put) conservative buffer multiplier.
+    # Schwab preview returns the margin required ($X). For MSP trades we deduct
+    # $X × this multiplier from the paper account — default 2.0 = book 2× margin.
+    # The extra $X acts as dry-powder buffer (short puts have theoretically unlimited
+    # downside). Set to 1.0 to book exact Schwab margin; >1 = more conservative.
+    # BTO options (calls, puts, spreads) always use Schwab's estimated_cost directly.
+    MSP_MARGIN_MULTIPLIER: float = 2.0
     # Multiple real Schwab account numbers (comma-separated, for future use):
     SCHWAB_ACCOUNT_NUMBERS: list[str] = Field(default_factory=list)
 

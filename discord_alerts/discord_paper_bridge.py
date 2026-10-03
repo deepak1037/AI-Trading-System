@@ -6,11 +6,17 @@ When a tradeable Discord signal arrives, this bridge:
   1. Builds an OptionsOrder from the ParsedSignal fields
   2. Calls SchwabBroker.preview_options_order() — real Schwab API call, no money moves
   3. Gets back real margin/buying-power impact from Schwab
-  4. Applies that cost to the paper_discord PaperAccount via apply_preview()
-  5. Checks a configurable buying-power buffer before opening each trade
+  4. Applies that cost to the paper_discord PaperAccount
 
-This means the paper account reflects realistic margin usage, not just
-"limit_price × contracts × 100".
+MSP (Margin Secured Put / STO put) buffer rule:
+  Schwab preview returns estimated_cost = margin required ($X).
+  For MSP we book 2X from the paper account — the actual margin ($X) as the
+  position cost, plus another $X held as a conservative buffer.  This reflects
+  the fact that a short put has theoretically unlimited downside and we want to
+  keep dry powder.  The 2X multiplier is configurable via MSP_MARGIN_MULTIPLIER.
+
+All other options (BTO calls, BTO puts, BTO spreads):
+  Book exactly what Schwab says (estimated_cost), no multiplier.
 
 Usage — called from discord_user_listener.py after a signal is saved:
 
@@ -20,7 +26,7 @@ Usage — called from discord_user_listener.py after a signal is saved:
     bridge.open_trade(signal)
 
     # On exit (from _close_trade in exit_rules):
-    bridge.close_trade(trade_id, exit_price, pnl_pct, reason)
+    bridge.close_trade(symbol, entry_price, exit_price, contracts, action, reason)
 """
 
 from __future__ import annotations
@@ -38,9 +44,14 @@ log = logging.getLogger(__name__)
 # One options contract = 100 shares × price
 _OPTIONS_MULTIPLIER = 100
 
-# Minimum projected available funds after a trade before we skip it.
-# Override via DISCORD_PAPER_MIN_BUFFER in .env (default $5,000).
-_DEFAULT_BUFFER = 5_000.0
+# For MSP (STO put): multiply Schwab's margin requirement by this factor
+# before debiting the paper account.  2.0 = block 2× margin as a buffer.
+# Override via MSP_MARGIN_MULTIPLIER in .env.
+_DEFAULT_MSP_MULTIPLIER = 2.0
+
+# Strategy types that are treated as MSP (margin secured put).
+_MSP_ACTIONS    = {"STO", "SELL", "SELL_TO_OPEN"}
+_MSP_STRATEGIES = {"short_put", "short_put_leaps", "cash_secured_put", "msp"}
 
 
 def _build_occ_symbol(symbol: str, expiry: str, option_type: str, strike: float) -> str:
@@ -69,13 +80,13 @@ class DiscordPaperBridge:
     """
 
     def __init__(self, account_id: Optional[str] = None) -> None:
-        acct_id         = account_id or settings.DISCORD_PAPER_ACCOUNT
-        self._account   = get_paper_account(acct_id)
-        self._broker    = get_broker_for(settings.DISCORD_SCHWAB_ACCOUNT or None)
-        self._min_buffer = float(getattr(settings, "DISCORD_PAPER_MIN_BUFFER", _DEFAULT_BUFFER))
+        acct_id              = account_id or settings.DISCORD_PAPER_ACCOUNT
+        self._account        = get_paper_account(acct_id)
+        self._broker         = get_broker_for(settings.DISCORD_SCHWAB_ACCOUNT or None)
+        self._msp_multiplier = float(getattr(settings, "MSP_MARGIN_MULTIPLIER", _DEFAULT_MSP_MULTIPLIER))
         log.info(
-            "DiscordPaperBridge: account=%s  broker=%s  min_buffer=$%.0f",
-            acct_id, type(self._broker).__name__, self._min_buffer,
+            "DiscordPaperBridge: account=%s  broker=%s  msp_multiplier=%.1fx",
+            acct_id, type(self._broker).__name__, self._msp_multiplier,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -111,7 +122,6 @@ class DiscordPaperBridge:
         )
 
         if preview is not None:
-            # Real Schwab cost — check buying-power buffer
             if not preview.is_valid:
                 log.warning(
                     "DiscordPaperBridge: Schwab rejected preview for %s — %s",
@@ -119,35 +129,67 @@ class DiscordPaperBridge:
                 )
                 return False
 
-            if preview.projected_available_fund < self._min_buffer:
-                log.warning(
-                    "DiscordPaperBridge: insufficient buying power after trade "
-                    "(projected_available=$%.2f < buffer=$%.2f) for %s — skipping",
-                    preview.projected_available_fund, self._min_buffer, symbol,
-                )
-                return False
+            is_msp = (
+                action in _MSP_ACTIONS
+                and (option_type or "").upper().startswith("P")
+                and strategy.lower() in _MSP_STRATEGIES
+            )
 
-            # Build a synthetic Order so apply_preview() math works:
-            # apply_preview does fill_price = estimated_cost / qty
-            # We pass qty = contracts (not ×100) because estimated_cost is
-            # already the total order value from Schwab.
-            order = Order(
-                ticker        = symbol,
-                action        = "BUY" if action in ("BTO", "BUY", "BUY_TO_OPEN") else "SELL",
-                qty           = contracts,
-                order_type    = "limit",
-                limit_price   = entry_price,
-                strategy_name = f"discord_{strategy}",
-                account_id    = self._account.account_id,
-            )
-            result = self._account.apply_preview(order, preview)
-            log.info(
-                "DiscordPaperBridge: OPEN %s %s  contracts=%d  "
-                "schwab_cost=$%.2f  buying_power_left=$%.2f  status=%s",
-                action, symbol, contracts,
-                preview.estimated_cost, preview.projected_available_fund,
-                result.status,
-            )
+            if is_msp:
+                # MSP: book 2× the Schwab margin requirement.
+                # Schwab gives estimated_cost = margin needed ($X).
+                # We debit $X × multiplier (default 2X) so the paper account
+                # stays conservative and keeps dry powder.
+                effective_cost = preview.estimated_cost * self._msp_multiplier
+                state = self._account.get_state()
+                if state.cash < effective_cost:
+                    log.warning(
+                        "DiscordPaperBridge: insufficient cash for MSP %s "
+                        "(need $%.2f [%.0fx $%.2f margin], have $%.2f) — skipping",
+                        symbol, effective_cost, self._msp_multiplier,
+                        preview.estimated_cost, state.cash,
+                    )
+                    return False
+                # Patch the preview so apply_preview() deducts the full 2X amount.
+                # fill_price = estimated_cost / qty, so we set estimated_cost = 2X margin.
+                adjusted_preview = preview.model_copy(update={"estimated_cost": effective_cost})
+                order = Order(
+                    ticker        = symbol,
+                    action        = "SELL",
+                    qty           = contracts,
+                    order_type    = "limit",
+                    limit_price   = entry_price,
+                    strategy_name = f"discord_{strategy}",
+                    account_id    = self._account.account_id,
+                )
+                result = self._account.apply_preview(order, adjusted_preview)
+                log.info(
+                    "DiscordPaperBridge: OPEN MSP %s  contracts=%d  "
+                    "schwab_margin=$%.2f  booked=%.0fx=$%.2f  status=%s",
+                    symbol, contracts,
+                    preview.estimated_cost, self._msp_multiplier, effective_cost,
+                    result.status,
+                )
+            else:
+                # BTO (calls, puts, spreads): book exactly what Schwab says.
+                order = Order(
+                    ticker        = symbol,
+                    action        = "BUY",
+                    qty           = contracts,
+                    order_type    = "limit",
+                    limit_price   = entry_price,
+                    strategy_name = f"discord_{strategy}",
+                    account_id    = self._account.account_id,
+                )
+                result = self._account.apply_preview(order, preview)
+                log.info(
+                    "DiscordPaperBridge: OPEN BTO %s  contracts=%d  "
+                    "schwab_cost=$%.2f  buying_power_left=$%.2f  status=%s",
+                    symbol, contracts,
+                    preview.estimated_cost, preview.projected_available_fund,
+                    result.status,
+                )
+
             return result.status == "filled"
 
         # ── Fallback: no OCC symbol → use signal price directly ──────────────
