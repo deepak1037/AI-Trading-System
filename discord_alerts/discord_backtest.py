@@ -180,12 +180,22 @@ def _snowflake_after(dt: datetime) -> str:
 
 def _fetch_channel_messages(token: str, channel_id: int, after_dt: datetime,
                             delay: float = 0.4) -> list[dict]:
-    """Fetch all messages in channel newer than after_dt, oldest-first."""
-    messages = []
-    after    = _snowflake_after(after_dt)
+    """Fetch all messages in channel newer than after_dt, oldest-first.
+
+    Paginates BACKWARD with ?before= (the robust Discord pattern): each call
+    returns the 100 messages immediately before the cursor, newest-first; we
+    walk back until we cross after_dt. (Using ?after= is unreliable — Discord
+    returns the NEWEST 100 after the cursor, silently skipping middle messages
+    on a busy channel.)
+    """
+    messages: list[dict] = []
+    cutoff   = int(_snowflake_after(after_dt))
+    before: Optional[str] = None
     while True:
-        url = f"{GATEWAY_API}/channels/{channel_id}/messages?limit=100&after={after}"
-        r   = requests.get(url, headers=_headers(token), timeout=15)
+        url = f"{GATEWAY_API}/channels/{channel_id}/messages?limit=100"
+        if before:
+            url += f"&before={before}"
+        r = requests.get(url, headers=_headers(token), timeout=15)
         if r.status_code == 429:
             wait = r.json().get("retry_after", 2)
             time.sleep(wait)
@@ -199,35 +209,66 @@ def _fetch_channel_messages(token: str, channel_id: int, after_dt: datetime,
         batch = r.json()
         if not batch:
             break
-        batch.sort(key=lambda m: int(m["id"]))
         messages.extend(batch)
-        after = batch[-1]["id"]
+        oldest_id = int(batch[-1]["id"])   # newest-first → last is oldest
+        before    = batch[-1]["id"]
+        if oldest_id <= cutoff:            # walked past the start date
+            break
+        if len(batch) < 100:               # no more history
+            break
         time.sleep(delay)
+
+    # Keep only messages at/after the start date, oldest-first.
+    messages = [m for m in messages if int(m["id"]) >= cutoff]
+    messages.sort(key=lambda m: int(m["id"]))
     return messages
 
 def _fetch_forum_threads(token: str, forum_id: int, after_dt: datetime,
-                         delay: float = 0.4) -> list[dict]:
-    """Fetch messages from all active + archived forum threads."""
+                         delay: float = 0.3) -> list[dict]:
+    """Fetch messages from all active + archived forum threads.
+
+    Prints per-thread progress so a long run never looks frozen.
+    """
     all_msgs: list[dict] = []
     after_snow = int(_snowflake_after(after_dt))
 
+    # Collect candidate threads from both the active search and the archive.
+    threads: list[dict] = []
+    seen_ids: set[str] = set()
     for endpoint in [
         f"{GATEWAY_API}/channels/{forum_id}/threads/search?limit=25&sort_by=last_message_time",
         f"{GATEWAY_API}/channels/{forum_id}/threads/archived/public?limit=100",
     ]:
         r = requests.get(endpoint, headers=_headers(token), timeout=15)
         if r.status_code != 200:
+            log.warning("thread list HTTP %d for %s", r.status_code, endpoint)
             continue
-        threads = r.json().get("threads", [])
-        for thread in threads:
-            tid = int(thread["id"])
-            if tid < after_snow:
-                continue
-            msgs = _fetch_channel_messages(token, tid, after_dt, delay)
-            for m in msgs:
-                m["_thread_name"] = thread.get("name", "")
-                m["_thread_id"]   = str(tid)
-            all_msgs.extend(msgs)
+        for t in r.json().get("threads", []):
+            if t["id"] not in seen_ids:
+                seen_ids.add(t["id"])
+                threads.append(t)
+
+    # Keep only threads whose last activity is within our window. A thread's
+    # id encodes its CREATION time; a thread created before the window can
+    # still hold in-window messages, so gate on last_message_id when present.
+    def _in_window(t: dict) -> bool:
+        last = t.get("last_message_id")
+        if last:
+            return int(last) >= after_snow
+        return int(t["id"]) >= after_snow
+
+    candidates = [t for t in threads if _in_window(t)]
+    print(f"  forum: {len(threads)} threads found, {len(candidates)} in window")
+
+    for i, thread in enumerate(candidates, 1):
+        tid   = int(thread["id"])
+        tname = thread.get("name", "")
+        msgs  = _fetch_channel_messages(token, tid, after_dt, delay)
+        for m in msgs:
+            m["_thread_name"] = tname
+            m["_thread_id"]   = str(tid)
+        all_msgs.extend(msgs)
+        print(f"    [{i}/{len(candidates)}] {tname[:40]:40}  {len(msgs):3} msgs")
     return all_msgs
 
 
