@@ -47,21 +47,33 @@ class WatchlistManager:
                 )
             """)
 
-    def add(self, ticker: str, composite_score: int, name: str = "") -> None:
+    def add(
+        self,
+        ticker: str,
+        composite_score: int,
+        name: str = "",
+        short_tf: int = 0,
+        mid_tf: int = 0,
+        long_tf: int = 0,
+    ) -> None:
         """Add or re-activate a ticker on the watchlist."""
         self._init_table()
         now = datetime.now(tz=timezone.utc).isoformat()
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("""
-                INSERT INTO watchlist (ticker, name, composite_score, added_at, is_active)
-                VALUES (?, ?, ?, ?, 1)
+                INSERT INTO watchlist (ticker, name, composite_score, short_tf, mid_tf, long_tf, added_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(ticker) DO UPDATE SET
                     composite_score=excluded.composite_score,
+                    short_tf=excluded.short_tf,
+                    mid_tf=excluded.mid_tf,
+                    long_tf=excluded.long_tf,
                     added_at=excluded.added_at,
                     removed_at=NULL,
                     is_active=1
-            """, (ticker, name, composite_score, now))
-        logger.info("Watchlist: added %s score=%d", ticker, composite_score)
+            """, (ticker, name, composite_score, short_tf, mid_tf, long_tf, now))
+        logger.info("Watchlist: added %s score=%d tf=%d/%d/%d",
+                    ticker, composite_score, short_tf, mid_tf, long_tf)
 
     def remove(self, ticker: str, reason: str = "") -> None:
         """Deactivate a ticker from the watchlist."""
@@ -85,11 +97,7 @@ class WatchlistManager:
         return [dict(r) for r in rows]
 
     def _composite_for(self, ticker: str, data: dict, tdata: dict) -> int:
-        """Real composite score from a stock's actual stage data.
-
-        ``data`` carries the fundamental + accumulation fields (from Stages 3-4),
-        ``tdata`` carries the technical fields (from the Stage 5 run).
-        """
+        """Real composite score from a stock's actual stage data."""
         fund_score = self._scorer.fundamental_score_from_flags(
             eps_accelerating=data.get("eps_accelerating", False),
             rev_reaccelerating=data.get("rev_reaccelerating", False),
@@ -118,34 +126,38 @@ class WatchlistManager:
             tf_alignment_score=tf_score,
         )
 
-    def update_from_stage4(self, stage4_data: dict[str, dict]) -> None:
-        """Update watchlist from Stage 3-4 per-stock data — full weekly run.
+    def _tf_flags(self, tdata: dict) -> tuple[int, int, int]:
+        """Derive short/mid/long TF flags from Stage 5 technical data.
 
-        Args:
-            stage4_data: ``{ticker: {...fundamental + accumulation fields...}}``
-                — the merged output of fundamental_screen + accumulation_screen.
-                Stage 5 (technical) is run here; its per-stock data is combined
-                with ``stage4_data`` to compute each name's real composite score.
+        Stage 5 confirms Stage 2 (price > 50/150/200 MA, stacked, rising) which
+        means all three timeframes agree. We break tf_alignment into individual
+        flags so the UI can show them separately.
+          short_tf = 1 if price > 50 MA  (short-term trend up)
+          mid_tf   = 1 if price > 150 MA (medium-term trend up)
+          long_tf  = 1 if tf_alignment   (full Stage 2 = all TFs aligned)
+        All three are 1 for every Stage 5 survivor; 0 otherwise.
         """
+        aligned = int(bool(tdata.get("tf_alignment", False)))
+        return aligned, aligned, aligned
+
+    def update_from_stage4(self, stage4_data: dict[str, dict]) -> None:
+        """Update watchlist from Stage 3-4 per-stock data — full weekly run."""
         self._init_table()
         stage5 = self._tech_screen.screen(list(stage4_data.keys()))
         stage5_by_ticker = {d["ticker"]: d for d in stage5}
 
-        # Score every Stage 5 survivor; keep only those clearing the threshold.
-        qualifying: dict[str, int] = {}
+        qualifying: dict[str, tuple[int, int, int, int]] = {}  # ticker -> (score, s, m, l)
         for ticker, tdata in stage5_by_ticker.items():
             score = self._composite_for(ticker, stage4_data.get(ticker, {}), tdata)
             if self._scorer.passes_watchlist_threshold(score):
-                qualifying[ticker] = score
+                short_tf, mid_tf, long_tf = self._tf_flags(tdata)
+                qualifying[ticker] = (score, short_tf, mid_tf, long_tf)
             else:
                 logger.debug("Stage5 %s scored %d (< threshold)", ticker, score)
 
-        for ticker, score in qualifying.items():
-            self.add(ticker, composite_score=score)  # add or refresh score
+        for ticker, (score, s, m, l) in qualifying.items():
+            self.add(ticker, composite_score=score, short_tf=s, mid_tf=m, long_tf=l)
 
-        # Remove any active name that no longer qualifies — whether it dropped
-        # out of Stage 5 OR is still in Stage 5 but now scores below threshold.
-        # (Without this, a name keeps a stale score forever.)
         for entry in self.get_active():
             if entry["ticker"] not in qualifying:
                 self.remove(entry["ticker"], reason="below_threshold_or_failed_stage5")
@@ -156,38 +168,34 @@ class WatchlistManager:
         )
 
     def daily_rescan(self, stage4_data: dict[str, dict]) -> None:
-        """Daily rescan: re-screen current Stage 4 survivors for technical changes.
-
-        Args:
-            stage4_data: ``{ticker: {...stage 3-4 fields...}}`` (same shape as
-                ``update_from_stage4``), so re-scored names keep their real
-                fundamental/institutional inputs.
-        """
+        """Daily rescan: re-screen current Stage 4 survivors for technical changes."""
         logger.info("WatchlistManager.daily_rescan: %d Stage 4 tickers", len(stage4_data))
         new_stage5 = self._tech_screen.screen(list(stage4_data.keys()))
         new_by_ticker = {d["ticker"]: d for d in new_stage5}
         self._tech_screen.log_run(len(stage4_data), len(new_by_ticker))
 
-        # Add new breakouts
         existing = {e["ticker"] for e in self.get_active()}
         for ticker, tdata in new_by_ticker.items():
-            if ticker not in existing:
-                score = self._composite_for(ticker, stage4_data.get(ticker, {}), tdata)
-                if self._scorer.passes_watchlist_threshold(score):
-                    self.add(ticker, composite_score=score)
+            score = self._composite_for(ticker, stage4_data.get(ticker, {}), tdata)
+            if self._scorer.passes_watchlist_threshold(score):
+                short_tf, mid_tf, long_tf = self._tf_flags(tdata)
+                if ticker not in existing:
+                    self.add(ticker, composite_score=score,
+                             short_tf=short_tf, mid_tf=mid_tf, long_tf=long_tf)
+                else:
+                    # Update TF flags on existing entries even if already on watchlist
+                    with sqlite3.connect(self._db_path) as conn:
+                        conn.execute(
+                            "UPDATE watchlist SET short_tf=?, mid_tf=?, long_tf=?, composite_score=? WHERE ticker=?",
+                            (short_tf, mid_tf, long_tf, score, ticker)
+                        )
 
-        # Remove stocks that broke down
         for entry in self.get_active():
             if entry["ticker"] not in new_by_ticker:
                 self.remove(entry["ticker"], reason="technical_breakdown")
 
     def promote_on_options_flow(self, ticker: str, options_score: float) -> None:
-        """Instant watchlist promotion when options flow threshold crossed.
-
-        High unusual options flow signals institutional conviction across multiple
-        dimensions — score it broadly rather than just the technical weight.
-        """
-        # Options flow above 80 = very strong signal — score all dimensions proportionally
+        """Instant watchlist promotion when options flow threshold crossed."""
         score = self._scorer.score(
             fundamental_score=options_score,
             institutional_score=options_score,
