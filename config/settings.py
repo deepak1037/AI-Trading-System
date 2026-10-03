@@ -295,6 +295,9 @@ class Settings(BaseSettings):
     # Real Schwab account numbers (leave blank to use SCHWAB_ACCOUNT_NUMBER):
     TRADING_ENGINE_SCHWAB_ACCOUNT: str = ""   # default → SCHWAB_ACCOUNT_NUMBER
     DISCORD_SCHWAB_ACCOUNT: str = ""          # default → SCHWAB_ACCOUNT_NUMBER
+    # Minimum projected available funds (buying power) after a Discord paper trade.
+    # If Schwab preview shows remaining buying power below this, the trade is skipped.
+    DISCORD_PAPER_MIN_BUFFER: float = 5_000.0
     # Multiple real Schwab account numbers (comma-separated, for future use):
     SCHWAB_ACCOUNT_NUMBERS: list[str] = Field(default_factory=list)
 
