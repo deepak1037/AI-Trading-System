@@ -111,7 +111,11 @@ def _get_close_price(ticker: str, on_date: date) -> Optional[float]:
         if df.empty:
             _price_cache[key] = None
             return None
-        price = float(df["Close"].iloc[-1])
+        close = df["Close"]
+        # Newer pandas/yfinance returns a DataFrame column (sometimes a 1-col
+        # frame when a single ticker is a MultiIndex); squeeze to a scalar.
+        val = close.iloc[-1]
+        price = float(val.iloc[0]) if hasattr(val, "iloc") else float(val)
         _price_cache[key] = price
         return price
     except Exception as e:
@@ -273,6 +277,167 @@ def _fetch_forum_threads(token: str, forum_id: int, after_dt: datetime,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Forum thread-title parser
+#
+# Each income-trades forum thread is ONE trade, and its title is the cleanest
+# spec we get, e.g.:
+#     "🟢 NVDA 205 Short Put @ 4.85"
+#     "🟢 AMAT 420 Short Put LEAPS @ 58"
+#     "🟢 TSM 450/460 Call Spread @ 2.8"
+#     "🟢 QQQ Double Diagonal Sept-25 @ 0.05 credit"
+#     "🟢 AAPL 230 Naked Put @ 12.35"
+# We parse the title for symbol/strike/strategy/entry/action so short puts are
+# correctly recognised as MSP (and tie up real margin, not premium).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TitleSignal:
+    """Minimal ParsedSignal-compatible object built from a forum thread title."""
+    def __init__(self):
+        self.message_id   = ""
+        self.channel_id   = ""
+        self.author       = "forum"
+        self.raw_text     = ""
+        self.action       = None
+        self.symbol       = None
+        self.strategy_type = "unknown"
+        self.strike       = None
+        self.expiry_short = None
+        self.expiry_long  = None
+        self.option_type  = None
+        self.limit_price  = None
+        self.paper_entry  = None
+        self.contracts    = 1
+        self.parse_confidence = "low"
+
+    @property
+    def is_tradeable(self):
+        return (self.symbol is not None and self.limit_price is not None
+                and self.action is not None)
+
+
+def _parse_thread_title(title: str) -> Optional[_TitleSignal]:
+    """Parse a forum thread title into a trade signal. None if unparseable."""
+    if not title:
+        return None
+    sig = _TitleSignal()
+    sig.raw_text = title
+
+    # Strip leading emoji / non-alphanumerics.
+    t = title.strip()
+    t = t.lstrip("🟢🔴⚪🟡🔵⭐️✅❌ ").strip()
+    t = __import__("re").sub(r'^[^A-Za-z0-9]+', '', t).strip()
+
+    import re
+    # Optional explicit STO/BTO prefix.
+    explicit = None
+    m = re.match(r'(STO|BTO)\s+', t, re.IGNORECASE)
+    if m:
+        explicit = m.group(1).upper()
+        t = t[m.end():].strip()
+
+    # Symbol = first 1-5 letter uppercase token.
+    m = re.match(r'([A-Za-z]{1,5})\b', t)
+    if not m:
+        return None
+    sig.symbol = m.group(1).upper()
+    rest = t[m.end():].strip()
+
+    # Strike(s): a leading number, optionally number/number (spread).
+    m = re.match(r'(\d+(?:\.\d+)?)(?:\s*/\s*(\d+(?:\.\d+)?))?', rest)
+    if m:
+        sig.strike = float(m.group(1))
+        rest = rest[m.end():].strip()
+
+    low = t.lower()
+
+    # Entry price after "@".
+    m = re.search(r'@\s*(\d+(?:\.\d+)?)', t)
+    if m:
+        sig.limit_price = float(m.group(1))
+        sig.paper_entry = sig.limit_price
+
+    credit = "credit" in low
+    debit  = "debit" in low
+
+    # Expiry hint in title (Month-Day), best-effort → YYYY-MM-DD.
+    sig.expiry_short = _title_expiry(t)
+
+    # Strategy / action / option_type from keywords (longest match first).
+    if "short put leaps" in low or "naked put leaps" in low or ("leaps" in low and "put" in low):
+        sig.strategy_type, sig.action, sig.option_type = "short_put_leaps", "STO", "PUT"
+    elif "short put" in low or "naked put" in low:
+        sig.strategy_type, sig.action, sig.option_type = "short_put", "STO", "PUT"
+    elif "put spread" in low:
+        sig.strategy_type = "put_spread"
+        sig.action = explicit or ("STO" if credit else "BTO")
+        sig.option_type = "PUT"
+    elif "call spread" in low:
+        sig.strategy_type = "call_spread"
+        sig.action = explicit or ("STO" if credit else "BTO")
+        sig.option_type = "CALL"
+    elif "double diagonal" in low:
+        sig.strategy_type, sig.action = "double_diagonal", "BTO"
+    elif "double calendar" in low:
+        sig.strategy_type, sig.action = "double_calendar", "BTO"
+    elif "diagonal" in low:
+        sig.strategy_type, sig.action = "diagonal", "BTO"
+    elif "calendar" in low:
+        sig.strategy_type, sig.action = "calendar", "BTO"
+    elif "bwb" in low or "butterfly" in low:
+        sig.strategy_type, sig.action = "bwb", (explicit or ("STO" if credit else "BTO"))
+    elif "put" in low:
+        sig.strategy_type, sig.action, sig.option_type = "short_put", "STO", "PUT"
+    elif "call" in low:
+        sig.strategy_type, sig.action, sig.option_type = "long_call", "BTO", "CALL"
+    else:
+        sig.strategy_type, sig.action = "unknown", (explicit or "BTO")
+
+    if explicit:
+        sig.action = explicit
+    sig.parse_confidence = "high"
+    return sig
+
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+}
+
+
+def _title_expiry(text: str) -> Optional[str]:
+    """Extract an expiry like 'Oct-9' / 'Sept-25' / 'Dec-19' → YYYY-MM-DD.
+
+    Year is inferred: pick the next occurrence of that month/day on or after
+    the backtest window; if the month is already past this year, roll forward.
+    """
+    import re
+    m = re.search(r'([A-Za-z]{3,9})[-\s]+(\d{1,2})', text)
+    if not m:
+        return None
+    mon = _MONTHS.get(m.group(1).lower())
+    if not mon:
+        return None
+    day = int(m.group(2))
+    # Infer year around the current date (backtests run on recent data).
+    today = date.today()
+    year = today.year
+    try:
+        cand = date(year, mon, day)
+    except ValueError:
+        return None
+    # If that date is far in the past (>6 months), roll to next year.
+    if (today - cand).days > 182:
+        try:
+            cand = date(year + 1, mon, day)
+        except ValueError:
+            return None
+    return cand.isoformat()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Paper account simulation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -292,7 +457,9 @@ class BacktestAccount:
             and strategy.lower() in _MSP_STRATS
         )
 
-    def open_trade(self, sig, received_at: str) -> bool:
+    def open_trade(self, sig, received_at: str,
+                   source: str = "signal", thread_id: Optional[str] = None):
+        """Open a position. Returns the position dict, or None if skipped."""
         entry     = sig.paper_entry or sig.limit_price
         contracts = sig.contracts or 1
         action    = (sig.action or "BTO").upper()
@@ -301,7 +468,7 @@ class BacktestAccount:
 
         if not entry:
             self.skipped.append({"sig": sig, "reason": "no_price", "date": received_at})
-            return False
+            return None
 
         is_msp = self._is_msp(action, opt_type, strategy)
         strike = sig.strike
@@ -329,10 +496,10 @@ class BacktestAccount:
                 "reason": f"no cash (need ${cost:,.0f} have ${self.cash:,.0f})",
                 "date": received_at,
             })
-            return False
+            return None
 
         self.cash -= cost
-        self.open_positions.append({
+        pos = {
             "symbol"      : (sig.symbol or "?").upper(),
             "action"      : action,
             "option_type" : opt_type,
@@ -345,47 +512,62 @@ class BacktestAccount:
             "expiry"      : sig.expiry_short,
             "strike"      : sig.strike,
             "is_msp"      : is_msp,
+            "source"      : source,       # signal | forum
+            "thread_id"   : thread_id,    # set for forum trades
             "sig"         : sig,
+        }
+        self.open_positions.append(pos)
+        return pos
+
+    def close_position(self, pos: dict, exit_price: Optional[float],
+                       pnl_pct: Optional[float], reason: str, close_date: str) -> bool:
+        """Close a SPECIFIC open position object (used for thread-scoped exits)."""
+        if pos not in self.open_positions:
+            return False
+        entry  = pos["entry"]
+        action = pos["action"]
+        if not exit_price and pnl_pct is not None:
+            if action in _MSP_ACTIONS:
+                exit_price = entry * (1 - pnl_pct / 100)
+            else:
+                exit_price = entry * (1 + pnl_pct / 100)
+        if not exit_price:
+            return False
+
+        contracts = pos["contracts"]
+        gross_pnl = (exit_price - entry) * contracts * _OPTIONS_MULT
+        if action in _MSP_ACTIONS:
+            gross_pnl = -gross_pnl   # STO profits when price falls
+
+        self.cash += pos["cost"] + gross_pnl
+        self.closed_trades.append({
+            **pos,
+            "exit"      : exit_price,
+            "gross_pnl" : gross_pnl,
+            "pnl_pct"   : gross_pnl / pos["cost"] * 100,
+            "close_date": close_date,
+            "reason"    : reason,
         })
+        self.open_positions.remove(pos)
         return True
 
     def close_trade(self, symbol: str, exit_price: Optional[float],
-                    pnl_pct: Optional[float], reason: str, close_date: str) -> bool:
+                    pnl_pct: Optional[float], reason: str, close_date: str,
+                    source: Optional[str] = None) -> bool:
+        """Close most-recent open position for symbol (LIFO).
+
+        If ``source`` is given, only positions opened from that venue are
+        eligible — this keeps update-channel closes from double-closing a
+        forum trade that its own thread already handled.
+        """
         symbol = symbol.upper()
         for i in range(len(self.open_positions) - 1, -1, -1):
             pos = self.open_positions[i]
             if pos["symbol"] != symbol:
                 continue
-
-            entry  = pos["entry"]
-            action = pos["action"]
-
-            # Derive exit price from pnl_pct if not given
-            if not exit_price and pnl_pct is not None:
-                if action in _MSP_ACTIONS:
-                    exit_price = entry * (1 - pnl_pct / 100)
-                else:
-                    exit_price = entry * (1 + pnl_pct / 100)
-
-            if not exit_price:
-                return False
-
-            contracts = pos["contracts"]
-            gross_pnl = (exit_price - entry) * contracts * _OPTIONS_MULT
-            if action in _MSP_ACTIONS:
-                gross_pnl = -gross_pnl   # STO profits when price falls
-
-            self.cash += pos["cost"] + gross_pnl
-            self.closed_trades.append({
-                **pos,
-                "exit"      : exit_price,
-                "gross_pnl" : gross_pnl,
-                "pnl_pct"   : gross_pnl / pos["cost"] * 100,
-                "close_date": close_date,
-                "reason"    : reason,
-            })
-            self.open_positions.pop(i)
-            return True
+            if source is not None and pos.get("source") != source:
+                continue
+            return self.close_position(pos, exit_price, pnl_pct, reason, close_date)
         return False
 
     @property
@@ -649,6 +831,32 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
               f"{'Ctrs':4}  {'Price':>7}  {'Cost':>9}  {'Cash':>12}  Status")
         print("─" * 102)
 
+    # thread_id → open position (or None once closed / never opened).
+    # Forum trades are managed entirely within their own thread; the update
+    # channel only closes SIGNAL-channel trades. This prevents the same profit
+    # post (which appears in both the thread and the update channel) from
+    # closing two positions.
+    thread_pos:    dict[str, Optional[dict]] = {}
+    thread_seen:   set[str] = set()
+
+    def _log(date_str, src, act, sym, strat, ctrs, price, cost, status):
+        if verbose:
+            print(f"{date_str}  {src:6}  {act:4} {sym:8} {strat:18} "
+                  f"{ctrs:4}  {price:7.2f}  {cost:9,.2f}  {acct.cash:12,.2f}  {status}")
+
+    def _detect_exit(content):
+        """Return (reason, exit_price, pnl_pct) if this msg is an exit, else None."""
+        lower     = content.lower()
+        ravish_kw = next((k for k in RAVISH_EXIT_KEYWORDS if k in lower), None)
+        exit_sig  = exit_parser.parse(content)
+        pnl_pct   = getattr(exit_sig, "pnl_pct",   None) if exit_sig else None
+        exit_price = getattr(exit_sig, "exit_price", None) if exit_sig else None
+        if ravish_kw:
+            return ravish_kw, exit_price, pnl_pct
+        if pnl_pct is not None and pnl_pct >= 50:
+            return "profit_target", exit_price, pnl_pct
+        return None
+
     for msg in all_msgs:
         source  = msg["_source"]
         content = msg.get("content", "") or ""
@@ -660,65 +868,93 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
         date_str   = msg_dt.strftime("%Y-%m-%d")
         channel_id = str(msg.get("channel_id", msg.get("_thread_id", "")))
 
-        # ── Entry signals ─────────────────────────────────────────────────
-        if source in ("signal", "forum"):
+        # ══ FORUM ════════════════════════════════════════════════════════
+        # One trade per thread. First message we see for a thread = ENTRY
+        # (parsed from the TITLE, expiry backfilled from the message body).
+        # Later messages in that thread = exits for THAT position only.
+        if source == "forum":
+            tid = str(msg.get("_thread_id", ""))
+
+            if tid not in thread_seen:
+                thread_seen.add(tid)
+                title   = msg.get("_thread_name", "")
+                tsig    = _parse_thread_title(title)
+                # Backfill expiry/strike from the first message body.
+                body    = parser.parse(text=content, message_id=msg["id"],
+                                       channel_id=channel_id, author=author)
+                if tsig and body:
+                    if not tsig.expiry_short and body.expiry_short:
+                        tsig.expiry_short = body.expiry_short
+                    if not tsig.strike and body.strike:
+                        tsig.strike = body.strike
+
+                if tsig and tsig.is_tradeable:
+                    parsed_entries += 1
+                    pos = acct.open_trade(tsig, date_str, source="forum", thread_id=tid)
+                    thread_pos[tid] = pos
+                    if pos:
+                        _log(date_str, "forum", tsig.action or "?", tsig.symbol or "?",
+                             tsig.strategy_type or "?", tsig.contracts or 1,
+                             tsig.paper_entry or 0, pos["cost"], f"OPEN  {pos['method']}")
+                    else:
+                        _log(date_str, "forum", tsig.action or "?", tsig.symbol or "?",
+                             tsig.strategy_type or "?", 1, tsig.paper_entry or 0, 0.0, "SKIP")
+                else:
+                    thread_pos[tid] = None
+                continue   # thread-opening message is never also an exit
+
+            # Subsequent message in a known thread → exit for its position.
+            pos = thread_pos.get(tid)
+            if pos is None:
+                continue
+            ev = _detect_exit(content)
+            if ev:
+                reason, exit_price, pnl_pct = ev
+                if acct.close_position(pos, exit_price, pnl_pct, reason, date_str):
+                    ravish_exits += 1
+                    thread_pos[tid] = None
+                    trade = acct.closed_trades[-1]
+                    _log(date_str, "forum", "EXIT", pos["symbol"], "", 1,
+                         trade.get("exit", 0) or 0, trade["gross_pnl"],
+                         f"CLOSED ({trade['pnl_pct']:+.1f}%)")
+            continue
+
+        # ══ SIGNAL CHANNEL ═══════════════════════════════════════════════
+        if source == "signal":
             sig = parser.parse(text=content, message_id=msg["id"],
                                channel_id=channel_id, author=author)
             if sig and sig.is_tradeable:
                 parsed_entries += 1
-                opened = acct.open_trade(sig, date_str)
-                if verbose:
-                    entry = sig.paper_entry or sig.limit_price or 0
-                    if opened:
-                        pos    = acct.open_positions[-1]
-                        cost   = pos["cost"]
-                        method = pos["method"]
-                        status = f"OPEN  {method}"
-                    else:
-                        cost   = 0.0
-                        status = "SKIP"
-                    print(f"{date_str}  {source:6}  {sig.action or '?':4} "
-                          f"{sig.symbol or '?':8} {sig.strategy_type or '?':18} "
-                          f"{sig.contracts or 1:4}  {entry:7.2f}  {cost:9,.2f}  "
-                          f"{acct.cash:12,.2f}  {status}")
+                pos = acct.open_trade(sig, date_str, source="signal")
+                if pos:
+                    _log(date_str, "signal", sig.action or "?", sig.symbol or "?",
+                         sig.strategy_type or "?", sig.contracts or 1,
+                         sig.paper_entry or sig.limit_price or 0, pos["cost"],
+                         f"OPEN  {pos['method']}")
+                else:
+                    _log(date_str, "signal", sig.action or "?", sig.symbol or "?",
+                         sig.strategy_type or "?", 1,
+                         sig.paper_entry or sig.limit_price or 0, 0.0, "SKIP")
+            continue
 
-        # ── Exit signals ──────────────────────────────────────────────────
-        if source in ("update", "forum"):
-            lower     = content.lower()
-            ravish_kw = next((k for k in RAVISH_EXIT_KEYWORDS if k in lower), None)
-            exit_sig  = exit_parser.parse(content)
-            pnl_pct   = getattr(exit_sig, "pnl_pct",   None) if exit_sig else None
-            exit_price = getattr(exit_sig, "exit_price", None) if exit_sig else None
-            symbol     = getattr(exit_sig, "symbol",    None) if exit_sig else None
-
-            # Fall back to thread name for symbol
+        # ══ UPDATE CHANNEL ═══════════════════════════════════════════════
+        # Closes SIGNAL-channel trades only (forum trades close in-thread).
+        if source == "update":
+            ev = _detect_exit(content)
+            if not ev:
+                continue
+            reason, exit_price, pnl_pct = ev
+            exit_sig = exit_parser.parse(content)
+            symbol   = getattr(exit_sig, "symbol", None) if exit_sig else None
             if not symbol:
-                thread_name = msg.get("_thread_name", "")
-                if thread_name:
-                    symbol = thread_name.split()[0].upper().strip("$")
-
-            if ravish_kw and symbol:
-                closed = acct.close_trade(symbol, exit_price, pnl_pct, ravish_kw, date_str)
-                if closed:
-                    ravish_exits += 1
-                    if verbose:
-                        trade = acct.closed_trades[-1]
-                        ep = trade.get("exit", 0) or 0
-                        print(f"{date_str}  {source:6}  {'EXIT':4} "
-                              f"{symbol:8} {'':18} {'':4}  {ep:7.2f}  "
-                              f"{trade['gross_pnl']:+9,.2f}  {acct.cash:12,.2f}  "
-                              f"CLOSED ({trade['pnl_pct']:+.1f}%)")
-
-            elif exit_sig and symbol and pnl_pct and pnl_pct >= 50:
-                # Profit target hit in update message (no explicit ravish keyword)
-                closed = acct.close_trade(symbol, exit_price, pnl_pct, "profit_target", date_str)
-                if closed and verbose:
-                    trade = acct.closed_trades[-1]
-                    ep = trade.get("exit", 0) or 0
-                    print(f"{date_str}  {source:6}  {'→PT':4} "
-                          f"{symbol:8} {'':18} {'':4}  {ep:7.2f}  "
-                          f"{trade['gross_pnl']:+9,.2f}  {acct.cash:12,.2f}  "
-                          f"PT ({pnl_pct:.0f}%)")
+                continue
+            if acct.close_trade(symbol, exit_price, pnl_pct, reason, date_str, source="signal"):
+                ravish_exits += 1
+                trade = acct.closed_trades[-1]
+                _log(date_str, "update", "EXIT", symbol, "", 1,
+                     trade.get("exit", 0) or 0, trade["gross_pnl"],
+                     f"CLOSED ({trade['pnl_pct']:+.1f}%)")
+            continue
 
     # ── Settle positions that never got an explicit close ─────────────────
     print("\nSettling open positions (expiry / DTE-stop / yfinance)...")
