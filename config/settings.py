@@ -283,6 +283,21 @@ class Settings(BaseSettings):
     WATCHER_SESSION_INTERVAL: int = 5  # minutes
     WATCHER_POWER_HOUR_INTERVAL: int = 1  # minutes
 
+    # ── Per-component broker / account config ─────────────────
+    # Each component declares which paper account and (for live Schwab) which
+    # real account number it uses.  Two components sharing the same name share
+    # the same PaperAccount object (same JSON file, same state).
+    #
+    # Paper account IDs (any alphanumeric string):
+    TRADING_ENGINE_PAPER_ACCOUNT: str = "paper_main"      # live market watcher + signal engine
+    DISCORD_PAPER_ACCOUNT: str = "paper_discord"          # discord signal listener
+    SCANNER_PAPER_ACCOUNT: str = "paper_scanner"          # multi-bagger scanner
+    # Real Schwab account numbers (leave blank to use SCHWAB_ACCOUNT_NUMBER):
+    TRADING_ENGINE_SCHWAB_ACCOUNT: str = ""   # default → SCHWAB_ACCOUNT_NUMBER
+    DISCORD_SCHWAB_ACCOUNT: str = ""          # default → SCHWAB_ACCOUNT_NUMBER
+    # Multiple real Schwab account numbers (comma-separated, for future use):
+    SCHWAB_ACCOUNT_NUMBERS: list[str] = Field(default_factory=list)
+
     # ── Paper trading ──────────────────────────────────────────
     PAPER_ACCOUNTS: list[str] = Field(default_factory=lambda: ["paper_main"])
     PAPER_FILL_METHOD: str = "next_open"  # next_open | vwap | worst_case

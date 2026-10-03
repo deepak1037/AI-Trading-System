@@ -107,13 +107,15 @@ class SchwabBroker(BaseBroker):
     5. No print() anywhere — structured logger only.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, account_number: Optional[str] = None) -> None:
+        # Use explicit account_number if provided; fall back to settings.
+        self._account_number: str = str(account_number or settings.SCHWAB_ACCOUNT_NUMBER)
         self._schwab = _import_schwab()
         self._client = self._authenticate()
         self._account_hash: str = self._resolve_account_hash()
         logger.info(
             "SchwabBroker ready | account=...%s",
-            str(settings.SCHWAB_ACCOUNT_NUMBER)[-4:],
+            self._account_number[-4:] if len(self._account_number) >= 4 else self._account_number,
         )
 
     # ── Authentication ────────────────────────────────────────────────────────
@@ -174,15 +176,15 @@ class SchwabBroker(BaseBroker):
             ) from exc
 
         for acct in accounts:
-            if acct["accountNumber"] == str(settings.SCHWAB_ACCOUNT_NUMBER):
+            if acct["accountNumber"] == self._account_number:
                 logger.debug(
                     "Account hash resolved for ...%s",
-                    str(settings.SCHWAB_ACCOUNT_NUMBER)[-4:],
+                    self._account_number[-4:] if len(self._account_number) >= 4 else self._account_number,
                 )
                 return acct["hashValue"]
 
         raise BrokerError(
-            f"Account {settings.SCHWAB_ACCOUNT_NUMBER} not found in Schwab accounts. "
+            f"Account {self._account_number} not found in Schwab accounts. "
             f"Available accounts: {[a['accountNumber'] for a in accounts]}",
             severity="CRITICAL",
         )
@@ -201,7 +203,7 @@ class SchwabBroker(BaseBroker):
             resp.raise_for_status()
             bal = resp.json().get("securitiesAccount", {}).get("currentBalances", {})
             return Account(
-                account_id      = str(settings.SCHWAB_ACCOUNT_NUMBER),
+                account_id      = self._account_number,
                 cash            = float(bal.get("cashBalance", 0.0)),
                 equity          = float(bal.get("liquidationValue", 0.0)),
                 buying_power    = float(bal.get("buyingPower", 0.0)),
@@ -446,7 +448,7 @@ class SchwabBroker(BaseBroker):
                     limit_price   = o.get("price"),
                     stop_price    = o.get("stopPrice"),
                     strategy_name = "unknown",
-                    account_id    = str(settings.SCHWAB_ACCOUNT_NUMBER),
+                    account_id    = self._account_number,
                 ))
             return orders
         except BrokerError:
