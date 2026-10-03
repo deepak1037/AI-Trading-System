@@ -71,6 +71,31 @@ _MSP_STRATS   = {"short_put", "short_put_leaps", "cash_secured_put", "msp"}
 # ─────────────────────────────────────────────────────────────────────────────
 _price_cache: dict[tuple, Optional[float]] = {}
 
+def _estimate_put_margin(strike: float, underlying: Optional[float],
+                         premium: float, contracts: int) -> float:
+    """Reg-T naked-put initial margin — the capital a short put ties up.
+
+    Mirrors llm_roi_analyzer.LLMROIAnalyzer._margin_per_contract (reg_t basis):
+        (max(0.20·underlying − OTM, 0.10·strike) + premium) × 100 × contracts
+
+    This is the OFFLINE estimate used when we can't ask Schwab's API for the
+    real buying-power reduction.  For an NVDA $200 put it lands ~$3–4k, matching
+    the real API figure — not the $250 premium.
+
+    When the underlying price is unknown (yfinance unavailable), the 0.10·strike
+    floor still gives a sane notional-based estimate.
+    """
+    if not strike or strike <= 0:
+        # No strike parsed — can't estimate notional; fall back to premium only.
+        return premium * _OPTIONS_MULT * contracts
+    if underlying and underlying > 0:
+        otm = max(underlying - strike, 0.0)          # put is OTM when U > K
+        req = max(0.20 * underlying - otm, 0.10 * strike)
+    else:
+        req = 0.20 * strike                          # notional-based fallback
+    return (req + premium) * _OPTIONS_MULT * contracts
+
+
 def _get_close_price(ticker: str, on_date: date) -> Optional[float]:
     """Return the adjusted close of `ticker` on `on_date` (or nearest prior day)."""
     key = (ticker, on_date)
@@ -236,10 +261,25 @@ class BacktestAccount:
             self.skipped.append({"sig": sig, "reason": "no_price", "date": received_at})
             return False
 
-        base_cost = entry * contracts * _OPTIONS_MULT
-        is_msp    = self._is_msp(action, opt_type, strategy)
-        cost      = base_cost * self.msp_mult if is_msp else base_cost
-        method    = f"MSP×{self.msp_mult:.1f}" if is_msp else "BTO"
+        is_msp = self._is_msp(action, opt_type, strategy)
+        strike = sig.strike
+
+        if is_msp:
+            # Capital tied up = Reg-T margin (buying-power reduction), NOT premium.
+            # A short NVDA $200 put ties up ~$3-4k margin, not the $250 premium.
+            underlying = None
+            try:
+                underlying = _get_close_price(sig.symbol.upper(),
+                                              date.fromisoformat(received_at[:10]))
+            except Exception:
+                underlying = None
+            margin = _estimate_put_margin(strike or 0.0, underlying, entry, contracts)
+            cost   = margin * self.msp_mult
+            method = f"MSP×{self.msp_mult:.1f} (margin≈${margin:,.0f})"
+        else:
+            # BTO: you pay the premium — that IS the capital out.
+            cost   = entry * contracts * _OPTIONS_MULT
+            method = "BTO"
 
         if self.cash < cost:
             self.skipped.append({
@@ -502,13 +542,15 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
                 parsed_entries += 1
                 opened = acct.open_trade(sig, date_str)
                 if verbose:
-                    entry  = sig.paper_entry or sig.limit_price or 0
-                    is_msp = acct._is_msp(sig.action or "", sig.option_type or "C",
-                                          sig.strategy_type or "")
-                    cost   = entry * (sig.contracts or 1) * _OPTIONS_MULT
-                    if is_msp:
-                        cost *= msp_multiplier
-                    status = "OPEN" if opened else "SKIP"
+                    entry = sig.paper_entry or sig.limit_price or 0
+                    if opened:
+                        pos    = acct.open_positions[-1]
+                        cost   = pos["cost"]
+                        method = pos["method"]
+                        status = f"OPEN  {method}"
+                    else:
+                        cost   = 0.0
+                        status = "SKIP"
                     print(f"{date_str}  {source:6}  {sig.action or '?':4} "
                           f"{sig.symbol or '?':8} {sig.strategy_type or '?':18} "
                           f"{sig.contracts or 1:4}  {entry:7.2f}  {cost:9,.2f}  "

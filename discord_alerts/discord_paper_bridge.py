@@ -136,18 +136,26 @@ class DiscordPaperBridge:
             )
 
             if is_msp:
-                # MSP: book 2× the Schwab margin requirement.
-                # Schwab gives estimated_cost = margin needed ($X).
-                # We debit $X × multiplier (default 2X) so the paper account
-                # stays conservative and keeps dry powder.
-                effective_cost = preview.estimated_cost * self._msp_multiplier
+                # MSP: capital tied up by a short put is the REAL buying-power /
+                # available-funds reduction Schwab projects — NOT the premium
+                # (orderValue, which the preview maps to estimated_cost).
+                #
+                # Mirror llm_roi_analyzer._broker_margin_per_contract:
+                #   margin = available_funds − projected_available_fund
+                # using AVAILABLE FUNDS (real cash basis), not buying power
+                # (buying power is leveraged ~4× and overstates margin).
+                #
+                # Then book margin × multiplier (default 2×) as the conservative
+                # buffer so the paper account keeps dry powder.
+                schwab_margin = self._msp_margin(preview)
+                effective_cost = schwab_margin * self._msp_multiplier
                 state = self._account.get_state()
                 if state.cash < effective_cost:
                     log.warning(
                         "DiscordPaperBridge: insufficient cash for MSP %s "
                         "(need $%.2f [%.0fx $%.2f margin], have $%.2f) — skipping",
                         symbol, effective_cost, self._msp_multiplier,
-                        preview.estimated_cost, state.cash,
+                        schwab_margin, state.cash,
                     )
                     return False
                 # Patch the preview so apply_preview() deducts the full 2X amount.
@@ -167,7 +175,7 @@ class DiscordPaperBridge:
                     "DiscordPaperBridge: OPEN MSP %s  contracts=%d  "
                     "schwab_margin=$%.2f  booked=%.0fx=$%.2f  status=%s",
                     symbol, contracts,
-                    preview.estimated_cost, self._msp_multiplier, effective_cost,
+                    schwab_margin, self._msp_multiplier, effective_cost,
                     result.status,
                 )
             else:
@@ -281,6 +289,39 @@ class DiscordPaperBridge:
         }
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _msp_margin(self, preview: OrderPreview) -> float:
+        """Real per-order margin (buying-power reduction) for a short put.
+
+        margin = available_funds − projected_available_fund
+
+        Mirrors llm_roi_analyzer._broker_margin_per_contract: we use AVAILABLE
+        FUNDS (real cash basis), not buying power (leveraged ~4×, would
+        overstate margin several-fold).  Falls back to estimated_cost (the
+        premium notional) if the broker/account data isn't usable.
+        """
+        try:
+            account    = self._broker.get_account()
+            current_af = float(getattr(account, "available_funds", 0.0) or 0.0)
+        except Exception as exc:  # noqa: BLE001 — degrade to premium notional
+            log.warning("DiscordPaperBridge: get_account failed for MSP margin: %s", exc)
+            current_af = 0.0
+
+        projected_af = float(preview.projected_available_fund or 0.0)
+        reduction    = current_af - projected_af
+
+        # Sanity: a single order can't tie up more than all available funds,
+        # and the reduction must be positive to be meaningful.
+        if current_af > 0 and 0 < reduction < current_af:
+            return reduction
+
+        # Fallback — premium notional (last resort; better than nothing).
+        log.warning(
+            "DiscordPaperBridge: implausible MSP margin (af=%.2f proj=%.2f) "
+            "— falling back to estimated_cost $%.2f",
+            current_af, projected_af, preview.estimated_cost,
+        )
+        return preview.estimated_cost
 
     def _schwab_preview(
         self,
