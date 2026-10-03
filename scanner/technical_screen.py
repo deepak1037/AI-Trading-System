@@ -174,13 +174,11 @@ class TechnicalScreen:
             try:
                 stage2 = self._is_stage2(df)
                 rs = _rs_rank(returns[ticker])
-                if stage2 and rs >= _MIN_RS_RANK:
-                    in_base = self._is_in_base(df)
-                    # Timeframe alignment: a Stage 2 uptrend (price > 50/150/200
-                    # MA, stacked and rising) with top-band RS means the short,
-                    # mid and long trends agree — that IS multi-timeframe
-                    # alignment, so survivors earn the tf bonus.
-                    tf_alignment = bool(stage2 and rs >= _MIN_RS_RANK)
+                in_base = self._is_in_base(df)
+                if stage2 and in_base and rs >= _MIN_RS_RANK:
+                    # Timeframe alignment: Stage 2 uptrend + in base + high RS
+                    # means all timeframes agree AND stock is at a buyable setup.
+                    tf_alignment = bool(stage2 and in_base and rs >= _MIN_RS_RANK)
                     passing.append({
                         "ticker": ticker,
                         "is_stage2": stage2,
