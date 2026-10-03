@@ -1,0 +1,82 @@
+position_sizing:
+  total_capital: 100000
+  max_deployed_pct: 0.60
+  margin_buffer_pct: 0.25
+  opportunity_reserve_pct: 0.15
+  max_concurrent_positions: 8
+
+rules:
+  spx_calendar:
+    match:
+      action: BTO
+      symbol: SPX
+      strategy_type: call_calendar
+    profit_target_pct: 75
+    dte_stop: 2
+    max_notional: 5000
+    auto_close_at_dte: true
+    auto_close_at_pt: false
+    auto_close_ravish: true
+
+  short_put_leaps:
+    match:
+      action: STO
+      min_dte_at_entry: 60
+    profit_target_pct: 75
+    dte_stop: 30
+    max_notional: 25000
+    auto_close_at_dte: true
+    auto_close_at_pt: false
+    auto_close_ravish: true
+
+  short_put_stable:
+    match:
+      action: STO
+      symbols: [NVDA, AMAT, AVGO, VRT, TSM, AAPL, PLTR, META, MRVL, MCD, MU]
+    profit_target_pct: 60
+    dte_stop: 14
+    max_notional: 12000
+    auto_close_at_dte: true
+    auto_close_at_pt: false
+    auto_close_ravish: true
+
+  short_put_volatile:
+    match:
+      action: STO
+      symbols: [TQQQ, UPRO, CRWV, DRAM, SOFI]
+    profit_target_pct: 50
+    dte_stop: 7
+    max_notional: 8000
+    auto_close_at_dte: true
+    auto_close_at_pt: false
+    auto_close_ravish: true
+
+  short_put_qqq:
+    match:
+      action: STO
+      symbols: [QQQ]
+    profit_target_pct: 60
+    dte_stop: 14
+    max_notional: 10000
+    auto_close_at_dte: true
+    auto_close_at_pt: false
+    auto_close_ravish: true
+
+  spread:
+    match:
+      strategy_type: [call_spread, put_spread]
+    profit_target_pct: 60
+    dte_stop: 5
+    max_notional: 5000
+    auto_close_at_dte: true
+    auto_close_at_pt: false
+    auto_close_ravish: true
+
+  default:
+    match: {}
+    profit_target_pct: 50
+    dte_stop: 14
+    max_notional: 5000
+    auto_close_at_dte: false
+    auto_close_at_pt: false
+    auto_close_ravish: true

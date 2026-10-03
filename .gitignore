@@ -24,7 +24,13 @@ coverage.xml
 
 # ── Runtime data (gitignored per CLAUDE.md Section 4) ──────
 logs/*.log
+logs/*.log.*
 db/*.db
+db/*.db-shm
+db/*.db-wal
+*.db
+*.db-shm
+*.db-wal
 paper_trading/accounts/*.json
 paper_trading/trades/*.csv
 paper_trading/backups/*.json
