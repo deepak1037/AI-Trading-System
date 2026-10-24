@@ -50,6 +50,7 @@ if _root not in sys.path:
 
 from discord_alerts.discord_signal_reader import AlertParser, ParsedSignal
 from discord_alerts.discord_exit_parser import ExitParser
+from discord_alerts.capital_manager import pick_rotations
 
 # Ravish exit keywords — kept in sync with discord_exit_rules.RAVISH_EXIT_KEYWORDS.
 # Inlined so the backtest doesn't pull in the bridge/settings import chain.
@@ -135,6 +136,15 @@ def _load_rules(rules_path: str) -> dict:
     with open(rules_path) as f:
         data = yaml.safe_load(f)
     return data.get("rules", {})
+
+def _dte_between(start_str, expiry_str):
+    """Days from start date to expiry; None if either is missing/unparseable."""
+    if not start_str or not expiry_str:
+        return None
+    try:
+        return (date.fromisoformat(expiry_str[:10]) - date.fromisoformat(start_str[:10])).days
+    except (ValueError, TypeError):
+        return None
 
 def _match_rule(rules: dict, action: str, symbol: str, strategy_type: str,
                 dte_at_entry: Optional[int]) -> dict:
@@ -450,6 +460,7 @@ class BacktestAccount:
         self.open_positions: list[dict] = []
         self.closed_trades:  list[dict] = []
         self.skipped:        list[dict] = []
+        self.rotations       = 0
 
     def _is_msp(self, action: str, option_type: str, strategy: str) -> bool:
         return (
@@ -457,6 +468,25 @@ class BacktestAccount:
             and option_type.upper().startswith("P")
             and strategy.lower() in _MSP_STRATS
         )
+
+    def _cost_for(self, sig, received_at: str):
+        """Return (cost, method, is_msp) for a signal — the capital it ties up."""
+        entry     = sig.paper_entry or sig.limit_price
+        contracts = sig.contracts or 1
+        action    = (sig.action or "BTO").upper()
+        opt_type  = (sig.option_type or "C")
+        strategy  = (sig.strategy_type or "unknown")
+        is_msp    = self._is_msp(action, opt_type, strategy)
+        if is_msp:
+            underlying = None
+            try:
+                underlying = _get_close_price(sig.symbol.upper(),
+                                              date.fromisoformat(received_at[:10]))
+            except Exception:
+                underlying = None
+            margin = _estimate_put_margin(sig.strike or 0.0, underlying, entry, contracts)
+            return margin * self.msp_mult, f"MSP×{self.msp_mult:.1f} (margin≈${margin:,.0f})", True
+        return entry * contracts * _OPTIONS_MULT, "BTO", False
 
     def open_trade(self, sig, received_at: str,
                    source: str = "signal", thread_id: Optional[str] = None):
@@ -471,25 +501,8 @@ class BacktestAccount:
             self.skipped.append({"sig": sig, "reason": "no_price", "date": received_at})
             return None
 
-        is_msp = self._is_msp(action, opt_type, strategy)
         strike = sig.strike
-
-        if is_msp:
-            # Capital tied up = Reg-T margin (buying-power reduction), NOT premium.
-            # A short NVDA $200 put ties up ~$3-4k margin, not the $250 premium.
-            underlying = None
-            try:
-                underlying = _get_close_price(sig.symbol.upper(),
-                                              date.fromisoformat(received_at[:10]))
-            except Exception:
-                underlying = None
-            margin = _estimate_put_margin(strike or 0.0, underlying, entry, contracts)
-            cost   = margin * self.msp_mult
-            method = f"MSP×{self.msp_mult:.1f} (margin≈${margin:,.0f})"
-        else:
-            # BTO: you pay the premium — that IS the capital out.
-            cost   = entry * contracts * _OPTIONS_MULT
-            method = "BTO"
+        cost, method, is_msp = self._cost_for(sig, received_at)
 
         if self.cash < cost:
             self.skipped.append({
@@ -519,6 +532,38 @@ class BacktestAccount:
         }
         self.open_positions.append(pos)
         return pos
+
+    def try_open(self, sig, received_at, source, thread_id, rules, rotate_threshold):
+        """Open a trade; if cash-short and rotation is enabled, close aged winners
+        (via capital_manager.pick_rotations) to fund it, then open."""
+        entry = sig.paper_entry or sig.limit_price
+        if entry and rotate_threshold is not None:
+            cost, _, _ = self._cost_for(sig, received_at)
+            if self.cash < cost:
+                contracts = sig.contracts or 1
+                npt = _match_rule(rules, (sig.action or "").upper(),
+                                  (sig.symbol or "").upper(), sig.strategy_type or "",
+                                  _dte_between(received_at, sig.expiry_short)
+                                  ).get("profit_target_pct", 50)
+                new_expected = entry * (npt / 100.0) * _OPTIONS_MULT * contracts
+                cands = []
+                for p in self.open_positions:
+                    mark = p.get("last_mark")
+                    if mark is None or mark[0] is None:
+                        continue
+                    prule = _match_rule(rules, p["action"], p["symbol"], p["strategy"],
+                                        _dte_between(p["open_date"], p.get("expiry")))
+                    ppt = prule.get("profit_target_pct", 50)
+                    remaining = p["entry"] * max(ppt - mark[0], 0) / 100.0 * _OPTIONS_MULT * p["contracts"]
+                    cands.append({"id": id(p), "mark_pct": mark[0], "capital": p["cost"],
+                                  "remaining_pnl": remaining, "_p": p})
+                chosen = set(pick_rotations(cost, self.cash, new_expected, cands, rotate_threshold))
+                for c in cands:
+                    if c["id"] in chosen:
+                        p = c["_p"]; m = p["last_mark"]
+                        self.close_position(p, m[1], m[0], "rotation", received_at)
+                        self.rotations += 1
+        return self.open_trade(sig, received_at, source, thread_id)
 
     def close_position(self, pos: dict, exit_price: Optional[float],
                        pnl_pct: Optional[float], reason: str, close_date: str) -> bool:
@@ -615,8 +660,22 @@ def _settle_open_positions(acct: BacktestAccount, rules: dict, today: date,
         entry    = pos["entry"]
         open_dt  = pos.get("open_date", "")
 
+        # ── CASE 0: rule-driven — never hit PT/SL but we have observations ──
+        # The trade ran to its last reported mark (updates stop near DTE/expiry),
+        # so close there. Far more honest than assuming expired-worthless.
+        mark = pos.get("last_mark")
+        if mark is not None:
+            m_pnl, m_px = mark
+            cd = (expiry_s or today.isoformat())[:10]
+            if acct.close_position(pos, m_px, m_pnl, "ride_to_last", cd) and verbose:
+                tr = acct.closed_trades[-1]
+                print(f"{cd}  {'LAST':6}  {'':4} {symbol:8} {'':18} {'':4}  "
+                      f"{tr.get('exit',0) or 0:7.2f}  {tr['gross_pnl']:+9,.2f}  "
+                      f"{acct.cash:12,.2f}  ride_to_last ({tr['pnl_pct']:+.1f}%)")
+            continue
+
         if not expiry_s:
-            # No expiry info — leave as open
+            # No expiry, no marks — leave as open
             continue
 
         try:
@@ -810,7 +869,8 @@ def fetch_raw_messages(token, signal_channel_id, update_channel_id,
 
 def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
                  from_date, starting_balance, msp_multiplier, verbose,
-                 csv_path=None, dump_raw=None, replay=None) -> None:
+                 csv_path=None, dump_raw=None, replay=None,
+                 rotate_threshold=None) -> None:
     after_dt = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
     today    = date.today()
 
@@ -908,33 +968,42 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
                 pass
         return pnl_pct, exit_price
 
-    # Explicit "this trade is closed" markers. Unlike a bare "at 12%" progress
-    # update, these announce a close — so we honour ANY profit level (calendars
-    # & diagonals routinely close at 30-40%, below the 50% fallback gate).
-    CLOSE_MARKERS = list(RAVISH_EXIT_KEYWORDS) + [
-        "profit hit", "pt hit", "profit target", "🎯", "target hit",
-        "assigned", "rolled", "roll out",
-        "stop loss", "stoploss", "stop-loss", "exited", "i exited",
-    ]
+    def _rule_for(pos):
+        """Matched exit_rules.yaml rule for an open position."""
+        dte_at_entry = None
+        if pos.get("expiry") and pos.get("open_date"):
+            try:
+                dte_at_entry = (date.fromisoformat(pos["expiry"][:10])
+                                - date.fromisoformat(pos["open_date"][:10])).days
+            except (ValueError, TypeError):
+                dte_at_entry = None
+        return _match_rule(rules, pos.get("action", ""), pos.get("symbol", ""),
+                           pos.get("strategy", ""), dte_at_entry)
 
-    def _detect_exit(content):
-        """Return (reason, exit_price, pnl_pct) if this msg is an exit, else None."""
-        lower     = content.lower()
-        marker    = next((k for k in CLOSE_MARKERS if k in lower), None)
-        # Prefer ExitParser's values; fall back to symbol-free extraction.
-        exit_sig  = exit_parser.parse(content)
-        pnl_pct   = getattr(exit_sig, "pnl_pct",   None) if exit_sig else None
-        exit_price = getattr(exit_sig, "exit_price", None) if exit_sig else None
+    def _rule_exit(pos, content):
+        """RULE-DRIVEN exit: apply the matched rule's PT / stop-loss to this
+        message's reported P&L. Returns (reason, exit_price, pnl_pct, mark) where
+        `mark` is the observation to remember even when no rule fires, or None if
+        the message carries no P&L observation at all.
+
+        Ravish's close markers are NOT treated as forced closes — exits are ours,
+        his posts are only P&L observations (per the copy model). A trade that
+        never hits PT/SL rides to its last observed mark at settlement.
+        """
+        pnl_pct, exit_price = _extract_pnl_price(content)
         if pnl_pct is None and exit_price is None:
-            pnl_pct, exit_price = _extract_pnl_price(content)
-        # An explicit close marker closes at whatever profit level is stated.
-        if marker:
-            return marker, exit_price, pnl_pct
-        # No marker: only treat a high bare profit % as a (scale-out) close,
-        # so interim "at 12%" progress posts don't close the trade early.
-        if pnl_pct is not None and pnl_pct >= 50:
-            return "profit_target", exit_price, pnl_pct
-        return None
+            return None
+        mark = (pnl_pct, exit_price)
+        rule = _rule_for(pos)
+        sl = rule.get("stop_loss_pct")
+        if (pnl_pct is not None and sl is not None
+                and pnl_pct <= -abs(sl) and rule.get("auto_close_at_stop", True)):
+            return "stop_loss", exit_price, pnl_pct, mark
+        pt = rule.get("profit_target_pct")
+        if (pnl_pct is not None and pt is not None
+                and pnl_pct >= pt and rule.get("auto_close_at_pt", False)):
+            return "profit_target", exit_price, pnl_pct, mark
+        return None, exit_price, pnl_pct, mark
 
     for msg in all_msgs:
         source  = msg["_source"]
@@ -969,7 +1038,7 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
 
                 if tsig and tsig.is_tradeable:
                     parsed_entries += 1
-                    pos = acct.open_trade(tsig, date_str, source="forum", thread_id=tid)
+                    pos = acct.try_open(tsig, date_str, "forum", tid, rules, rotate_threshold)
                     thread_pos[tid] = pos
                     if pos:
                         _log(date_str, "forum", tsig.action or "?", tsig.symbol or "?",
@@ -986,16 +1055,19 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
             pos = thread_pos.get(tid)
             if pos is None:
                 continue
-            ev = _detect_exit(content)
-            if ev:
-                reason, exit_price, pnl_pct = ev
-                if acct.close_position(pos, exit_price, pnl_pct, reason, date_str):
-                    ravish_exits += 1
-                    thread_pos[tid] = None
-                    trade = acct.closed_trades[-1]
-                    _log(date_str, "forum", "EXIT", pos["symbol"], "", 1,
-                         trade.get("exit", 0) or 0, trade["gross_pnl"],
-                         f"CLOSED ({trade['pnl_pct']:+.1f}%)")
+            ev = _rule_exit(pos, content)
+            if ev is None:
+                continue
+            reason, exit_price, pnl_pct, mark = ev
+            if mark is not None:
+                pos["last_mark"] = mark   # remember latest observation for settlement
+            if reason and acct.close_position(pos, exit_price, pnl_pct, reason, date_str):
+                ravish_exits += 1
+                thread_pos[tid] = None
+                trade = acct.closed_trades[-1]
+                _log(date_str, "forum", "EXIT", pos["symbol"], "", 1,
+                     trade.get("exit", 0) or 0, trade["gross_pnl"],
+                     f"CLOSE {reason} ({trade['pnl_pct']:+.1f}%)")
             continue
 
         # ══ SIGNAL CHANNEL ═══════════════════════════════════════════════
@@ -1004,7 +1076,7 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
                                channel_id=channel_id, author=author)
             if sig and sig.is_tradeable:
                 parsed_entries += 1
-                pos = acct.open_trade(sig, date_str, source="signal")
+                pos = acct.try_open(sig, date_str, "signal", None, rules, rotate_threshold)
                 if pos:
                     _log(date_str, "signal", sig.action or "?", sig.symbol or "?",
                          sig.strategy_type or "?", sig.contracts or 1,
@@ -1017,22 +1089,29 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
             continue
 
         # ══ UPDATE CHANNEL ═══════════════════════════════════════════════
-        # Closes SIGNAL-channel trades only (forum trades close in-thread).
+        # P&L updates for SIGNAL-channel trades (forum trades update in-thread).
         if source == "update":
-            ev = _detect_exit(content)
-            if not ev:
-                continue
-            reason, exit_price, pnl_pct = ev
             exit_sig = exit_parser.parse(content)
             symbol   = getattr(exit_sig, "symbol", None) if exit_sig else None
             if not symbol:
                 continue
-            if acct.close_trade(symbol, exit_price, pnl_pct, reason, date_str, source="signal"):
+            symbol = symbol.upper()
+            pos = next((p for p in reversed(acct.open_positions)
+                        if p["symbol"] == symbol and p.get("source") == "signal"), None)
+            if pos is None:
+                continue
+            ev = _rule_exit(pos, content)
+            if ev is None:
+                continue
+            reason, exit_price, pnl_pct, mark = ev
+            if mark is not None:
+                pos["last_mark"] = mark
+            if reason and acct.close_position(pos, exit_price, pnl_pct, reason, date_str):
                 ravish_exits += 1
                 trade = acct.closed_trades[-1]
                 _log(date_str, "update", "EXIT", symbol, "", 1,
                      trade.get("exit", 0) or 0, trade["gross_pnl"],
-                     f"CLOSED ({trade['pnl_pct']:+.1f}%)")
+                     f"CLOSE {reason} ({trade['pnl_pct']:+.1f}%)")
             continue
 
     # ── Settle positions that never got an explicit close ─────────────────
@@ -1081,6 +1160,7 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
     print(f"  Still open          :  {len(acct.open_positions)}  "
           f"(cost tied up: ${acct.open_cost:,.2f})")
     print(f"  Skipped             :  {len(acct.skipped)}")
+    print(f"  Rotations           :  {acct.rotations}")
     print()
     print(f"  Starting balance    :  ${starting_balance:>12,.2f}")
     print(f"  Realised P&L        :  ${total_pnl:>+12,.2f}")

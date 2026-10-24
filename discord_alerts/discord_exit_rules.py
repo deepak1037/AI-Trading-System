@@ -175,6 +175,21 @@ class ExitRuleEngine:
                 await self.notifier.alert_ravish_exit(symbol, pnl_pct, trade_id, ravish_trigger)
             return closed
 
+        # Stop-loss (protective) — fires before DTE/PT. stop_loss_pct is a positive
+        # number; a loss of that magnitude (pnl_pct <= -stop_loss_pct) triggers it.
+        stop_loss_pct = rule.get("stop_loss_pct")
+        if (pnl_pct is not None and stop_loss_pct is not None
+                and pnl_pct <= -abs(stop_loss_pct)):
+            auto = rule.get("auto_close_at_stop", True)
+            log.info("Stop-loss: %s %s pnl=%.1f%% <= -%.0f%% (auto=%s)",
+                     action, symbol, pnl_pct, abs(stop_loss_pct), auto)
+            if self.notifier and hasattr(self.notifier, "alert_stop_loss"):
+                await self.notifier.alert_stop_loss(
+                    symbol, action, pnl_pct, stop_loss_pct, trade_id, auto)
+            if auto:
+                return self._close_trade(trade_id, exit_price, pnl_pct, "stop_loss")
+            return False
+
         dte_stop = rule.get("dte_stop")
         if dte is not None and dte_stop is not None and dte <= dte_stop:
             auto = rule.get("auto_close_at_dte", True)
@@ -194,6 +209,19 @@ class ExitRuleEngine:
             if auto:
                 return self._close_trade(trade_id, exit_price, pnl_pct, "profit_target")
             return False
+
+        # Persist the latest mark on open trades so the capital-rotation manager
+        # can rank candidates by current profit without a price feed.
+        if pnl_pct is not None:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute(
+                        "UPDATE discord_signals SET paper_pnl_pct=? "
+                        "WHERE id=? AND paper_status='open'",
+                        (round(pnl_pct, 2), trade_id),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("mark persist failed for #%d: %s", trade_id, exc)
 
         log.info("Holding %s %s  pnl=%s%%  DTE=%s  rule=%s",
                  action, symbol,
