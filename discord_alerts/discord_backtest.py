@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -781,9 +782,32 @@ def _msg_dt(msg: dict) -> datetime:
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def fetch_raw_messages(token, signal_channel_id, update_channel_id,
+                       forum_channel_id, after_dt) -> list[dict]:
+    """Fetch + tag + merge all channel/forum messages (the network-bound step)."""
+    print("\nFetching signal channel messages...")
+    signal_msgs = _fetch_channel_messages(token, signal_channel_id, after_dt)
+    print(f"  → {len(signal_msgs)} messages")
+
+    print("Fetching update channel messages...")
+    update_msgs = _fetch_channel_messages(token, update_channel_id, after_dt)
+    print(f"  → {len(update_msgs)} messages")
+
+    print("Fetching forum thread messages...")
+    forum_msgs = _fetch_forum_threads(token, forum_channel_id, after_dt)
+    print(f"  → {len(forum_msgs)} messages")
+
+    for m in signal_msgs:  m["_source"] = "signal"
+    for m in update_msgs:  m["_source"] = "update"
+    for m in forum_msgs:   m["_source"] = "forum"
+    all_msgs = signal_msgs + update_msgs + forum_msgs
+    all_msgs.sort(key=_msg_dt)
+    return all_msgs
+
+
 def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
                  from_date, starting_balance, msp_multiplier, verbose,
-                 csv_path=None) -> None:
+                 csv_path=None, dump_raw=None, replay=None) -> None:
     after_dt = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
     today    = date.today()
 
@@ -798,26 +822,26 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
     print(f"  Today:     {today}")
     print(f"{'='*72}")
 
-    # ── Fetch messages ────────────────────────────────────────────────────
-    print("\nFetching signal channel messages...")
-    signal_msgs = _fetch_channel_messages(token, signal_channel_id, after_dt)
-    print(f"  → {len(signal_msgs)} messages")
-
-    print("Fetching update channel messages...")
-    update_msgs = _fetch_channel_messages(token, update_channel_id, after_dt)
-    print(f"  → {len(update_msgs)} messages")
-
-    print("Fetching forum thread messages...")
-    forum_msgs = _fetch_forum_threads(token, forum_channel_id, after_dt)
-    print(f"  → {len(forum_msgs)} messages")
-
-    all_msgs = []
-    for m in signal_msgs:  m["_source"] = "signal"
-    for m in update_msgs:  m["_source"] = "update"
-    for m in forum_msgs:   m["_source"] = "forum"
-    all_msgs = signal_msgs + update_msgs + forum_msgs
-    all_msgs.sort(key=_msg_dt)
-    print(f"\nTotal messages: {len(all_msgs)}\n")
+    # ── Messages: replay from a saved dump, or fetch live from Discord ─────
+    if replay:
+        with open(replay) as f:
+            all_msgs = json.load(f)
+        # Keep only messages at/after the start date (dump may be wider).
+        cutoff = int(_snowflake_after(after_dt))
+        all_msgs = [m for m in all_msgs if int(m["id"]) >= cutoff]
+        all_msgs.sort(key=_msg_dt)
+        print(f"\nReplaying {len(all_msgs)} messages from {replay}\n")
+    else:
+        all_msgs = fetch_raw_messages(token, signal_channel_id, update_channel_id,
+                                      forum_channel_id, after_dt)
+        if dump_raw:
+            os.makedirs(os.path.dirname(os.path.abspath(dump_raw)), exist_ok=True)
+            with open(dump_raw, "w") as f:
+                json.dump(all_msgs, f)
+            print(f"\n  Dumped {len(all_msgs)} raw messages → {dump_raw}")
+            print(f"  (upload this file to replay the backtest offline, "
+                  f"no Discord token needed)")
+        print(f"\nTotal messages: {len(all_msgs)}\n")
 
     parser      = AlertParser()
     exit_parser = ExitParser()
@@ -844,13 +868,41 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
             print(f"{date_str}  {src:6}  {act:4} {sym:8} {strat:18} "
                   f"{ctrs:4}  {price:7.2f}  {cost:9,.2f}  {acct.cash:12,.2f}  {status}")
 
+    import re as _re
+
+    def _extract_pnl_price(content):
+        """Pull (pnl_pct, exit_price) straight from the text, no symbol needed.
+
+        ExitParser requires a ticker and returns None without one — but inside a
+        forum thread the symbol is already known, so we extract numbers directly.
+        """
+        pnl_pct = exit_price = None
+        # ROI / profit percentage: "ROI 74%", "74% profit", "+74%", "74% ROI".
+        m = (_re.search(r'roi[\s:]*\+?(\d+(?:\.\d+)?)\s*%', content, _re.I)
+             or _re.search(r'\+?(\d+(?:\.\d+)?)\s*%\s*(?:profit|roi|gain)', content, _re.I)
+             or _re.search(r'(?:profit|roi|gain)[\s:]*\+?(\d+(?:\.\d+)?)\s*%', content, _re.I))
+        if m:
+            pnl_pct = float(m.group(1))
+        # Closing price: "credit to close 0.15", "close @ 1.20", "closed at 2.5".
+        m = (_re.search(r'credit\s+to\s+close\s*\n?\s*([\d.]+)', content, _re.I)
+             or _re.search(r'clos(?:e|ed|ing)\s*(?:@|at)?\s*([\d.]+)', content, _re.I))
+        if m:
+            try:
+                exit_price = float(m.group(1))
+            except ValueError:
+                pass
+        return pnl_pct, exit_price
+
     def _detect_exit(content):
         """Return (reason, exit_price, pnl_pct) if this msg is an exit, else None."""
         lower     = content.lower()
         ravish_kw = next((k for k in RAVISH_EXIT_KEYWORDS if k in lower), None)
+        # Prefer ExitParser's values; fall back to symbol-free extraction.
         exit_sig  = exit_parser.parse(content)
         pnl_pct   = getattr(exit_sig, "pnl_pct",   None) if exit_sig else None
         exit_price = getattr(exit_sig, "exit_price", None) if exit_sig else None
+        if pnl_pct is None and exit_price is None:
+            pnl_pct, exit_price = _extract_pnl_price(content)
         if ravish_kw:
             return ravish_kw, exit_price, pnl_pct
         if pnl_pct is not None and pnl_pct >= 50:
@@ -1055,23 +1107,30 @@ def main() -> None:
                    help="Write per-trade CSV to this path "
                         "(default: paper_trading/trades/discord_backtest_<from>.csv; "
                         "pass 'none' to skip)")
+    p.add_argument("--dump-raw",   dest="dump_raw", default=None,
+                   help="Fetch from Discord, then save all raw messages to this "
+                        "JSON path (upload it to replay offline, no token needed)")
+    p.add_argument("--replay",     dest="replay", default=None,
+                   help="Replay from a --dump-raw JSON instead of hitting Discord "
+                        "(no token / network needed)")
     args = p.parse_args()
 
-    # Load token from .env if not in environment
-    token = os.getenv("DISCORD_USER_TOKEN")
-    if not token:
-        env_file = os.path.join(_root, ".env")
-        if os.path.exists(env_file):
-            with open(env_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("DISCORD_USER_TOKEN="):
-                        token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        break
-
-    if not token:
-        print("ERROR: DISCORD_USER_TOKEN not set in .env")
-        sys.exit(1)
+    # A token is only needed for a live fetch, not for --replay.
+    token = None
+    if not args.replay:
+        token = os.getenv("DISCORD_USER_TOKEN")
+        if not token:
+            env_file = os.path.join(_root, ".env")
+            if os.path.exists(env_file):
+                with open(env_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("DISCORD_USER_TOKEN="):
+                            token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+        if not token:
+            print("ERROR: DISCORD_USER_TOKEN not set in .env")
+            sys.exit(1)
 
     signal_channel_id = int(os.getenv("DISCORD_SIGNAL_CHANNEL_ID", "1418852039382925353"))
     update_channel_id = int(os.getenv("DISCORD_UPDATE_CHANNEL_ID", "1466838176202231829"))
@@ -1096,6 +1155,8 @@ def main() -> None:
         msp_multiplier    = args.multiplier,
         verbose           = args.verbose,
         csv_path          = csv_path,
+        dump_raw          = args.dump_raw,
+        replay            = args.replay,
     )
 
 
