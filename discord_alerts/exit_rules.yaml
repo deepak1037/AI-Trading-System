@@ -1,8 +1,28 @@
+# exit_rules.yaml — rule-driven exits for Ravish copy-trading
+# ============================================================
+# Ravish only posts ENTRIES; the EXIT is ours. These rules decide when to
+# close, applied to the P&L he reports in each trade's thread (and the update
+# channel). profit_target_pct is on the position (premium for shorts / debit
+# for longs), consistent with his "X% profit" posts.
+#
+# Profit targets below were RECALIBRATED from a full replay of his Aug–Oct 2026
+# alerts (see claude/ravish-copy-trading-plan.md). Key finding: the old targets
+# for calendars/diagonals/LEAPS were set ABOVE where those strategies actually
+# trade (calendars top ~40%, diagonals ~30%), so the PT never fired and trades
+# drifted to expiry — sometimes giving gains back. Targets are set to where the
+# profit actually lives, deliberately NOT to the in-sample optimum (tiny per-
+# strategy samples; anti-overfit). auto_close_at_pt is now TRUE for income
+# strategies so OUR target drives the exit, per the copy model.
+#
+# NOTE: stop-loss and capital-rotation (close an aged winner to fund a better
+# new signal when buying power is short) are validated in the plan doc but need
+# engine support — they are NOT encoded here yet. See the plan's "next build".
+
 position_sizing:
   total_capital: 100000
   max_deployed_pct: 0.60
   margin_buffer_pct: 0.25
-  opportunity_reserve_pct: 0.15
+  opportunity_reserve_pct: 0.15   # dry powder for rotation into better setups
   max_concurrent_positions: 8
 
 rules:
@@ -11,65 +31,85 @@ rules:
       action: BTO
       symbol: SPX
       strategy_type: call_calendar
-    profit_target_pct: 75
+    profit_target_pct: 45          # was 75 — calendars top ~40-56%, 75 never hit
     dte_stop: 2
     max_notional: 5000
     auto_close_at_dte: true
-    auto_close_at_pt: false
+    auto_close_at_pt: true         # was false — our target now drives the exit
+    auto_close_ravish: true
+
+  double_calendar:                 # NEW — QQQ etc. double calendars (were hitting default PT50)
+    match:
+      strategy_type: [double_calendar, calendar]
+    profit_target_pct: 45          # in-sample tops ~27-56%
+    dte_stop: 3
+    max_notional: 5000
+    auto_close_at_dte: true
+    auto_close_at_pt: true
+    auto_close_ravish: true
+
+  double_diagonal:                 # NEW — QQQ double diagonals (were hitting default PT50)
+    match:
+      strategy_type: [double_diagonal, diagonal]
+    profit_target_pct: 30          # in-sample tops ~25-30%
+    dte_stop: 3
+    max_notional: 5000
+    auto_close_at_dte: true
+    auto_close_at_pt: true
     auto_close_ravish: true
 
   short_put_leaps:
     match:
       action: STO
       min_dte_at_entry: 60
-    profit_target_pct: 75
-    dte_stop: 30
+    profit_target_pct: 60          # was 75 — grinds up slowly; lower to lock gains
+    dte_stop: 30                   #   AND recycle the large capital a LEAPS ties up
     max_notional: 25000
     auto_close_at_dte: true
-    auto_close_at_pt: false
+    auto_close_at_pt: true
     auto_close_ravish: true
 
   short_put_stable:
     match:
       action: STO
       symbols: [NVDA, AMAT, AVGO, VRT, TSM, AAPL, PLTR, META, MRVL, MCD, MU]
-    profit_target_pct: 60
+    profit_target_pct: 70          # was 60 — they climb steadily to 70-100% in-sample
     dte_stop: 14
     max_notional: 12000
     auto_close_at_dte: true
-    auto_close_at_pt: false
+    auto_close_at_pt: true
     auto_close_ravish: true
 
   short_put_volatile:
     match:
       action: STO
-      symbols: [TQQQ, UPRO, CRWV, DRAM, SOFI]
-    profit_target_pct: 50
+      symbols: [TQQQ, UPRO, CRWV, DRAM, SOFI, SOXL, NBIS]
+    profit_target_pct: 55          # was 50 — slight; take profit fast on volatile names
     dte_stop: 7
     max_notional: 8000
     auto_close_at_dte: true
-    auto_close_at_pt: false
+    auto_close_at_pt: true
     auto_close_ravish: true
 
   short_put_qqq:
     match:
       action: STO
       symbols: [QQQ]
-    profit_target_pct: 60
+    profit_target_pct: 70          # was 60
     dte_stop: 14
     max_notional: 10000
     auto_close_at_dte: true
-    auto_close_at_pt: false
+    auto_close_at_pt: true
     auto_close_ravish: true
 
   spread:
     match:
       strategy_type: [call_spread, put_spread]
-    profit_target_pct: 60
-    dte_stop: 5
+    profit_target_pct: 70          # was 60 — defined risk allows more room; NOT the
+    dte_stop: 5                    #   in-sample "ride to 200%" (only 3 trades, bull run)
     max_notional: 5000
     auto_close_at_dte: true
-    auto_close_at_pt: false
+    auto_close_at_pt: true
     auto_close_ravish: true
 
   default:
