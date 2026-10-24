@@ -152,21 +152,21 @@ class DiscordPaperBridge:
         thr = float(getattr(settings, "DISCORD_ROTATION_THRESHOLD", 0.0) or 0.0)
         self._rotation_threshold: Optional[float] = thr if thr > 0 else None
 
-        # LIVE only when the Discord toggle AND the system triple-gate all hold.
-        # Any gate off → paper. This cannot activate by accident.
-        self._live = bool(
-            getattr(settings, "DISCORD_LIVE_TRADING", False)
-            and settings.ENV == "live"
-            and not settings.DRY_RUN
-            and settings.LIVE_TRADING_ENABLED
-        )
+        # STANDALONE Discord live/paper switch — independent of the main system's
+        # ENV / DRY_RUN / LIVE_TRADING_ENABLED gate, so the Discord copy-trader can
+        # run live while the rest of the engine stays in paper (or vice versa).
+        # True → real Schwab orders for Discord trades. Default False → paper.
+        # It is a single explicit bool (defaults off); nothing else gates it.
+        self._live = bool(getattr(settings, "DISCORD_LIVE_TRADING", False))
         # Exit rules (for rotation: new-trade PT and candidates' remaining profit).
         self._rules = _load_exit_rules()
 
         if self._live:
             log.warning(
-                "DiscordPaperBridge: *** LIVE TRADING ENABLED *** account=%s broker=%s "
-                "— real Schwab orders will be placed. (UNTESTED path: paper-verify first.)",
+                "DiscordPaperBridge: *** DISCORD LIVE TRADING ENABLED *** "
+                "(DISCORD_LIVE_TRADING=True, standalone) account=%s broker=%s "
+                "— real Schwab orders will be placed for Discord trades. "
+                "(UNTESTED path: paper-verify first.)",
                 acct_id, type(self._broker).__name__,
             )
         else:

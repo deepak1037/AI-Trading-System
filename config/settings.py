@@ -302,10 +302,11 @@ class Settings(BaseSettings):
     # downside). Set to 1.0 to book exact Schwab margin; >1 = more conservative.
     # BTO options (calls, puts, spreads) always use Schwab's estimated_cost directly.
     MSP_MARGIN_MULTIPLIER: float = 2.0
-    # Discord copy-trading mode. False (default) = PAPER (Schwab previewOrder +
-    # PaperAccount, no real orders). True = LIVE real Schwab orders — but ONLY
-    # when the system triple-gate also holds (ENV=live, DRY_RUN=False,
-    # LIVE_TRADING_ENABLED=True). If any gate is off, the bridge stays on paper.
+    # Discord copy-trading live/paper switch — STANDALONE, independent of the
+    # main system gate (ENV / DRY_RUN / LIVE_TRADING_ENABLED). This lets the
+    # Discord copy-trader run live while the rest of the engine stays in paper,
+    # or vice versa. False (default) = PAPER (Schwab previewOrder + PaperAccount,
+    # no real orders). True = LIVE real Schwab orders for Discord trades.
     DISCORD_LIVE_TRADING: bool = False
     # Capital rotation: when a new Discord signal lacks buying power, close the
     # most-profitable open position (at/above this profit %, and only if the new
