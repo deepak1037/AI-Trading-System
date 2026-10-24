@@ -316,6 +316,29 @@ class Settings(BaseSettings):
     # Multiple real Schwab account numbers (comma-separated, for future use):
     SCHWAB_ACCOUNT_NUMBERS: list[str] = Field(default_factory=list)
 
+    # ── 0DTE QQQ put-selling (standalone strategy, Ravish video) ──────────────
+    # Mechanical: each trading day at ENTRY_TIME, STO one QQQ 0DTE ~30-delta put;
+    # bracket TP (95% of credit) / SL (200%); force-close at FORCE_CLOSE_TIME;
+    # always flat before 16:00 ET. Runs independently of everything else.
+    ZERODTE_ENABLED: bool = False
+    ZERODTE_TICKER: str = "QQQ"
+    ZERODTE_TARGET_DELTA: float = 0.30          # 30-delta put (positive magnitude)
+    ZERODTE_ENTRY_TIME: str = "09:45"           # ET, HH:MM
+    ZERODTE_FORCE_CLOSE_TIME: str = "15:45"     # ET — manual close if still open
+    ZERODTE_MANAGE_INTERVAL_MIN: int = 5        # how often to poll TP/SL
+    ZERODTE_TAKE_PROFIT_PCT: float = 95.0       # buy-to-close at 5% of credit
+    ZERODTE_STOP_LOSS_PCT: float = 200.0        # buy-to-close at 3× credit
+    ZERODTE_CONTRACTS: int = 1                  # fixed size (unless autosize)
+    ZERODTE_AUTOSIZE: bool = False              # size by equity / capital_per_contract
+    ZERODTE_CAPITAL_PER_CONTRACT: float = 10_000.0
+    ZERODTE_MAX_CONTRACTS: int = 5
+    ZERODTE_SKIP_EVENT_DAYS: bool = True
+    ZERODTE_EVENT_DATES: list[str] = Field(default_factory=list)  # YYYY-MM-DD CPI/FOMC
+    # STANDALONE live/paper switch (independent of ENV / DRY_RUN / LIVE_TRADING_ENABLED).
+    ZERODTE_LIVE_TRADING: bool = False
+    ZERODTE_PAPER_ACCOUNT: str = "paper_zerodte"
+    ZERODTE_SCHWAB_ACCOUNT: str = ""            # blank → SCHWAB_ACCOUNT_NUMBER
+
     # ── Paper trading ──────────────────────────────────────────
     PAPER_ACCOUNTS: list[str] = Field(default_factory=lambda: ["paper_main"])
     PAPER_FILL_METHOD: str = "next_open"  # next_open | vwap | worst_case
