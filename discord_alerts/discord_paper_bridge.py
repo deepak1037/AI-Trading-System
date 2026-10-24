@@ -252,9 +252,14 @@ class DiscordPaperBridge:
                 # Patch the preview so apply_preview() deducts the full 2X amount.
                 # fill_price = estimated_cost / qty, so we set estimated_cost = 2X margin.
                 adjusted_preview = preview.model_copy(update={"estimated_cost": effective_cost})
+                # Book as a synthetic LONG in the (long-only) PaperAccount: the
+                # position is a bookkeeping proxy for the capital/margin held, so
+                # the open debits effective_cost and the close releases it. (An
+                # STO/"SELL" here would be a no-op — apply_fill would try to close
+                # a long that doesn't exist.)
                 order = Order(
                     ticker        = symbol,
-                    action        = "SELL",
+                    action        = "BUY",
                     qty           = contracts,
                     order_type    = "limit",
                     limit_price   = entry_price,
@@ -308,9 +313,10 @@ class DiscordPaperBridge:
             )
             return False
 
+        # Synthetic long (bookkeeping proxy for capital), same as the preview path.
         order = Order(
             ticker        = symbol,
-            action        = "BUY" if action in ("BTO", "BUY", "BUY_TO_OPEN") else "SELL",
+            action        = "BUY",
             qty           = contracts * _OPTIONS_MULTIPLIER,
             order_type    = "limit",
             limit_price   = entry_price,
@@ -347,7 +353,9 @@ class DiscordPaperBridge:
             return False
 
         contracts    = contracts or 1
-        close_action = "SELL" if action in ("BTO", "BUY", "BUY_TO_OPEN") else "BUY"
+        # Everything is booked as a synthetic long, so every close is a SELL of
+        # that long (the premium P&L below carries the real economic result).
+        close_action = "SELL"
 
         # LIVE: place a real closing order when we can build the contract.
         if self._live and strike and expiry and option_type:
@@ -365,22 +373,31 @@ class DiscordPaperBridge:
             except Exception as exc:  # noqa: BLE001
                 log.error("DiscordPaperBridge: LIVE CLOSE FAILED %s: %s", symbol, exc)
 
-        # Close with qty=contracts*100 to match the fallback open path.
-        # For Schwab-preview opens, qty was set to contracts (not ×100),
-        # so PaperAccount FIFO matching works either way — it matches by ticker.
-        order = Order(
-            ticker        = symbol,
-            action        = close_action,  # type: ignore[arg-type]
-            qty           = contracts * _OPTIONS_MULTIPLIER,
-            order_type    = "market",
-            strategy_name = f"discord_{reason}",
-            account_id    = self._account.account_id,
-        )
-        self._account.apply_fill(order, fill_price=exit_price, commission=0.0)
-
+        # Premium P&L (the real economic result on the option).
         pnl = (exit_price - entry_price) * contracts * _OPTIONS_MULTIPLIER
         if action in ("STO", "SELL", "SELL_TO_OPEN"):
             pnl = -pnl  # STO profits when price goes down
+
+        # Release the position's ACTUAL cost basis (the capital/margin held at
+        # open) plus the premium P&L — symmetric with the open. We locate the
+        # open paper position for this ticker to get its true cost basis
+        # (qty × entry_price), because MSP opens book 2×margin as the basis
+        # while BTO opens book the premium notional. Closing with the position's
+        # own qty makes apply_fill credit cost_basis + pnl back to cash exactly.
+        pos = next((p for p in self._account.get_state().open_positions
+                    if p.ticker == symbol), None)
+        if pos is not None and pos.qty > 0:
+            cost_basis = pos.qty * pos.entry_price
+            close_fill = (cost_basis + pnl) / pos.qty
+            order = Order(
+                ticker=symbol, action=close_action, qty=pos.qty,  # type: ignore[arg-type]
+                order_type="market", strategy_name=f"discord_{reason}",
+                account_id=self._account.account_id,
+            )
+            self._account.apply_fill(order, fill_price=close_fill, commission=0.0)
+        else:
+            # No matching open position (e.g. already closed) — best-effort.
+            log.warning("DiscordPaperBridge: no open paper position for %s at close", symbol)
 
         log.info(
             "DiscordPaperBridge: CLOSE %s  contracts=%d  entry=%.4f  exit=%.4f  P&L=$%.2f  reason=%s",
