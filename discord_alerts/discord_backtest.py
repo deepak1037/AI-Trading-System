@@ -527,12 +527,15 @@ class BacktestAccount:
             return False
         entry  = pos["entry"]
         action = pos["action"]
-        if not exit_price and pnl_pct is not None:
+        # Derive exit from pnl_pct only when no explicit price was given.
+        # NB: exit_price == 0.0 is VALID (expired worthless) — test `is None`,
+        # never truthiness, or 0 closes silently fail.
+        if exit_price is None and pnl_pct is not None:
             if action in _MSP_ACTIONS:
                 exit_price = entry * (1 - pnl_pct / 100)
             else:
                 exit_price = entry * (1 + pnl_pct / 100)
-        if not exit_price:
+        if exit_price is None:
             return False
 
         contracts = pos["contracts"]
@@ -875,16 +878,28 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
 
         ExitParser requires a ticker and returns None without one — but inside a
         forum thread the symbol is already known, so we extract numbers directly.
+        Handles both profit closes and LOSS closes (stop-loss / manual exit),
+        returning a NEGATIVE pnl_pct for losses.
         """
         pnl_pct = exit_price = None
-        # ROI / profit percentage: "ROI 74%", "74% profit", "+74%", "74% ROI".
-        m = (_re.search(r'roi[\s:]*\+?(\d+(?:\.\d+)?)\s*%', content, _re.I)
-             or _re.search(r'\+?(\d+(?:\.\d+)?)\s*%\s*(?:profit|roi|gain)', content, _re.I)
-             or _re.search(r'(?:profit|roi|gain)[\s:]*\+?(\d+(?:\.\d+)?)\s*%', content, _re.I))
-        if m:
-            pnl_pct = float(m.group(1))
-        # Closing price: "credit to close 0.15", "close @ 1.20", "closed at 2.5".
+
+        # ── Loss first: "Stop Loss -29%", "50% Stoploss", "down -45%" ─────
+        ml = (_re.search(r'stop\s*-?loss[\s:–\-]*-?(\d+(?:\.\d+)?)\s*%', content, _re.I)
+              or _re.search(r'(\d+(?:\.\d+)?)\s*%\s*stop\s*-?loss', content, _re.I)
+              or _re.search(r'\bdown\s*-?(\d+(?:\.\d+)?)\s*%', content, _re.I))
+        if ml:
+            pnl_pct = -float(ml.group(1))
+        else:
+            # ── Profit: "ROI 74%", "74% profit", "+74%", "74% ROI" ────────
+            m = (_re.search(r'roi[\s:]*\+?(\d+(?:\.\d+)?)\s*%', content, _re.I)
+                 or _re.search(r'\+?(\d+(?:\.\d+)?)\s*%\s*(?:profit|roi|gain)', content, _re.I)
+                 or _re.search(r'(?:profit|roi|gain)[\s:]*\+?(\d+(?:\.\d+)?)\s*%', content, _re.I))
+            if m:
+                pnl_pct = float(m.group(1))
+
+        # ── Explicit exit/close price ─────────────────────────────────────
         m = (_re.search(r'credit\s+to\s+close\s*\n?\s*([\d.]+)', content, _re.I)
+             or _re.search(r'(?:exited|exit|out|sold|closed?)\b[^@\n]*@\s*([\d.]+)', content, _re.I)
              or _re.search(r'clos(?:e|ed|ing)\s*(?:@|at)?\s*([\d.]+)', content, _re.I))
         if m:
             try:
@@ -893,18 +908,30 @@ def run_backtest(token, signal_channel_id, update_channel_id, forum_channel_id,
                 pass
         return pnl_pct, exit_price
 
+    # Explicit "this trade is closed" markers. Unlike a bare "at 12%" progress
+    # update, these announce a close — so we honour ANY profit level (calendars
+    # & diagonals routinely close at 30-40%, below the 50% fallback gate).
+    CLOSE_MARKERS = list(RAVISH_EXIT_KEYWORDS) + [
+        "profit hit", "pt hit", "profit target", "🎯", "target hit",
+        "assigned", "rolled", "roll out",
+        "stop loss", "stoploss", "stop-loss", "exited", "i exited",
+    ]
+
     def _detect_exit(content):
         """Return (reason, exit_price, pnl_pct) if this msg is an exit, else None."""
         lower     = content.lower()
-        ravish_kw = next((k for k in RAVISH_EXIT_KEYWORDS if k in lower), None)
+        marker    = next((k for k in CLOSE_MARKERS if k in lower), None)
         # Prefer ExitParser's values; fall back to symbol-free extraction.
         exit_sig  = exit_parser.parse(content)
         pnl_pct   = getattr(exit_sig, "pnl_pct",   None) if exit_sig else None
         exit_price = getattr(exit_sig, "exit_price", None) if exit_sig else None
         if pnl_pct is None and exit_price is None:
             pnl_pct, exit_price = _extract_pnl_price(content)
-        if ravish_kw:
-            return ravish_kw, exit_price, pnl_pct
+        # An explicit close marker closes at whatever profit level is stated.
+        if marker:
+            return marker, exit_price, pnl_pct
+        # No marker: only treat a high bare profit % as a (scale-out) close,
+        # so interim "at 12%" progress posts don't close the trade early.
         if pnl_pct is not None and pnl_pct >= 50:
             return "profit_target", exit_price, pnl_pct
         return None
