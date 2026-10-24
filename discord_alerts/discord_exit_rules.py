@@ -253,7 +253,8 @@ class ExitRuleEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT paper_entry, action, contracts, symbol FROM discord_signals WHERE id=?",
+                "SELECT paper_entry, action, contracts, symbol, strike, expiry_short, "
+                "option_type FROM discord_signals WHERE id=?",
                 (trade_id,)
             ).fetchone()
             if not row:
@@ -281,7 +282,8 @@ class ExitRuleEngine:
         log.info("Closed trade #%d @ %.2f  P&L=%.1f%%  reason=%s",
                  trade_id, exit_price, computed_pnl or 0, reason)
 
-        # Mirror close to the paper_discord PaperAccount
+        # Mirror close to the paper_discord PaperAccount (and place a real
+        # closing order when the bridge is in LIVE mode).
         self._bridge.close_trade(
             symbol      = symbol,
             entry_price = entry,
@@ -289,5 +291,8 @@ class ExitRuleEngine:
             contracts   = contracts,
             action      = action,
             reason      = reason,
+            strike      = row["strike"],
+            expiry      = row["expiry_short"],
+            option_type = row["option_type"],
         )
         return True

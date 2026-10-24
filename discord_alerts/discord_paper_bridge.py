@@ -32,14 +32,76 @@ Usage — called from discord_user_listener.py after a signal is saved:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import os
+import sqlite3
+from datetime import date, datetime, timezone
 from typing import Optional
 
+import yaml
+
 from broker_core.account_registry import get_broker_for, get_paper_account
-from broker_core.base_broker import OptionsOrder, Order, OrderPreview
+from broker_core.base_broker import OptionsOrder, Order, OrderPreview, OrderResult
 from config.settings import settings
+from discord_alerts.capital_manager import pick_rotations
 
 log = logging.getLogger(__name__)
+
+_EXIT_RULES_PATH = os.path.join(os.path.dirname(__file__), "exit_rules.yaml")
+
+
+def _dte_between(start_str, expiry_str):
+    """Days from start date to expiry; None if either is missing/unparseable."""
+    if not expiry_str:
+        return None
+    try:
+        exp = date.fromisoformat(expiry_str[:10])
+    except (ValueError, TypeError):
+        return None
+    if not start_str:
+        return (exp - date.today()).days
+    try:
+        return (exp - date.fromisoformat(start_str[:10])).days
+    except (ValueError, TypeError):
+        return (exp - date.today()).days
+
+
+def _load_exit_rules() -> dict:
+    """Load exit_rules.yaml rules (for rotation PT lookups). Empty on failure."""
+    try:
+        with open(_EXIT_RULES_PATH) as f:
+            return (yaml.safe_load(f) or {}).get("rules", {})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DiscordPaperBridge: could not load exit_rules.yaml: %s", exc)
+        return {}
+
+
+def _match_exit_rule(rules: dict, action: str, symbol: str, strategy: str,
+                     dte_at_entry: Optional[int]) -> dict:
+    """Mirror ExitRuleEngine._match_rule — pick the rule for a trade."""
+    action = (action or "").upper(); symbol = (symbol or "").upper()
+    strategy = (strategy or "").lower()
+    for name, rule in rules.items():
+        if name == "default":
+            continue
+        m = rule.get("match", {})
+        if "action" in m and m["action"].upper() != action:
+            continue
+        if "symbol" in m and m["symbol"].upper() != symbol:
+            continue
+        if "symbols" in m and symbol not in [s.upper() for s in m["symbols"]]:
+            continue
+        if "strategy_type" in m:
+            st = m["strategy_type"]
+            if isinstance(st, list):
+                if strategy not in [s.lower() for s in st]:
+                    continue
+            elif strategy != st.lower():
+                continue
+        if "min_dte_at_entry" in m:
+            if dte_at_entry is None or dte_at_entry < m["min_dte_at_entry"]:
+                continue
+        return rule
+    return rules.get("default", {"profit_target_pct": 50})
 
 # One options contract = 100 shares × price
 _OPTIONS_MULTIPLIER = 100
@@ -84,10 +146,36 @@ class DiscordPaperBridge:
         self._account        = get_paper_account(acct_id)
         self._broker         = get_broker_for(settings.DISCORD_SCHWAB_ACCOUNT or None)
         self._msp_multiplier = float(getattr(settings, "MSP_MARGIN_MULTIPLIER", _DEFAULT_MSP_MULTIPLIER))
-        log.info(
-            "DiscordPaperBridge: account=%s  broker=%s  msp_multiplier=%.1fx",
-            acct_id, type(self._broker).__name__, self._msp_multiplier,
+        self._db_path        = settings.DB_PATH
+
+        # Capital rotation threshold (profit %); 0 / unset = OFF.
+        thr = float(getattr(settings, "DISCORD_ROTATION_THRESHOLD", 0.0) or 0.0)
+        self._rotation_threshold: Optional[float] = thr if thr > 0 else None
+
+        # LIVE only when the Discord toggle AND the system triple-gate all hold.
+        # Any gate off → paper. This cannot activate by accident.
+        self._live = bool(
+            getattr(settings, "DISCORD_LIVE_TRADING", False)
+            and settings.ENV == "live"
+            and not settings.DRY_RUN
+            and settings.LIVE_TRADING_ENABLED
         )
+        # Exit rules (for rotation: new-trade PT and candidates' remaining profit).
+        self._rules = _load_exit_rules()
+
+        if self._live:
+            log.warning(
+                "DiscordPaperBridge: *** LIVE TRADING ENABLED *** account=%s broker=%s "
+                "— real Schwab orders will be placed. (UNTESTED path: paper-verify first.)",
+                acct_id, type(self._broker).__name__,
+            )
+        else:
+            log.info(
+                "DiscordPaperBridge: PAPER mode  account=%s  broker=%s  "
+                "msp_multiplier=%.1fx  rotation=%s",
+                acct_id, type(self._broker).__name__, self._msp_multiplier,
+                f"≥{self._rotation_threshold:.0f}%" if self._rotation_threshold else "off",
+            )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -114,7 +202,7 @@ class DiscordPaperBridge:
         option_type = getattr(signal, "option_type",   None)
 
         # ── Try Schwab preview if we have enough info for an OCC symbol ──────
-        preview = self._schwab_preview(
+        preview, options_order = self._schwab_preview(
             symbol=symbol, action=action, contracts=contracts,
             limit_price=entry_price, strike=strike,
             expiry=expiry, option_type=option_type,
@@ -151,13 +239,16 @@ class DiscordPaperBridge:
                 effective_cost = schwab_margin * self._msp_multiplier
                 state = self._account.get_state()
                 if state.cash < effective_cost:
-                    log.warning(
-                        "DiscordPaperBridge: insufficient cash for MSP %s "
-                        "(need $%.2f [%.0fx $%.2f margin], have $%.2f) — skipping",
-                        symbol, effective_cost, self._msp_multiplier,
-                        schwab_margin, state.cash,
-                    )
-                    return False
+                    # Try to free buying power by rotating out of an aged winner.
+                    if not self._attempt_rotation(symbol, action, strategy, expiry,
+                                                  entry_price, contracts, effective_cost):
+                        log.warning(
+                            "DiscordPaperBridge: insufficient cash for MSP %s "
+                            "(need $%.2f [%.0fx $%.2f margin], have $%.2f) — skipping",
+                            symbol, effective_cost, self._msp_multiplier,
+                            schwab_margin, state.cash,
+                        )
+                        return False
                 # Patch the preview so apply_preview() deducts the full 2X amount.
                 # fill_price = estimated_cost / qty, so we set estimated_cost = 2X margin.
                 adjusted_preview = preview.model_copy(update={"estimated_cost": effective_cost})
@@ -170,13 +261,14 @@ class DiscordPaperBridge:
                     strategy_name = f"discord_{strategy}",
                     account_id    = self._account.account_id,
                 )
-                result = self._account.apply_preview(order, adjusted_preview)
+                result = self._execute_open(options_order, order, adjusted_preview,
+                                            f"MSP {symbol}")
                 log.info(
                     "DiscordPaperBridge: OPEN MSP %s  contracts=%d  "
-                    "schwab_margin=$%.2f  booked=%.0fx=$%.2f  status=%s",
+                    "schwab_margin=$%.2f  booked=%.0fx=$%.2f  mode=%s  status=%s",
                     symbol, contracts,
                     schwab_margin, self._msp_multiplier, effective_cost,
-                    result.status,
+                    "LIVE" if self._live else "paper", result.status,
                 )
             else:
                 # BTO (calls, puts, spreads): book exactly what Schwab says.
@@ -189,13 +281,14 @@ class DiscordPaperBridge:
                     strategy_name = f"discord_{strategy}",
                     account_id    = self._account.account_id,
                 )
-                result = self._account.apply_preview(order, preview)
+                result = self._execute_open(options_order, order, preview,
+                                            f"BTO {symbol}")
                 log.info(
                     "DiscordPaperBridge: OPEN BTO %s  contracts=%d  "
-                    "schwab_cost=$%.2f  buying_power_left=$%.2f  status=%s",
+                    "schwab_cost=$%.2f  buying_power_left=$%.2f  mode=%s  status=%s",
                     symbol, contracts,
                     preview.estimated_cost, preview.projected_available_fund,
-                    result.status,
+                    "LIVE" if self._live else "paper", result.status,
                 )
 
             return result.status == "filled"
@@ -239,8 +332,12 @@ class DiscordPaperBridge:
         contracts: int,
         action: str,
         reason: str = "exit",
+        strike: Optional[float] = None,
+        expiry: Optional[str] = None,
+        option_type: Optional[str] = None,
     ) -> bool:
-        """Record a trade close in PaperAccount.
+        """Record a trade close in PaperAccount (and place a real closing order
+        when LIVE and the contract fields are available).
 
         The action is the ENTRY action (BTO/STO); the bridge derives the
         closing action automatically.
@@ -251,6 +348,22 @@ class DiscordPaperBridge:
 
         contracts    = contracts or 1
         close_action = "SELL" if action in ("BTO", "BUY", "BUY_TO_OPEN") else "BUY"
+
+        # LIVE: place a real closing order when we can build the contract.
+        if self._live and strike and expiry and option_type:
+            try:
+                occ = _build_occ_symbol(symbol, expiry, option_type, strike)
+                occ_close = "SELL_TO_CLOSE" if action in ("BTO", "BUY", "BUY_TO_OPEN") \
+                    else "BUY_TO_CLOSE"
+                live = self._broker.place_options_order(OptionsOrder(
+                    ticker=symbol, action=occ_close, contract=occ, qty=contracts,
+                    order_type="market", strategy_name=f"discord_{reason}",
+                    account_id=self._account.account_id))
+                log.warning("DiscordPaperBridge: LIVE CLOSE %s id=%s status=%s",
+                            symbol, getattr(live, "order_id", "?"),
+                            getattr(live, "status", "?"))
+            except Exception as exc:  # noqa: BLE001
+                log.error("DiscordPaperBridge: LIVE CLOSE FAILED %s: %s", symbol, exc)
 
         # Close with qty=contracts*100 to match the fallback open path.
         # For Schwab-preview opens, qty was set to contracts (not ×100),
@@ -323,6 +436,121 @@ class DiscordPaperBridge:
         )
         return preview.estimated_cost
 
+    def _execute_open(self, options_order, book_order, book_preview, label: str):
+        """Open a position: LIVE places a real Schwab order then mirrors to the
+        paper ledger; PAPER books to the ledger only. Returns the paper result."""
+        if self._live and options_order is not None:
+            try:
+                live = self._broker.place_options_order(options_order)
+                log.warning("DiscordPaperBridge: LIVE OPEN [%s] id=%s status=%s",
+                            label, getattr(live, "order_id", "?"),
+                            getattr(live, "status", "?"))
+            except Exception as exc:  # noqa: BLE001
+                log.error("DiscordPaperBridge: LIVE OPEN FAILED [%s]: %s", label, exc)
+                return OrderResult(order_id="LIVE_FAILED", status="rejected", fill_price=0.0)
+        # Always mirror to the paper ledger (tracking account / dashboard parity).
+        return self._account.apply_preview(book_order, book_preview)
+
+    def _attempt_rotation(self, symbol, action, strategy, expiry,
+                          entry_price, contracts, need_cost) -> bool:
+        """Free buying power for a new signal by closing an aged winner, using
+        capital_manager.pick_rotations. Returns True if enough was freed."""
+        if self._rotation_threshold is None:
+            return False
+        state = self._account.get_state()
+        if state.cash >= need_cost:
+            return True
+
+        # Expected profit of the NEW trade if it reaches its own PT.
+        nrule = _match_exit_rule(self._rules, action, symbol, strategy,
+                                 _dte_between(None, expiry))
+        npt = float(nrule.get("profit_target_pct", 50))
+        new_expected = entry_price * (npt / 100.0) * _OPTIONS_MULTIPLIER * (contracts or 1)
+
+        # Candidates: open DB trades with a current mark, joined to the paper
+        # position's cost basis (capital that would be freed).
+        pos_by_ticker = {p.ticker: p for p in state.open_positions}
+        cands, by_id = [], {}
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM discord_signals WHERE paper_status='open' "
+                    "AND paper_pnl_pct IS NOT NULL"
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("DiscordPaperBridge: rotation DB read failed: %s", exc)
+            return False
+
+        for r in rows:
+            sym = (r["symbol"] or "").upper()
+            pos = pos_by_ticker.get(sym)
+            if pos is None:
+                continue
+            mark = r["paper_pnl_pct"]
+            if mark is None:
+                continue
+            capital = pos.qty * pos.entry_price            # cost basis freed on close
+            c_entry = r["paper_entry"] or 0.0
+            c_ctr   = r["contracts"] or 1
+            crule = _match_exit_rule(self._rules, r["action"], sym,
+                                     r["strategy_type"] or "",
+                                     _dte_between(r["received_at"], r["expiry_short"]))
+            cpt = float(crule.get("profit_target_pct", 50))
+            remaining = c_entry * max(cpt - mark, 0) / 100.0 * _OPTIONS_MULTIPLIER * c_ctr
+            cands.append({"id": r["id"], "mark_pct": mark, "capital": capital,
+                          "remaining_pnl": remaining})
+            by_id[r["id"]] = (r, mark)
+
+        chosen = pick_rotations(need_cost, state.cash, new_expected,
+                                cands, self._rotation_threshold)
+        if not chosen:
+            return False
+
+        for cid in chosen:
+            r, mark = by_id[cid]
+            self._rotate_close(r, mark)
+        return self._account.get_state().cash >= need_cost
+
+    def _rotate_close(self, row, mark_pct) -> None:
+        """Close one open trade early for capital rotation: LIVE closing order
+        (if live), paper ledger close, and DB mark-closed."""
+        sym      = (row["symbol"] or "?").upper()
+        entry    = row["paper_entry"] or 0.0
+        act      = (row["action"] or "BTO").upper()
+        ctr      = row["contracts"] or 1
+        exit_px  = entry * (1 - mark_pct / 100) if act in ("STO", "SELL", "SELL_TO_OPEN") \
+            else entry * (1 + mark_pct / 100)
+        log.warning("DiscordPaperBridge: ROTATION close %s @ %.1f%% (free capital)",
+                    sym, mark_pct)
+        # LIVE: place a real closing order when we can build the contract.
+        if self._live and row["strike"] and row["expiry_short"] and row["option_type"]:
+            try:
+                occ = _build_occ_symbol(sym, row["expiry_short"], row["option_type"],
+                                        row["strike"])
+                close_act = "SELL_TO_CLOSE" if act in ("BTO", "BUY", "BUY_TO_OPEN") \
+                    else "BUY_TO_CLOSE"
+                self._broker.place_options_order(OptionsOrder(
+                    ticker=sym, action=close_act, contract=occ, qty=ctr,
+                    order_type="market", strategy_name="discord_rotation",
+                    account_id=self._account.account_id))
+            except Exception as exc:  # noqa: BLE001
+                log.error("DiscordPaperBridge: LIVE rotation close FAILED %s: %s", sym, exc)
+        # Paper ledger close.
+        self.close_trade(sym, entry, exit_px, ctr, act, reason="rotation")
+        # Mark closed in the DB so the exit engine stops managing it.
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "UPDATE discord_signals SET paper_status='closed', paper_exit=?, "
+                    "paper_pnl_pct=?, closed_at=?, skip_reason='rotation' WHERE id=?",
+                    (round(exit_px, 4), round(mark_pct, 2),
+                     datetime.now(timezone.utc).isoformat(), row["id"]),
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("DiscordPaperBridge: rotation DB close failed for #%s: %s",
+                        row["id"], exc)
+
     def _schwab_preview(
         self,
         symbol: str,
@@ -333,20 +561,21 @@ class DiscordPaperBridge:
         expiry: Optional[str],
         option_type: Optional[str],
         strategy: str,
-    ) -> Optional[OrderPreview]:
+    ) -> tuple[Optional[OrderPreview], Optional[OptionsOrder]]:
         """Call Schwab previewOrder for an options trade.
 
-        Returns an OrderPreview if successful, None if we can't build the
+        Returns (preview, options_order). Both are None if we can't build the
         OCC symbol or the broker call fails (caller falls back to direct fill).
+        The options_order is returned so a LIVE open can place that same order.
         """
         if not (strike and expiry and option_type):
-            return None
+            return None, None
 
         try:
             occ = _build_occ_symbol(symbol, expiry, option_type, strike)
         except Exception as exc:
             log.warning("DiscordPaperBridge: could not build OCC symbol for %s: %s", symbol, exc)
-            return None
+            return None, None
 
         order_action = "BUY_TO_OPEN" if action in ("BTO", "BUY", "BUY_TO_OPEN") else "SELL_TO_OPEN"
         options_order = OptionsOrder(
@@ -369,13 +598,13 @@ class DiscordPaperBridge:
                 preview.estimated_cost, preview.projected_available_fund,
                 preview.is_valid,
             )
-            return preview
+            return preview, options_order
         except Exception as exc:
             log.warning(
                 "DiscordPaperBridge: Schwab preview failed for %s (%s) — falling back: %s",
                 symbol, occ, exc,
             )
-            return None
+            return None, options_order
 
 
 __all__ = ["DiscordPaperBridge"]
