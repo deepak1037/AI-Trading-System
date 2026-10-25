@@ -489,6 +489,44 @@ class SchwabBroker(BaseBroker):
 
     @retry(max_attempts=settings.API_MAX_RETRIES, backoff_seconds=settings.API_BACKOFF_SECONDS, exceptions=(BrokerError,))
     @circuit_breaker(failure_threshold=settings.API_CIRCUIT_BREAKER_FAILURES, recovery_timeout=settings.API_CIRCUIT_BREAKER_TIMEOUT)
+    def place_options_oco_close(self, contract: str, qty: int,
+                                tp_limit: float, sl_stop: float) -> OrderResult:
+        """Place a resting OCO bracket to CLOSE a short option position:
+          • take-profit  = BUY_TO_CLOSE LIMIT at tp_limit
+          • stop-loss    = BUY_TO_CLOSE STOP  at sl_stop
+        One-cancels-other, DAY duration — rests at the exchange so the exit is
+        handled even if this process is down. Used by the 0DTE strategy in LIVE.
+        """
+        try:
+            common  = self._schwab.orders.common
+            options = self._schwab.orders.options
+
+            tp = options.option_buy_to_close_limit(contract, qty, round(tp_limit, 2))
+
+            sl = common.OrderBuilder()
+            sl.set_order_type(common.OrderType.STOP)
+            sl.set_stop_price(round(sl_stop, 2))
+            sl.set_duration(common.Duration.DAY)
+            sl.set_session(common.Session.NORMAL)
+            sl.add_option_leg(common.OptionInstruction.BUY_TO_CLOSE, contract, qty)
+
+            oco  = common.one_cancels_other(tp, sl)
+            resp = self._client.place_order(self._account_hash, oco)
+            resp.raise_for_status()
+            order_id = resp.headers.get("location", resp.headers.get("Location", "")).split("/")[-1]
+            logger.warning(
+                "LIVE OCO CLOSE | order_id=%s contract=%s qty=%d tp=%.2f sl=%.2f",
+                order_id, contract, qty, tp_limit, sl_stop,
+            )
+            return OrderResult(order_id=order_id, status="submitted", fill_price=0.0,
+                               raw_response={"order_id": order_id})
+        except BrokerError:
+            raise
+        except Exception as exc:
+            raise BrokerError(f"place_options_oco_close failed: {exc}") from exc
+
+    @retry(max_attempts=settings.API_MAX_RETRIES, backoff_seconds=settings.API_BACKOFF_SECONDS, exceptions=(BrokerError,))
+    @circuit_breaker(failure_threshold=settings.API_CIRCUIT_BREAKER_FAILURES, recovery_timeout=settings.API_CIRCUIT_BREAKER_TIMEOUT)
     def preview_options_order(self, order: OptionsOrder) -> OrderPreview:
         """
         Call Schwab previewOrder API for options — real validation, not a stub.

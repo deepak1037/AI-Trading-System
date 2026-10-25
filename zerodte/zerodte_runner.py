@@ -43,6 +43,8 @@ class ZeroDTERunner:
         self._ticker  = settings.ZERODTE_TICKER
         self._live    = bool(getattr(settings, "ZERODTE_LIVE_TRADING", False))
         self._open: Optional[strat.ZeroDTEPlan] = None   # current day's open plan
+        self._oco_id: Optional[str] = None               # resting broker OCO (live)
+        self._broker_managed = False                     # TP/SL rest at the broker?
         mode = "LIVE" if self._live else "PAPER"
         log.warning(
             "ZeroDTERunner: %s  ticker=%s  account=%s  delta=%.2f  TP=%.0f%%  SL=%.0f%%",
@@ -105,9 +107,17 @@ class ZeroDTERunner:
     # ── Manage ──────────────────────────────────────────────────────────────
 
     def manage(self) -> None:
-        """Re-price the open put; close on TP or SL."""
+        """Manage the open position.
+
+        LIVE with a resting broker OCO: the exchange owns the TP/SL exit, so we
+        do nothing here (the whole point of the OCO — survives this process
+        being down). PAPER (or a LIVE fallback where the OCO couldn't be placed)
+        polls the option price and closes on TP/SL.
+        """
         if self._open is None:
             return
+        if self._live and self._broker_managed:
+            return   # broker's OCO handles TP/SL
         price = self._current_price(self._open.contract.symbol, self._open.contract.expiry)
         if price is None:
             log.warning("ZeroDTE: could not re-price %s — will retry", self._open.contract.symbol)
@@ -117,12 +127,20 @@ class ZeroDTERunner:
             self.close_position(reason, price)
 
     def force_close(self) -> None:
-        """Close manually if still open (must be flat before 16:00 ET)."""
+        """Flatten if still open — must be flat before 16:00 ET. There is no
+        broker-resting timed order (the Schwab API has no time trigger), so this
+        scheduled step cancels any resting OCO and buys the put back."""
         if self._open is None:
             return
         price = self._current_price(self._open.contract.symbol, self._open.contract.expiry)
         if price is None:
-            price = self._open.credit   # best effort — scratch
+            price = self._open.credit   # best effort
+        if self._live and self._oco_id:
+            try:
+                self._broker.cancel_order(self._oco_id)
+                log.warning("ZeroDTE: cancelled resting OCO %s before force-close", self._oco_id)
+            except Exception as exc:  # noqa: BLE001
+                log.error("ZeroDTE: cancel OCO failed (%s) — the OCO may already have filled", exc)
         self.close_position("force_close_eod", price)
 
     def close_position(self, reason: str, exit_price: float) -> None:
@@ -137,12 +155,20 @@ class ZeroDTERunner:
             "LIVE" if self._live else "paper",
         )
         self._open = None
+        self._oco_id = None
+        self._broker_managed = False
 
-    # ── Execution (paper ledger + optional live orders) ───────────────────────
+    # ── Execution ─────────────────────────────────────────────────────────────
 
     def _execute_open(self, plan: strat.ZeroDTEPlan) -> bool:
-        """STO the put. LIVE places a real order; always mirror to the paper
-        ledger as a synthetic long whose cost basis = the real Schwab margin."""
+        """STO the put, then arm the bracket.
+
+        LIVE: place the real STO, then rest a TP/SL OCO at the broker so the exit
+        is handled all day without this process (the 3:45 close stays a scheduled
+        action — the API has no resting timed order). Schwab is the book of
+        record in live, so no paper-ledger mirror is written.
+        PAPER: book a synthetic long (cost basis = real Schwab margin) and poll.
+        """
         occ = plan.contract.symbol
         sto = OptionsOrder(
             ticker=self._ticker, action="SELL_TO_OPEN", contract=occ,
@@ -167,8 +193,25 @@ class ZeroDTERunner:
             except Exception as exc:  # noqa: BLE001
                 log.error("ZeroDTE: LIVE STO FAILED: %s", exc)
                 return False
+            # Rest the TP/SL OCO at the broker (survives this process going down).
+            self._broker_managed = False
+            self._oco_id = None
+            place_oco = getattr(self._broker, "place_options_oco_close", None)
+            if callable(place_oco):
+                try:
+                    oco = place_oco(occ, plan.contracts, plan.tp_price, plan.sl_price)
+                    self._oco_id = getattr(oco, "order_id", None)
+                    self._broker_managed = True
+                    log.warning("ZeroDTE: resting OCO armed id=%s (TP=%.2f SL=%.2f)",
+                                self._oco_id, plan.tp_price, plan.sl_price)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("ZeroDTE: OCO placement failed (%s) — falling back to "
+                              "poll-managed exit (process must stay up)", exc)
+            else:
+                log.warning("ZeroDTE: broker has no OCO support — poll-managed exit")
+            return True   # live: Schwab is the book of record, no paper mirror
 
-        # Mirror to the paper ledger as a synthetic long (cost basis = margin).
+        # PAPER: synthetic-long ledger (cost basis = margin), poll-managed.
         state = self._account.get_state()
         if state.cash < margin:
             log.warning("ZeroDTE: insufficient paper cash ($%.2f < $%.2f) — skipping",
@@ -184,17 +227,21 @@ class ZeroDTERunner:
     def _execute_close(self, plan: strat.ZeroDTEPlan, exit_price: float, reason: str) -> None:
         occ = plan.contract.symbol
         if self._live:
+            # Options market orders are blocked by the broker — use a marketable
+            # LIMIT at the current price to flatten.
             try:
                 res = self._broker.place_options_order(OptionsOrder(
                     ticker=self._ticker, action="BUY_TO_CLOSE", contract=occ,
-                    qty=plan.contracts, order_type="market",
+                    qty=plan.contracts, order_type="limit",
+                    limit_price=round(max(exit_price, 0.01), 2),
                     strategy_name=f"zerodte_{reason}", account_id=self._account.account_id))
                 log.warning("ZeroDTE: LIVE BTC id=%s status=%s",
                             getattr(res, "order_id", "?"), getattr(res, "status", "?"))
             except Exception as exc:  # noqa: BLE001
                 log.error("ZeroDTE: LIVE BTC FAILED: %s", exc)
-        # Paper close: release the position's cost basis + premium P&L (symmetric
-        # with the synthetic-long open — never credit garbage).
+            return   # live: no paper-ledger mirror
+
+        # PAPER close: release cost basis + premium P&L (symmetric with the open).
         pnl = strat.realized_pnl(plan, exit_price)
         pos = next((p for p in self._account.get_state().open_positions
                     if p.ticker == self._ticker), None)
