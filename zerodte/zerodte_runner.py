@@ -20,12 +20,14 @@ Run:  python -m zerodte.zerodte_runner
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import date, datetime, timezone
 from typing import Optional
 
 from broker_core.account_registry import get_broker_for, get_paper_account
-from broker_core.base_broker import OptionsOrder, Order, OrderPreview, OrderResult
+from broker_core.base_broker import OptionsContract, OptionsOrder, Order, OrderPreview, OrderResult
 from broker_client.options_engine import OptionsEngine
 from config.settings import settings
 from zerodte import zerodte_strategy as strat
@@ -45,6 +47,7 @@ class ZeroDTERunner:
         self._open: Optional[strat.ZeroDTEPlan] = None   # current day's open plan
         self._oco_id: Optional[str] = None               # resting broker OCO (live)
         self._broker_managed = False                     # TP/SL rest at the broker?
+        self._state_file = settings.ZERODTE_STATE_FILE
         mode = "LIVE" if self._live else "PAPER"
         log.warning(
             "ZeroDTERunner: %s  ticker=%s  account=%s  delta=%.2f  TP=%.0f%%  SL=%.0f%%",
@@ -52,6 +55,60 @@ class ZeroDTERunner:
             settings.ZERODTE_TARGET_DELTA, settings.ZERODTE_TAKE_PROFIT_PCT,
             settings.ZERODTE_STOP_LOSS_PCT,
         )
+        # Recover today's open position after a restart (systemd) so management
+        # and the 15:45 close survive the process going down mid-day.
+        self._load_state()
+
+    # ── Durable day-state (open plan + resting OCO id) ────────────────────────
+
+    def _save_state(self) -> None:
+        if self._open is None:
+            return
+        p = self._open
+        data = {
+            "open_date": datetime.now(tz=timezone.utc).date().isoformat(),
+            "live": self._live, "ticker": self._ticker,
+            "occ": p.contract.symbol, "strike": p.contract.strike,
+            "expiry": p.contract.expiry, "credit": p.credit,
+            "tp": p.tp_price, "sl": p.sl_price, "contracts": p.contracts,
+            "oco_id": self._oco_id, "broker_managed": self._broker_managed,
+        }
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self._state_file)), exist_ok=True)
+            with open(self._state_file, "w") as f:
+                json.dump(data, f)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ZeroDTE: could not save state: %s", exc)
+
+    def _load_state(self) -> None:
+        try:
+            if not os.path.exists(self._state_file):
+                return
+            with open(self._state_file) as f:
+                d = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ZeroDTE: could not read state: %s", exc)
+            return
+        today = datetime.now(tz=timezone.utc).date().isoformat()
+        if d.get("open_date") != today:
+            self._clear_state()   # stale (previous day) — discard
+            return
+        contract = OptionsContract(symbol=d["occ"], expiry=d["expiry"],
+                                   strike=d["strike"], option_type="put")
+        self._open = strat.ZeroDTEPlan(contract=contract, credit=d["credit"],
+                                       tp_price=d["tp"], sl_price=d["sl"],
+                                       contracts=d["contracts"])
+        self._oco_id = d.get("oco_id")
+        self._broker_managed = bool(d.get("broker_managed"))
+        log.warning("ZeroDTE: recovered open position %s strike=%.1f (oco=%s) from state",
+                    d["occ"], d["strike"], self._oco_id)
+
+    def _clear_state(self) -> None:
+        try:
+            if os.path.exists(self._state_file):
+                os.remove(self._state_file)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ZeroDTE: could not clear state: %s", exc)
 
     # ── Entry ───────────────────────────────────────────────────────────────
 
@@ -96,6 +153,7 @@ class ZeroDTERunner:
         if not self._execute_open(plan):
             return False
         self._open = plan
+        self._save_state()   # durable — survives a restart; enables cron --flatten
         log.warning(
             "ZeroDTE OPEN %s %s put strike=%.1f  credit=%.2f  qty=%d  "
             "TP=%.2f  SL=%.2f  mode=%s",
@@ -157,6 +215,7 @@ class ZeroDTERunner:
         self._open = None
         self._oco_id = None
         self._broker_managed = False
+        self._clear_state()
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
@@ -288,6 +347,7 @@ class ZeroDTERunner:
 # ── Scheduler entry point ─────────────────────────────────────────────────────
 
 def main() -> None:
+    import sys
     try:
         from dotenv import load_dotenv
         load_dotenv()
@@ -298,6 +358,20 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
+
+    # Standalone flatten backstop — run from OS cron at 15:45 ET so the position
+    # is closed even if the long-running runner died. Reads the durable state
+    # file, cancels any resting OCO, buys the put back, and exits. Idempotent:
+    # if nothing is open it is a no-op.
+    if "--flatten" in sys.argv:
+        runner = ZeroDTERunner()
+        if runner._open is None:
+            log.warning("ZeroDTE --flatten: nothing open — no-op")
+            return
+        log.warning("ZeroDTE --flatten: closing open position before EOD")
+        runner.force_close()
+        return
+
     if not settings.ZERODTE_ENABLED:
         log.warning("ZERODTE_ENABLED=False — not starting. Set it True to run.")
         return

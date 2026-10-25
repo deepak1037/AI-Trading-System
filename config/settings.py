@@ -338,6 +338,10 @@ class Settings(BaseSettings):
     ZERODTE_LIVE_TRADING: bool = False
     ZERODTE_PAPER_ACCOUNT: str = "paper_zerodte"
     ZERODTE_SCHWAB_ACCOUNT: str = ""            # blank → SCHWAB_ACCOUNT_NUMBER
+    # Durable day-state file so a restarted runner (or a cron `--flatten`
+    # backstop) can recover the open position + resting OCO id and guarantee the
+    # 15:45 close even if the long-running process died.
+    ZERODTE_STATE_FILE: str = "db/zerodte_state.json"
 
     # ── Paper trading ──────────────────────────────────────────
     PAPER_ACCOUNTS: list[str] = Field(default_factory=lambda: ["paper_main"])

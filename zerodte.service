@@ -1,0 +1,38 @@
+[Unit]
+Description=0DTE QQQ put-selling strategy (Ravish) — daily runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/ai-trading-system
+
+# Secrets + config (chmod 600, owned by trading user)
+EnvironmentFile=/opt/ai-trading-system/.env
+
+# The long-running runner: 09:45 entry, manage, 15:45 close (APScheduler, ET).
+ExecStart=/opt/ai-trading-system/.venv/bin/python -m zerodte.zerodte_runner
+
+# Keep it up. On a mid-day crash it restarts and recovers the open position
+# from the durable state file (ZERODTE_STATE_FILE), so management + the 15:45
+# close survive the restart.
+Restart=always
+RestartSec=15s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/ai-trading-system
+
+LimitNOFILE=65536
+TimeoutStopSec=30s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerodte
+
+[Install]
+WantedBy=multi-user.target
